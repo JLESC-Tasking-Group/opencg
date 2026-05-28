@@ -53,10 +53,6 @@
 # include <stdio.h>
 # include <stdint.h>
 
-# ifndef OCG_COMMAND_GRAPH_DEBUG
-#  define OCG_COMMAND_GRAPH_DEBUG 1
-# endif
-
 OCG_NAMESPACE_BEGIN
 
 /* struct command_t exists */
@@ -297,17 +293,6 @@ struct command_graph_t
     inline void
     optimize(command_graph_pass_t pass)
     {
-        # if OCG_COMMAND_GRAPH_DEBUG
-        char fname[128];
-        const char * name = command_graph_pass_to_str(pass);
-        {
-            snprintf(fname, sizeof(fname), "cg-pre-%s.dot", name);
-            FILE * f = fopen(fname, "w");
-            this->dump(f);
-            fclose(f);
-        }
-        # endif
-
         switch (pass)
         {
             # define DEF(ENUM, FUNC, NAME) case(ENUM): { this->FUNC(); break; }
@@ -319,16 +304,6 @@ struct command_graph_t
                 abort();
             }
         }
-
-        # if OCG_COMMAND_GRAPH_DEBUG
-        {
-            this->coherence_checks();
-            snprintf(fname, sizeof(fname), "cg-post-%s.dot", name);
-            FILE * f = fopen(fname, "w");
-            this->dump(f);
-            fclose(f);
-        }
-        # endif
     }
 
     /* get entry node */
@@ -660,6 +635,14 @@ struct command_graph_t
 
     /* Dump the command graph */
     void dump(FILE * file);
+
+    /* Dump the command graph to a dot file */
+    inline void dump(const char * fname)
+    {
+        FILE * f = fopen(fname, "w");
+        this->dump(f);
+        fclose(f);
+    }
 
     /**************
      * Iterators *
