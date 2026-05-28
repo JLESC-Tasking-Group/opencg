@@ -1,0 +1,7 @@
+build*/
+docs/generated/
+*.cobaltlog
+*.error
+*.output
+*.swp
+tags
