@@ -1,13 +1,16 @@
 # OpenCG - Open Command Graphs
 
-In short, OpenCG is a C++ library
+In short, OpenCG is a library
 - to manipulate directed acyclic graph **command graphs** (**CG**)
 - that is **vendor-agnostic** with no vendor-specific backend provided
 - with support for **multi-devices**
 - that includes multiple **optimization passes**
 
 In a command graph
-- nodes hold a **command** and a **device unique identifier**
+- nodes hold a **device unique identifier** and are either
+  - a **command** (e.g., kernel launch, H2D copy, etc.)
+  - a **command graph** (i.e., the structure is recursive)
+  - a **condition** (demuxer or loop, to conditionally execute associated commands)
 - edges represent **precedence constraints** for execution
 
 A few examples of **commands**:
@@ -30,7 +33,6 @@ make
 ```
 
 # Example
-
 OpenCG is integrated into the [XKRT](https://github.com/anlsys/xkrt) runtime system.
 It serves as its abstraction for representing commands, notably to record and replay.
 The [XKOMP](https://github.com/anlsys/xkomp) support for the `taskgraph` construct eventually fallbacks to OpenCG.
