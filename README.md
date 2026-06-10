@@ -1,3 +1,5 @@
+[![docs](https://img.shields.io/badge/docs-stable-blue.svg)](https://JLESC-Tasking-Group.github.io/opencg/)
+
 # OpenCG - Open Command Graphs
 
 OpenCG is a library to manipulate directed acyclic graph **command graphs** (**CG**) that is **Vendor-agnostic**, supports **Multi-devices** and includes **Optimization passes**
