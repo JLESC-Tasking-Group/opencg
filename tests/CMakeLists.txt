@@ -8,6 +8,7 @@ project(tests)
 # list of tests
 set(TEST_SOURCES
     h2d-distribute.cc
+    prog-fuse.cc
 )
 
 # Loop over each test source file
