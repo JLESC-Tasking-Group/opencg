@@ -63,7 +63,7 @@ Batches are typically created by the [batching optimization pass](@ref optimizat
 
 The **demuxer** uses a bitset to select which commands (up to `OCG_COMMAND_CTRL_DEMUX_SIZE_MAX`) to execute from a list.
 
-## The `command_t` Union
+## The command_t Union
 
 All command data is stored in `ocg::command_t`, which is a tagged union:
 
