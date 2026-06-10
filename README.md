@@ -1,17 +1,13 @@
 # OpenCG - Open Command Graphs
 
-In short, OpenCG is a library
-- to manipulate directed acyclic graph **command graphs** (**CG**)
-- that is **vendor-agnostic** with no vendor-specific backend provided
-- with support for **multi-devices**
-- that includes multiple **optimization passes**
+OpenCG is a library to manipulate directed acyclic graph **command graphs** (**CG**) that is **Vendor-agnostic**, supports **Multi-devices** and includes **Optimization passes**
 
 In a command graph
-- nodes hold a **device unique identifier** and are either
+- Nodes hold a **device unique identifier** and are either
   - a **command** (e.g., kernel launch, H2D copy, etc.)
   - a **command graph** (i.e., the structure is recursive)
   - a **condition** (demuxer or loop, to conditionally execute associated commands)
-- edges represent **precedence constraints** for execution
+- Edges represent **precedence constraints** for execution
 
 A few examples of **commands**:
 - 1-dimensional copy: copy(src, dst, ptr, size)
