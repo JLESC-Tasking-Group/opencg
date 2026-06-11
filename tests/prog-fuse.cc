@@ -145,6 +145,8 @@ main(void)
 
     /* Create a command graph */
     command_graph_t * cg = command_graph_new();
+    assert(cg);
+    cg->init(command_new, command_graph_node_new, command_graph_new);
 
     command_graph_node_t * entry = cg->node_get_entry();
     command_graph_node_t * exit  = cg->node_get_exit();
@@ -155,22 +157,24 @@ main(void)
 
     /* Node u: scale(s, y, n)  =>  y := s * y */
     command_t * cmd_u = command_new(cg, COMMAND_TYPE_PROG);
+    assert(cmd_u);
     cmd_u->prog.source      = (void *) scale_llvm_ir;
     cmd_u->prog.source_type = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
-    cmd_u->prog.grid  = {1, 1, 1};
-    cmd_u->prog.block = {1, 1, 1};
 
     constexpr device_unique_id_t host_device = 0;
-    command_graph_node_t * u = command_graph_node_new(cg, cmd_u, host_device);
+    command_graph_node_t * u = command_graph_node_new(cg, host_device, COMMAND_GRAPH_NODE_TYPE_COMMAND);
+    assert(u);
+    u->command = cmd_u;
 
     /* Node v: axpy(a, x, y, n)  =>  y := a * x + y */
     command_t * cmd_v = command_new(cg, COMMAND_TYPE_PROG);
+    assert(cmd_v);
     cmd_v->prog.source      = (void *) axpy_llvm_ir;
     cmd_v->prog.source_type = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
-    cmd_v->prog.grid  = {1, 1, 1};
-    cmd_v->prog.block = {1, 1, 1};
 
-    command_graph_node_t * v = command_graph_node_new(cg, cmd_v, host_device);
+    command_graph_node_t * v = command_graph_node_new(cg, host_device, COMMAND_GRAPH_NODE_TYPE_COMMAND);
+    assert(v);
+    v->command = cmd_v;
 
     /* Build graph: entry -> u -> v -> exit */
     entry->precedes(u);

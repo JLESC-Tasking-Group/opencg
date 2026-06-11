@@ -84,6 +84,10 @@ configure_file(
     ${CMAKE_SOURCE_DIR}/include/opencg/support.h.in
     ${CMAKE_BINARY_DIR}/include/opencg/support.h
 )
+install(
+    FILES "${CMAKE_BINARY_DIR}/include/opencg/support.h"
+    DESTINATION include/opencg
+)
 
 # Installation - lib and include files
 install(TARGETS ${OpenCG_TARGETS} LIBRARY DESTINATION lib ARCHIVE DESTINATION lib)

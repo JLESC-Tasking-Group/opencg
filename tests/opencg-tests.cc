@@ -39,32 +39,24 @@
 OCG_NAMESPACE_USE;
 
 static command_t *
-command_new(
-    command_graph_t * cg,
-    command_type_t type
-) {
-    command_t * command = (command_t *) malloc(sizeof(command_t));
-    assert(command);
-    new (command) command_t(type);
-    return command;
+command_new(command_graph_t * cg, const command_type_t type)
+{
+    return new command_t(type);
 }
 
 static command_graph_node_t *
 command_graph_node_new(
     command_graph_t * cg,
-    command_t * command,
-    const device_unique_id_t device_unique_id
+    const device_unique_id_t device_unique_id,
+    const command_graph_node_type_t type
 ) {
-    return new command_graph_node_t(command, device_unique_id);
+    return new command_graph_node_t(type);
 }
 
 static command_graph_t *
 command_graph_new(command_graph_t * original_cg)
 {
-    command_graph_t * cg = (command_graph_t *) malloc(sizeof(command_graph_t));
-    assert(cg);
-    cg->init(command_new, command_graph_node_new, command_graph_new);
-    return cg;
+    return new command_graph_t();
 }
 
 static command_graph_t *
