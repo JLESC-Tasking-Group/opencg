@@ -57,27 +57,42 @@ command_graph_dump_interior(
     {
         command_graph_node_t * node = nodes[i].node;
         assert(node);
+
         /* print the node */
-        if (node->command == NULL)
+        switch (node->type)
         {
-            fprintf(f, "  \"%p\" [label=\"node %lu\\ndev=%u\"] ;\n", node, node->iterator_index, node->device_unique_id);
-        }
-        else
-        {
-            assert(node->command);
-            if (node->command->type == COMMAND_TYPE_BATCH && node->command->batch.cg)
+            case (COMMAND_GRAPH_NODE_TYPE_EMPTY):
+            case (COMMAND_GRAPH_NODE_TYPE_COMMAND_GRAPH):
+            case (COMMAND_GRAPH_NODE_TYPE_CONDITION):
             {
-                fprintf(f, "  subgraph cluster_%p {\n", node);
-                fprintf(f, "    \"%p\" [style=invis, width=0, height=0, label=\"\"] ;\n", node);
-                fprintf(f, "    label=\"node %lu\\ndev=%u\\ncmd=%s\" ;\n",
-                        node->iterator_index, node->device_unique_id, command_type_to_str(node->command->type));
-                command_graph_dump_interior(node->command->batch.cg, f);
-                fprintf(f, "  }\n");
+                fprintf(f, "  \"%p\" [label=\"node %lu\\ndev=%u\"] ;\n",
+                        node, node->iterator_index, node->device_unique_id);
+                break ;
             }
-            else
+
+            case (COMMAND_GRAPH_NODE_TYPE_COMMAND):
             {
-                fprintf(f, "  \"%p\" [label=\"node %lu\\ndev=%u\\ncmd=%s\"] ;\n",
-                        node, node->iterator_index, node->device_unique_id, command_type_to_str(node->command->type));
+                assert(node->command);
+                if (node->command->type == COMMAND_TYPE_BATCH && node->command->batch.cg)
+                {
+                    fprintf(f, "  subgraph cluster_%p {\n", node);
+                    fprintf(f, "    \"%p\" [style=invis, width=0, height=0, label=\"\"] ;\n", node);
+                    fprintf(f, "    label=\"node %lu\\ndev=%u\\ncmd=%s\" ;\n",
+                            node->iterator_index, node->device_unique_id, command_type_to_str(node->command->type));
+                    command_graph_dump_interior(node->command->batch.cg, f);
+                    fprintf(f, "  }\n");
+                }
+                else
+                {
+                    fprintf(f, "  \"%p\" [label=\"node %lu\\ndev=%u\\ncmd=%s\"] ;\n",
+                            node, node->iterator_index, node->device_unique_id, command_type_to_str(node->command->type));
+                }
+                break ;
+            }
+
+            default:
+            {
+                break ;
             }
         }
 
@@ -85,9 +100,9 @@ command_graph_dump_interior(
         node->foreach_successor([&] (command_graph_node_t * succ)
         {
             fprintf(f, "  \"%p\" -> \"%p\"", node, succ);
-            if (node->command && node->command->type == COMMAND_TYPE_BATCH)
+            if (node->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && node->command->type == COMMAND_TYPE_BATCH)
                 fprintf(f, " [ltail=cluster_%p]", node);
-            if (succ->command && succ->command->type == COMMAND_TYPE_BATCH)
+            if (succ->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && succ->command->type == COMMAND_TYPE_BATCH)
                 fprintf(f, " [lhead=cluster_%p]", succ);
             fprintf(f, " ;\n");
         });

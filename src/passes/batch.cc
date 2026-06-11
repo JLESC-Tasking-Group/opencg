@@ -105,6 +105,8 @@ command_batch_init(
     command_graph_node_t * vv = cmd->batch.cg->command_graph_node_allocate(cmd->batch.cg);
     assert(uu);
     assert(vv);
+    new (uu) command_graph_node_t(u->device_unique_id, cmd_u);
+    new (vv) command_graph_node_t(v->device_unique_id, cmd_v);
 
     if constexpr (hint == COMMAND_GRAPH_CONTRACTION_HINT_FALSE_TWINS)
     {
