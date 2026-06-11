@@ -60,21 +60,18 @@ command_graph_t::pass_reduce_node(void)
         # if 0
         if (u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND)
         {
-            if (u->command)
+            if (u->command->type == COMMAND_TYPE_BATCH && u->command->batch)
             {
-                if (u->command->type == COMMAND_TYPE_BATCH && u->command->batch)
+                if (u->command->batch->has_cg)
                 {
-                    if (u->command->batch->has_cg)
-                    {
-                        u->command->batch->cg.pass_reduction_node();
-                    }
+                    u->command->batch->cg.pass_reduction_node();
                 }
             }
         }
         # endif
 
         /* remove control nodes that do not simplifies the graph complexity */
-        if (!u->command)
+        if (u->type == COMMAND_GRAPH_NODE_TYPE_EMPTY)
         {
             command_graph_node_index_t m = u->predecessors.size();
             command_graph_node_index_t n = u->successors.size();
