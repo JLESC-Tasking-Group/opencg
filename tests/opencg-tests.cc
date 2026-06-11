@@ -39,10 +39,8 @@
 OCG_NAMESPACE_USE;
 
 static command_t *
-command_allocate(
-    command_graph_t * cg,
-    command_type_t type
-) {
+command_allocate(command_graph_t * cg)
+{
     return (command_t *) malloc(sizeof(command_t));
 }
 

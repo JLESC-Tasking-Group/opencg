@@ -57,7 +57,7 @@ main(void)
     /* create a CG */
     command_graph_t * cg = command_graph_allocate();
     assert(cg);
-    new (cg) command_graph_t();
+    cg->init(command_allocate, command_graph_node_allocate, command_graph_allocate);
 
     /* entry/exit nodes */
     command_graph_node_t * entry = cg->node_get_entry();

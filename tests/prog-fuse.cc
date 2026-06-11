@@ -146,7 +146,7 @@ main(void)
     /* Create a command graph */
     command_graph_t * cg = command_graph_allocate();
     assert(cg);
-    new (cg) command_graph_t();
+    cg->init(command_allocate, command_graph_node_allocate, command_graph_allocate);
 
     command_graph_node_t * entry = cg->node_get_entry();
     command_graph_node_t * exit  = cg->node_get_exit();
@@ -163,7 +163,9 @@ main(void)
     cmd_u->prog.source_type = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
 
     constexpr device_unique_id_t host_device = 0;
-    command_graph_node_t * u = command_graph_node_allocate(cg, cmd_u, host_device);
+    command_graph_node_t * u = command_graph_node_allocate(cg);
+    assert(u);
+    new (u) command_graph_node_t(host_device, cmd_u);
 
     /* Node v: axpy(a, x, y, n)  =>  y := a * x + y */
     command_t * cmd_v = command_allocate(cg);
@@ -172,9 +174,9 @@ main(void)
     cmd_v->prog.source      = (void *) axpy_llvm_ir;
     cmd_v->prog.source_type = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
 
-    command_graph_node_t * v = command_graph_node_allocate(cg, cmd_v, host_device);
+    command_graph_node_t * v = command_graph_node_allocate(cg);
     assert(v);
-    new (v) command_graph_node_t(
+    new (v) command_graph_node_t(host_device, cmd_v);
 
     /* Build graph: entry -> u -> v -> exit */
     entry->precedes(u);
