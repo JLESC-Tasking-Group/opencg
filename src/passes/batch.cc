@@ -78,16 +78,14 @@ command_batch_init(
 
     /* create a new batch command, and replace u's command (since 'v' just got
      * contracted into 'u', we are building a new 'batch' command to 'u' here */
-    assert(original_cg->command_allocate);
-    command_t * cmd = original_cg->command_allocate(original_cg);
+    assert(original_cg->command_new);
+    command_t * cmd = original_cg->command_new(original_cg, COMMAND_TYPE_BATCH);
     assert(cmd);
-    new (cmd) command_t(COMMAND_TYPE_BATCH);
     cmd->batch.driver_handle = NULL;
 
-    assert(original_cg->command_graph_allocate);
-    cmd->batch.cg = original_cg->command_graph_allocate(original_cg);
+    assert(original_cg->command_graph_new);
+    cmd->batch.cg = original_cg->command_graph_new(original_cg);
     assert(cmd->batch.cg);
-    cmd->batch.cg->init(original_cg->command_allocate, original_cg->command_graph_node_allocate, original_cg->command_graph_allocate);
     u->command = cmd;
 
     command_graph_node_t * entry = cmd->batch.cg->node_get_entry();
@@ -100,13 +98,13 @@ command_batch_init(
     assert(exit->successors.size() == 0);
 
     /* create new nodes corresponding to u and v in the new batch command graph */
-    assert(cmd->batch.cg->command_graph_node_allocate);
-    command_graph_node_t * uu = cmd->batch.cg->command_graph_node_allocate(cmd->batch.cg);
-    command_graph_node_t * vv = cmd->batch.cg->command_graph_node_allocate(cmd->batch.cg);
+    assert(cmd->batch.cg->command_graph_node_new);
+    command_graph_node_t * uu = cmd->batch.cg->command_graph_node_new(cmd->batch.cg, u->device_unique_id, COMMAND_GRAPH_NODE_TYPE_COMMAND);
+    command_graph_node_t * vv = cmd->batch.cg->command_graph_node_new(cmd->batch.cg, v->device_unique_id, COMMAND_GRAPH_NODE_TYPE_COMMAND);
     assert(uu);
     assert(vv);
-    new (uu) command_graph_node_t(u->device_unique_id, cmd_u);
-    new (vv) command_graph_node_t(v->device_unique_id, cmd_v);
+    uu->command = cmd_u;
+    vv->command = cmd_v;
 
     if constexpr (hint == COMMAND_GRAPH_CONTRACTION_HINT_FALSE_TWINS)
     {
@@ -145,6 +143,7 @@ command_graph_pass_batch_contract_batch_single_node(
 ) {
     assert(u_graph);
     assert(v);
+    assert(v->type == COMMAND_GRAPH_NODE_TYPE_COMMAND);
     assert(v->command);
 
     command_graph_node_t * u_entry = u_graph->node_get_entry();
@@ -231,6 +230,8 @@ command_graph_pass_batch_contract_batch_merge(
     assert(u);
     assert(v);
     assert(u->device_unique_id == v->device_unique_id);
+    assert(u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND);
+    assert(v->type == COMMAND_GRAPH_NODE_TYPE_COMMAND);
     assert(u->command);
     assert(v->command);
     assert(u->command->batch.cg);
@@ -313,8 +314,9 @@ command_graph_pass_batch_contract(
     assert(u->device_unique_id == v->device_unique_id);
 
     /* update commands */
-    if (u->command && v->command)
+    if (u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && v->type == COMMAND_GRAPH_NODE_TYPE_COMMAND)
     {
+        assert(u->command && v->command);
         if (COMMAND_IS_ATOMIC(u->command) && !COMMAND_IS_ATOMIC(v->command))
         {
 swap_u_v:
@@ -333,18 +335,19 @@ swap_u_v:
             // nothing to do
         }
     }
-    else if (u->command && !v->command)
+    else if (u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && v->type != COMMAND_GRAPH_NODE_TYPE_COMMAND)
     {
         // nothing to do
+        assert(u->command);
     }
-    else if (!u->command && v->command)
+    else if (u->type != COMMAND_GRAPH_NODE_TYPE_COMMAND && v->type == COMMAND_GRAPH_NODE_TYPE_COMMAND)
     {
         goto swap_u_v;
     }
     else
     {
-        assert(!u->command && !v->command);
         // nothing to do
+        assert(u->type != COMMAND_GRAPH_NODE_TYPE_COMMAND && v->type != COMMAND_GRAPH_NODE_TYPE_COMMAND);
     }
 
     /* always contract in place */
@@ -372,21 +375,21 @@ swap_u_v:
     nodes[v->iterator_index].data.contracted = true;
 
     /* Initialize the command of 'w' */
-    if (!u->command)
+    if (u->type != COMMAND_GRAPH_NODE_TYPE_COMMAND)
     {
         // nothing to do - (a)
     }
     else
     {
-        if (!v->command)
+        if (v->type != COMMAND_GRAPH_NODE_TYPE_COMMAND)
         {
             // nothing to do - (b)
         }
         else
         {
             // (c)
-            assert(u->command);
-            assert(v->command);
+            assert(u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && u->command);
+            assert(v->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && v->command);
 
             if (!COMMAND_IS_ATOMIC(u->command))
             {

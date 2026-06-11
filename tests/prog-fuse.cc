@@ -144,9 +144,9 @@ main(void)
         y_expected[i] = a * x[i] + s * y[i];
 
     /* Create a command graph */
-    command_graph_t * cg = command_graph_allocate();
+    command_graph_t * cg = command_graph_new();
     assert(cg);
-    cg->init(command_allocate, command_graph_node_allocate, command_graph_allocate);
+    cg->init(command_new, command_graph_node_new, command_graph_new);
 
     command_graph_node_t * entry = cg->node_get_entry();
     command_graph_node_t * exit  = cg->node_get_exit();
@@ -156,27 +156,25 @@ main(void)
     exit->predecessors.clear();
 
     /* Node u: scale(s, y, n)  =>  y := s * y */
-    command_t * cmd_u = command_allocate(cg);
+    command_t * cmd_u = command_new(cg, COMMAND_TYPE_PROG);
     assert(cmd_u);
-    new (cmd_u) command_t(COMMAND_TYPE_PROG);
     cmd_u->prog.source      = (void *) scale_llvm_ir;
     cmd_u->prog.source_type = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
 
     constexpr device_unique_id_t host_device = 0;
-    command_graph_node_t * u = command_graph_node_allocate(cg);
+    command_graph_node_t * u = command_graph_node_new(cg, host_device, COMMAND_GRAPH_NODE_TYPE_COMMAND);
     assert(u);
-    new (u) command_graph_node_t(host_device, cmd_u);
+    u->command = cmd_u;
 
     /* Node v: axpy(a, x, y, n)  =>  y := a * x + y */
-    command_t * cmd_v = command_allocate(cg);
+    command_t * cmd_v = command_new(cg, COMMAND_TYPE_PROG);
     assert(cmd_v);
-    new (cmd_v) command_t(COMMAND_TYPE_PROG);
     cmd_v->prog.source      = (void *) axpy_llvm_ir;
     cmd_v->prog.source_type = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
 
-    command_graph_node_t * v = command_graph_node_allocate(cg);
+    command_graph_node_t * v = command_graph_node_new(cg, host_device, COMMAND_GRAPH_NODE_TYPE_COMMAND);
     assert(v);
-    new (v) command_graph_node_t(host_device, cmd_v);
+    v->command = cmd_v;
 
     /* Build graph: entry -> u -> v -> exit */
     entry->precedes(u);

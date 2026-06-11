@@ -39,26 +39,28 @@
 OCG_NAMESPACE_USE;
 
 static command_t *
-command_allocate(command_graph_t * cg)
+command_new(command_graph_t * cg, const command_type_t type)
 {
-    return (command_t *) malloc(sizeof(command_t));
+    return new command_t(type);
 }
 
 static command_graph_node_t *
-command_graph_node_allocate(
-    command_graph_t * cg
+command_graph_node_new(
+    command_graph_t * cg,
+    const device_unique_id_t device_unique_id,
+    const command_graph_node_type_t type
 ) {
-    return (command_graph_node_t *) malloc(sizeof(command_graph_node_t));
+    return new command_graph_node_t(type);
 }
 
 static command_graph_t *
-command_graph_allocate(command_graph_t * original_cg)
+command_graph_new(command_graph_t * original_cg)
 {
-    return (command_graph_t *) malloc(sizeof(command_graph_t));
+    return new command_graph_t();
 }
 
 static command_graph_t *
-command_graph_allocate(void)
+command_graph_new(void)
 {
-    return command_graph_allocate(NULL);
+    return command_graph_new(NULL);
 }

@@ -55,9 +55,9 @@ main(void)
     const size_t bs = size / ndevices;
 
     /* create a CG */
-    command_graph_t * cg = command_graph_allocate();
+    command_graph_t * cg = command_graph_new();
     assert(cg);
-    cg->init(command_allocate, command_graph_node_allocate, command_graph_allocate);
+    cg->init(command_new, command_graph_node_new, command_graph_new);
 
     /* entry/exit nodes */
     command_graph_node_t * entry = cg->node_get_entry();
@@ -68,7 +68,7 @@ main(void)
     {
         device_unique_id_t device_unique_id = (device_unique_id_t) (i + 1);
 
-        // allocate device memory
+        // new device memory
         void * dst = malloc(bs);
 
         // create a command and initialize it
@@ -83,9 +83,9 @@ main(void)
         command->copy_1D.size                   = bs;
 
         // add node to CG
-        command_graph_node_t * node = command_graph_node_allocate(cg);
+        command_graph_node_t * node = command_graph_node_new(cg, device_unique_id, COMMAND_GRAPH_NODE_TYPE_COMMAND);
         assert(node);
-        new (node) command_graph_node_t(device_unique_id, command);
+        node->command = command;
         entry->precedes(node);
         node->precedes(exit);
     }
