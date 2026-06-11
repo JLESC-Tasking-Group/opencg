@@ -71,6 +71,7 @@ set(OpenCG_TARGETS ${OpenCG})
 
 if (USE_PROTEUS)
     find_package(proteus CONFIG REQUIRED)
+     find_package(Threads REQUIRED)
     add_proteus(${OpenCG})
 endif()
 
