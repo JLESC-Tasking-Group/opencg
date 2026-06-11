@@ -27,6 +27,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)  # Optional: disables compiler-specific extensions
 # OPTIONS #
 ###########
 
+include(BooleanUtils)
+ocgoption(BUILD_C_API "Build the C API." ON)
+ocgoption(USE_PROTEUS "Use Proteus for JIT." OFF)
 
 ##########
 # OpenCG #
@@ -42,6 +45,13 @@ SET(SOURCE_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/command-graph.cc
 )
 
+if (BUILD_C_API)
+    list(APPEND SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/api/c/src/opencg.cc)
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/api/c/src)
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/api/c/include)
+    install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/api/c/include/ DESTINATION include FILES_MATCHING PATTERN "*.h")
+endif()
+
 # OpenCG Lib
 add_library(${OpenCG} SHARED ${SOURCE_FILES})
 set_target_properties(${OpenCG} PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_SOURCE_DIR}/lib")
@@ -49,14 +59,31 @@ set_target_properties(${OpenCG} PROPERTIES INSTALL_RPATH "$ORIGIN/../lib")
 
 # Include directory
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include/)
+include_directories(${CMAKE_CURRENT_BINARY_DIR}/include/)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src/)
 
 # targets to install (lib)
 set(OpenCG_TARGETS ${OpenCG})
 
+###############
+# DEPENDENCES #
+###############
+
+if (USE_PROTEUS)
+    find_package(proteus CONFIG REQUIRED)
+    add_proteus(${OpenCG})
+endif()
+
 ################
 # INSTALLATION #
 ################
+
+# Header file generated
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/include/opencg")
+configure_file(
+    ${CMAKE_SOURCE_DIR}/include/opencg/support.h.in
+    ${CMAKE_BINARY_DIR}/include/opencg/support.h
+)
 
 # Installation - lib and include files
 install(TARGETS ${OpenCG_TARGETS} LIBRARY DESTINATION lib ARCHIVE DESTINATION lib)

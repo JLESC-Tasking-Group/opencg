@@ -2,7 +2,8 @@
 ** Copyright 2024,2025 INRIA
 **
 ** Contributors :
-** Romain PEREIRA, rpereira@anl.gov
+** Thierry Gautier, thierry.gautier@inrialpes.fr
+** Romain PEREIRA, romain.pereira@inria.fr + rpereira@anl.gov
 **
 ** This software is a computer program whose purpose is to execute
 ** blas subroutines on multi-GPUs system.
@@ -34,15 +35,11 @@
 ** knowledge of the CeCILL-C license and that you accept its terms.
 **/
 
-#ifndef __OPENCG_HPP__
-# define __OPENCG_HPP__
+#ifndef __OPENCG_SUPPORT_H__
+# define __OPENCG_SUPPORT_H__
 
-#  include <opencg/command-graph-pass.hpp>
-#  include <opencg/command-graph.hpp>
-#  include <opencg/command-type.hpp>
-#  include <opencg/command.hpp>
-#  include <opencg/device-type.hpp>
-#  include <opencg/namespace.hpp>
-#  include <opencg/support.h>
+/* If Proteus JIT is enabled */
+# define OPENCG_SUPPORT_PROTEUS @USE_PROTEUS@
 
-#endif /* __OPENCG_HPP__ */
+#endif /* __OPENCG_SUPPORT_H__ */
+
