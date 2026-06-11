@@ -43,6 +43,4 @@ OCG_NAMESPACE_USE;
 void
 command_graph_t::pass_prog_fuse(void)
 {
-    // LOGGER_FATAL("TODO");
-    abort();
 }

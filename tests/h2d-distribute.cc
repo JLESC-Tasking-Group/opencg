@@ -55,7 +55,9 @@ main(void)
     const size_t bs = size / ndevices;
 
     /* create a CG */
-    command_graph_t * cg = command_graph_new();
+    command_graph_t * cg = command_graph_allocate();
+    assert(cg);
+    new (cg) command_graph_t();
 
     /* entry/exit nodes */
     command_graph_node_t * entry = cg->node_get_entry();
@@ -81,8 +83,9 @@ main(void)
         command->copy_1D.size                   = bs;
 
         // add node to CG
-        command_graph_node_t * node = command_graph_node_new(cg, command, device_unique_id);
+        command_graph_node_t * node = command_graph_node_allocate(cg);
         assert(node);
+        new (node) command_graph_node_t(device_unique_id, command);
         entry->precedes(node);
         node->precedes(exit);
     }

@@ -71,7 +71,10 @@ set(OpenCG_TARGETS ${OpenCG})
 
 if (USE_PROTEUS)
     find_package(proteus CONFIG REQUIRED)
-    add_proteus(${OpenCG})
+    find_package(Threads REQUIRED)
+    #add_proteus(${OpenCG}) # this adds Proteus pass, we dont need that
+    target_link_libraries(opencg PRIVATE proteusFrontend)
+    #target_link_libraries(opencg PRIVATE proteus)
 endif()
 
 ################

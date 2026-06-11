@@ -78,12 +78,16 @@ command_batch_init(
 
     /* create a new batch command, and replace u's command (since 'v' just got
      * contracted into 'u', we are building a new 'batch' command to 'u' here */
-    assert(original_cg->command_new);
-    command_t * cmd = original_cg->command_new(original_cg, COMMAND_TYPE_BATCH);
+    assert(original_cg->command_allocate);
+    command_t * cmd = original_cg->command_allocate(original_cg);
+    assert(cmd);
+    new (cmd) command_t(COMMAND_TYPE_BATCH);
     cmd->batch.driver_handle = NULL;
-    assert(original_cg->command_graph_new);
-    cmd->batch.cg = original_cg->command_graph_new(original_cg);
+
+    assert(original_cg->command_graph_allocate);
+    cmd->batch.cg = original_cg->command_graph_allocate(original_cg);
     assert(cmd->batch.cg);
+    cmd->batch.cg->init(original_cg->command_allocate, original_cg->command_graph_node_allocate, original_cg->command_graph_allocate);
     u->command = cmd;
 
     command_graph_node_t * entry = cmd->batch.cg->node_get_entry();
@@ -96,9 +100,9 @@ command_batch_init(
     assert(exit->successors.size() == 0);
 
     /* create new nodes corresponding to u and v in the new batch command graph */
-    assert(cmd->batch.cg->command_graph_node_new);
-    command_graph_node_t * uu = cmd->batch.cg->command_graph_node_new(cmd->batch.cg, cmd_u, u->device_unique_id);
-    command_graph_node_t * vv = cmd->batch.cg->command_graph_node_new(cmd->batch.cg, cmd_v, v->device_unique_id);
+    assert(cmd->batch.cg->command_graph_node_allocate);
+    command_graph_node_t * uu = cmd->batch.cg->command_graph_node_allocate(cmd->batch.cg);
+    command_graph_node_t * vv = cmd->batch.cg->command_graph_node_allocate(cmd->batch.cg);
     assert(uu);
     assert(vv);
 
