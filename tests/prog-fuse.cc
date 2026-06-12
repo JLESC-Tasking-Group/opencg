@@ -158,8 +158,9 @@ main(void)
     /* Node u: scale(s, y, n)  =>  y := s * y */
     command_t * cmd_u = command_new(cg, COMMAND_TYPE_PROG);
     assert(cmd_u);
-    cmd_u->prog.source      = (void *) scale_llvm_ir;
-    cmd_u->prog.source_type = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
+    cmd_u->prog.source.type                 = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
+    cmd_u->prog.source.content.llvmir.raw   = (void *) scale_llvm_ir;
+    cmd_u->prog.source.content.llvmir.size  = sizeof(scale_llvm_ir);
 
     constexpr device_unique_id_t host_device = 0;
     command_graph_node_t * u = command_graph_node_new(cg, host_device, COMMAND_GRAPH_NODE_TYPE_COMMAND);
@@ -169,8 +170,9 @@ main(void)
     /* Node v: axpy(a, x, y, n)  =>  y := a * x + y */
     command_t * cmd_v = command_new(cg, COMMAND_TYPE_PROG);
     assert(cmd_v);
-    cmd_v->prog.source      = (void *) axpy_llvm_ir;
-    cmd_v->prog.source_type = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
+    cmd_v->prog.source.type                 = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
+    cmd_v->prog.source.content.llvmir.raw   = (void *) axpy_llvm_ir;
+    cmd_v->prog.source.content.llvmir.size  = sizeof(axpy_llvm_ir);
 
     command_graph_node_t * v = command_graph_node_new(cg, host_device, COMMAND_GRAPH_NODE_TYPE_COMMAND);
     assert(v);
@@ -219,20 +221,23 @@ main(void)
         return 1;
     }
 
-    if (fused->command->prog.source_type != COMMAND_PROG_SOURCE_TYPE_LLVMIR)
+    if (fused->command->prog.source.type != COMMAND_PROG_SOURCE_TYPE_LLVMIR)
     {
         fprintf(stderr, "FAIL: fused node source is not LLVM-IR (type=%d)\n",
-                fused->command->prog.source_type);
+                fused->command->prog.source.type);
         return 1;
     }
 
-    if (fused->command->prog.source == nullptr)
+    if (fused->command->prog.source.content.llvmir.raw == nullptr ||
+        fused->command->prog.source.content.llvmir.size == 0)
     {
         fprintf(stderr, "FAIL: fused node has NULL source\n");
         return 1;
     }
 
     fprintf(stdout, "PASS: prog-fuse produced 1 fused PROG node with LLVM-IR source\n");
+
+    // TODO: test mathematical correctness now
 
     return 0;
 }
