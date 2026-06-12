@@ -35,5 +35,6 @@ OpenCG is integrated into the [XKRT](https://github.com/anlsys/xkrt) runtime sys
 It serves as its abstraction for representing commands, notably to record and replay.
 The [XKOMP](https://github.com/anlsys/xkomp) support for the `taskgraph` construct eventually fallbacks to OpenCG.
 See the glue here:
-- The [record/replay executionner](https://github.com/anlsys/xkrt/blob/master/src/command/command-graph.cc#L418)
+- The [graph instanciation](https://github.com/anlsys/xkrt/blob/master/src/command/command-graph.cc#L97-L101) for a task dependence graph IR.
+- The [replay executionner](https://github.com/anlsys/xkrt/blob/master/src/command/command-graph.cc#L418)
 - The [CUDA driver](https://github.com/anlsys/xkrt/blob/master/src/driver/driver_cu.cc#L618) to execute command graphs
