@@ -2,9 +2,6 @@
 
 # OpenCG - Open Command Graphs
 
-OpenCG is a programming abstraction targeting [**Command Processor**](https://rocm.docs.amd.com/projects/rocprofiler-compute/en/latest/conceptual/command-processor.html
-) available on modern GPUs.
-
 OpenCG is a library that defines **commands graph** (**CG**)---a **Vendor-agnostic** and **Multi-devices** Intermediate Representation (IR) for programming [**Command Processor**](https://rocm.docs.amd.com/projects/rocprofiler-compute/en/latest/conceptual/command-processor.html
 ) available on modern GPUs. OpenCG provides **Optimization passes** of its IR.
 
