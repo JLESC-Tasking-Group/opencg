@@ -53,19 +53,20 @@ namespace OCG_NAMESPACE { void command_graph_optimize_mlir(command_graph_t * cg,
 
 /* Returns true if the MLIR optimizer should be used.
  * Controlled by the OPENCG_OPTIMIZER environment variable:
- *   - "legacy" -> use the legacy C++ passes
- *   - anything else (or unset) -> use the MLIR pipeline (default)
- * This enables A/B parity testing within a single binary. */
+ *   - "mlir"   -> use the MLIR `cg` pipeline
+ *   - anything else (or unset) -> use the legacy POD passes (default)
+ * The legacy POD passes remain the default so existing behavior is unchanged;
+ * setting OPENCG_OPTIMIZER=mlir enables A/B comparison within a single binary. */
 static inline bool
 command_graph_use_mlir_optimizer(void)
 {
-    static int use_mlir_optimized = -1;
-    if (use_mlir_optimized == -1)
+    static int use_mlir_optimizer = -1;
+    if (use_mlir_optimizer == -1)
     {
         const char * s = getenv("OPENCG_OPTIMIZER");
-        use_mlir_optimized = (s && strcmp(s, "legacy") == 0) ? 0 : 1;
+        use_mlir_optimizer = (s && strcmp(s, "mlir") == 0) ? 1 : 0;
     }
-    return (bool) use_mlir_optimized;
+    return (bool) use_mlir_optimizer;
 }
 # endif /* OPENCG_USE_MLIR */
 

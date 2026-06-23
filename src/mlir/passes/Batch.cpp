@@ -15,21 +15,21 @@
 ** specifics are irrelevant here (batching is type-agnostic, device-based).
 */
 
-#include "bridge.h"
+# include <opencg/mlir/opencg-mlir.hpp>
 
-#include "mlir/IR/Builders.h"
-#include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/Pass/Pass.h"
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/SetVector.h"
-#include "llvm/ADT/SmallPtrSet.h"
-#include "llvm/ADT/SmallVector.h"
+# include "mlir/IR/Builders.h"
+# include "mlir/IR/BuiltinAttributes.h"
+# include "mlir/Pass/Pass.h"
+# include "llvm/ADT/DenseMap.h"
+# include "llvm/ADT/STLExtras.h"
+# include "llvm/ADT/SetVector.h"
+# include "llvm/ADT/SmallPtrSet.h"
+# include "llvm/ADT/SmallVector.h"
 
-#include <cstdint>
-#include <deque>
-#include <set>
-#include <vector>
+# include <cstdint>
+# include <deque>
+# include <set>
+# include <vector>
 
 using namespace mlir;
 
@@ -64,28 +64,28 @@ materialize_batch(
     Location loc = members.front()->getLoc();
     Type tok = members.front()->getResult(0).getType();
 
-    llvm::SmallPtrSet<Operation *, 16> G(members.begin(), members.end());
+    llvm::SmallPtrSet<Operation *, 16> group(members.begin(), members.end());
 
     /* external predecessor tokens (defined outside the group), deduplicated */
-    llvm::SetVector<Value> extPreds;
+    llvm::SetVector<Value> ext_preds;
     for (Operation * m : members)
         for (Value t : m->getOperands())
         {
             Operation * d = t.getDefiningOp();
-            if (!d || !G.count(d))
-                extPreds.insert(t);
+            if (!d || !group.count(d))
+                ext_preds.insert(t);
         }
 
     /* create the batch op at the end of the parent block */
     b.setInsertionPointToEnd(&body);
     OperationState st(loc, BatchOp::getOperationName());
     st.addTypes({tok});
-    st.addOperands(extPreds.getArrayRef());
+    st.addOperands(ext_preds.getArrayRef());
     st.addAttribute("duid", b.getI32IntegerAttr((int32_t) device));
-    Region * r = st.addRegion();
-    r->emplaceBlock();
-    Operation * B = b.create(st);
-    Value Btok = B->getResult(0);
+    Region * region = st.addRegion();
+    region->emplaceBlock();
+    Operation * batch_op = b.create(st);
+    Value batch_token = batch_op->getResult(0);
 
     /* external successors of members now depend on the batch token */
     for (Operation * m : members)
@@ -94,15 +94,15 @@ materialize_batch(
         for (OpOperand & use : llvm::make_early_inc_range(mt.getUses()))
         {
             Operation * owner = use.getOwner();
-            if (owner != B && !G.count(owner))
-                use.set(Btok);
+            if (owner != batch_op && !group.count(owner))
+                use.set(batch_token);
         }
     }
 
     /* move members into the batch region */
-    Block & rb = B->getRegion(0).front();
+    Block & batch_block = batch_op->getRegion(0).front();
     for (Operation * m : members)
-        m->moveBefore(&rb, rb.end());
+        m->moveBefore(&batch_block, batch_block.end());
 
     /* strip external predecessor operands from members (carried by the batch) */
     for (Operation * m : members)
@@ -111,7 +111,7 @@ materialize_batch(
         for (Value t : m->getOperands())
         {
             Operation * d = t.getDefiningOp();
-            if (d && G.count(d))
+            if (d && group.count(d))
                 keep.push_back(t);
         }
         m->setOperands(keep);
@@ -175,17 +175,17 @@ struct BatchPass
         for (int i = 0; i < n; ++i)
             members[i].push_back(ops[i]);
 
-        auto can_batch = [&](int a, int b) {
+        auto can_batch = [&] (int a, int b) {
             return a != b && alive[a] && alive[b] && cand[a] && cand[b] && dev[a] == dev[b];
         };
-        auto false_twins = [&](int a, int b) {
+        auto false_twins = [&] (int a, int b) {
             return preds[a] == preds[b] && succs[a] == succs[b];
         };
-        auto are_seq = [&](int a, int b) {
+        auto are_seq = [&] (int a, int b) {
             return succs[a].size() == 1 && *succs[a].begin() == b &&
                    preds[b].size() == 1 && *preds[b].begin() == a;
         };
-        auto merge = [&](int a, int b) {
+        auto merge = [&] (int a, int b) {
             /* absorb b into a */
             for (int x : preds[b])
             {
@@ -300,7 +300,7 @@ struct BatchPass
 } // anonymous namespace
 
 std::unique_ptr<Pass>
-ocg::cg::createBatchPass()
+ocg::cg::create_batch_pass(void)
 {
     return std::make_unique<BatchPass>();
 }

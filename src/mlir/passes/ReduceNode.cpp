@@ -7,13 +7,13 @@
 ** not pay off, i.e. when  m*n < 1 + m + n. Entry/exit nodes are never removed.
 */
 
-#include "bridge.h"
+# include <opencg/mlir/opencg-mlir.hpp>
 
-#include "mlir/Pass/Pass.h"
-#include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/SetVector.h"
-#include "llvm/ADT/SmallPtrSet.h"
-#include "llvm/ADT/SmallVector.h"
+# include "mlir/Pass/Pass.h"
+# include "llvm/ADT/STLExtras.h"
+# include "llvm/ADT/SetVector.h"
+# include "llvm/ADT/SmallPtrSet.h"
+# include "llvm/ADT/SmallVector.h"
 
 using namespace mlir;
 
@@ -90,7 +90,7 @@ struct ReduceNodePass
 } // anonymous namespace
 
 std::unique_ptr<Pass>
-ocg::cg::createReduceNodePass()
+ocg::cg::create_reduce_node_pass(void)
 {
     return std::make_unique<ReduceNodePass>();
 }

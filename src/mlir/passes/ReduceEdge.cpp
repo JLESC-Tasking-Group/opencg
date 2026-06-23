@@ -7,16 +7,16 @@
 ** accumulation), then redundant edges are dropped.
 */
 
-#include "bridge.h"
+# include <opencg/mlir/opencg-mlir.hpp>
 
-#include "mlir/Pass/Pass.h"
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/SmallPtrSet.h"
-#include "llvm/ADT/SmallVector.h"
+# include "mlir/Pass/Pass.h"
+# include "llvm/ADT/DenseMap.h"
+# include "llvm/ADT/SmallPtrSet.h"
+# include "llvm/ADT/SmallVector.h"
 
-#include <opencg/bitset2d.hpp>
+# include <opencg/bitset2d.hpp>
 
-#include <vector>
+# include <vector>
 
 using namespace mlir;
 
@@ -157,7 +157,7 @@ struct ReduceEdgePass
 } // anonymous namespace
 
 std::unique_ptr<Pass>
-ocg::cg::createReduceEdgePass()
+ocg::cg::create_reduce_edge_pass(void)
 {
     return std::make_unique<ReduceEdgePass>();
 }

@@ -5,20 +5,20 @@
 ** command graph: one op per node, edges encoded as !cg.token operands.
 */
 
-#include "bridge.h"
+# include <opencg/mlir/opencg-mlir.hpp>
 
-#include "mlir/IR/Builders.h"
-#include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/IR/BuiltinOps.h"
+# include "mlir/IR/Builders.h"
+# include "mlir/IR/BuiltinAttributes.h"
+# include "mlir/IR/BuiltinOps.h"
 
-#include <opencg/command.hpp>
-#include <opencg/command-graph.hpp>
-#include <opencg/command-type.hpp>
+# include <opencg/command.hpp>
+# include <opencg/command-graph.hpp>
+# include <opencg/command-type.hpp>
 
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <vector>
+# include <cstdint>
+# include <cstdio>
+# include <cstdlib>
+# include <vector>
 
 using namespace mlir;
 
@@ -158,8 +158,8 @@ import_command_graph(
     OperationState gstate(loc, GraphOp::getOperationName());
     Region * region = gstate.addRegion();
     region->emplaceBlock();
-    Operation * graphOp = b.create(gstate);
-    Block & body = graphOp->getRegion(0).front();
+    Operation * graph_op = b.create(gstate);
+    Block & body = graph_op->getRegion(0).front();
     b.setInsertionPointToStart(&body);
 
     Type tok = TokenType::get(&ctx);

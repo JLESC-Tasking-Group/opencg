@@ -7,15 +7,15 @@
 **   - Otherwise normalize it to sizeof_type == 1 (scaling m by the old size).
 */
 
-#include "bridge.h"
+# include <opencg/mlir/opencg-mlir.hpp>
 
-#include "mlir/IR/Builders.h"
-#include "mlir/Pass/Pass.h"
-#include "llvm/ADT/STLExtras.h"
+# include "mlir/IR/Builders.h"
+# include "mlir/Pass/Pass.h"
+# include "llvm/ADT/STLExtras.h"
 
-#include <opencg/command-type.hpp>
+# include <opencg/command-type.hpp>
 
-#include <cstdint>
+# include <cstdint>
 
 using namespace mlir;
 
@@ -77,20 +77,24 @@ struct CopyNormalizePass
                 st.addAttribute("src_addr", b.getI64IntegerAttr((int64_t) c.getSrcAddr()));
                 st.addAttribute("dst_addr", b.getI64IntegerAttr((int64_t) c.getDstAddr()));
                 st.addAttribute("size",     b.getI64IntegerAttr((int64_t) (m * n * s)));
-                Operation * n1d = b.create(st);
+                Operation * node_1d = b.create(st);
 
                 /* preserve the originating POD node, then replace */
                 if (command_graph_node_t * sn = get_src_node(c))
-                    set_src_node(n1d, sn);
+                    set_src_node(node_1d, sn);
 
-                c.getToken().replaceAllUsesWith(n1d->getResult(0));
+                c.getToken().replaceAllUsesWith(node_1d->getResult(0));
                 c->erase();
             }
             else
             {
-                /* normalize sizeof_type to 1 */
-                c.setSizeofType(1);
+                /* normalize to byte units: scale the column extent AND both
+                 * leading dimensions by the element size, otherwise the row
+                 * strides would lose the 'sizeof_type' factor. */
+                c.setSrcLd(c.getSrcLd() * s);
+                c.setDstLd(c.getDstLd() * s);
                 c.setM(m * s);
+                c.setSizeofType(1);
             }
         }
     }
@@ -99,7 +103,7 @@ struct CopyNormalizePass
 } // anonymous namespace
 
 std::unique_ptr<Pass>
-ocg::cg::createCopyNormalizePass()
+ocg::cg::create_copy_normalize_pass(void)
 {
     return std::make_unique<CopyNormalizePass>();
 }

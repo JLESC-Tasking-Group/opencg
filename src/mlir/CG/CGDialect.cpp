@@ -2,11 +2,11 @@
 ** OpenCG `cg` MLIR dialect - definitions.
 */
 
-#include "CG/CGDialect.h"
+# include <opencg/mlir/CG/CGDialect.h>
 
-#include "mlir/IR/Builders.h"
-#include "mlir/IR/DialectImplementation.h"
-#include "llvm/ADT/TypeSwitch.h"
+# include "mlir/IR/Builders.h"
+# include "mlir/IR/DialectImplementation.h"
+# include "llvm/ADT/TypeSwitch.h"
 
 using namespace mlir;
 using namespace ocg::cg;
@@ -19,25 +19,25 @@ using namespace ocg::cg;
 // parser/printer emitted here.
 //===----------------------------------------------------------------------===//
 
-#define GET_TYPEDEF_CLASSES
-#include "CGTypes.cpp.inc"
+# define GET_TYPEDEF_CLASSES
+# include "CGTypes.cpp.inc"
 
 //===----------------------------------------------------------------------===//
 // Dialect
 //===----------------------------------------------------------------------===//
 
-#include "CGDialect.cpp.inc"
+# include "CGDialect.cpp.inc"
 
 void CGDialect::initialize()
 {
     addTypes<
-#define GET_TYPEDEF_LIST
-#include "CGTypes.cpp.inc"
+# define GET_TYPEDEF_LIST
+# include "CGTypes.cpp.inc"
     >();
 
     addOperations<
-#define GET_OP_LIST
-#include "CGOps.cpp.inc"
+# define GET_OP_LIST
+# include "CGOps.cpp.inc"
     >();
 }
 
@@ -45,8 +45,8 @@ void CGDialect::initialize()
 // Ops
 //===----------------------------------------------------------------------===//
 
-#define GET_OP_CLASSES
-#include "CGOps.cpp.inc"
+# define GET_OP_CLASSES
+# include "CGOps.cpp.inc"
 
 //===----------------------------------------------------------------------===//
 // RegionKindInterface : cg.graph and cg.batch hold *graph* regions

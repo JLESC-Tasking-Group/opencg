@@ -7,19 +7,19 @@
 ** nodes/commands via the graph's allocator callbacks otherwise.
 */
 
-#include "bridge.h"
+# include <opencg/mlir/opencg-mlir.hpp>
 
-#include "mlir/IR/BuiltinAttributes.h"
-#include "llvm/ADT/DenseMap.h"
+# include "mlir/IR/BuiltinAttributes.h"
+# include "llvm/ADT/DenseMap.h"
 
-#include <opencg/command.hpp>
-#include <opencg/command-graph.hpp>
-#include <opencg/command-type.hpp>
+# include <opencg/command.hpp>
+# include <opencg/command-graph.hpp>
+# include <opencg/command-type.hpp>
 
-#include <cstdint>
-#include <cstring>
-#include <cstdio>
-#include <cstdlib>
+# include <cstdint>
+# include <cstring>
+# include <cstdio>
+# include <cstdlib>
 
 using namespace mlir;
 
@@ -166,16 +166,16 @@ build_batch_node(command_graph_t * cg, BatchOp batch)
     /* allocate + (callback-)initialize the sub command graph (entry/exit set) */
     command_graph_t * sub = cg->command_graph_new(cg);
     assert(sub);
-    command_graph_node_t * sentry = sub->node_get_entry();
-    command_graph_node_t * sexit  = sub->node_get_exit();
-    assert(sentry && sexit);
+    command_graph_node_t * sub_entry = sub->node_get_entry();
+    command_graph_node_t * sub_exit  = sub->node_get_exit();
+    assert(sub_entry && sub_exit);
 
     /* detach the default entry->exit edge */
-    sentry->successors.clear();
-    sexit->predecessors.clear();
+    sub_entry->successors.clear();
+    sub_exit->predecessors.clear();
 
     Block & rb = batch.getBodyBlock();
-    llvm::DenseMap<Operation *, command_graph_node_t *> subout;
+    llvm::DenseMap<Operation *, command_graph_node_t *> sub_nodes;
 
     /* create one sub-node per member */
     for (Operation & mref : rb)
@@ -199,7 +199,7 @@ build_batch_node(command_graph_t * cg, BatchOp batch)
             node = create_pod_node_from_op(sub, m);
         }
 
-        subout[m] = node;
+        sub_nodes[m] = node;
         node->predecessors.clear();
         node->successors.clear();
     }
@@ -208,12 +208,12 @@ build_batch_node(command_graph_t * cg, BatchOp batch)
     for (Operation & mref : rb)
     {
         Operation * m = &mref;
-        command_graph_node_t * node = subout[m];
+        command_graph_node_t * node = sub_nodes[m];
         for (Value t : m->getOperands())
         {
             Operation * d = t.getDefiningOp();
-            assert(d && subout.count(d));
-            subout[d]->precedes(node);
+            assert(d && sub_nodes.count(d));
+            sub_nodes[d]->precedes(node);
         }
     }
 
@@ -221,19 +221,19 @@ build_batch_node(command_graph_t * cg, BatchOp batch)
     for (Operation & mref : rb)
     {
         Operation * m = &mref;
-        command_graph_node_t * node = subout[m];
-        if (node->predecessors.size() == 0) sentry->precedes(node);
-        if (node->successors.size()   == 0) node->precedes(sexit);
+        command_graph_node_t * node = sub_nodes[m];
+        if (node->predecessors.size() == 0) sub_entry->precedes(node);
+        if (node->successors.size()   == 0) node->precedes(sub_exit);
     }
 
     /* build the BATCH command + node in the parent graph */
-    command_t * bcmd = cg->command_new(cg, COMMAND_TYPE_BATCH);
-    bcmd->batch.cg            = sub;
-    bcmd->batch.driver_handle = NULL;
+    command_t * batch_cmd = cg->command_new(cg, COMMAND_TYPE_BATCH);
+    batch_cmd->batch.cg            = sub;
+    batch_cmd->batch.driver_handle = NULL;
 
-    command_graph_node_t * bnode = cg->command_graph_node_new(cg, duid, COMMAND_GRAPH_NODE_TYPE_COMMAND);
-    bnode->command = bcmd;
-    return bnode;
+    command_graph_node_t * batch_node = cg->command_graph_node_new(cg, duid, COMMAND_GRAPH_NODE_TYPE_COMMAND);
+    batch_node->command = batch_cmd;
+    return batch_node;
 }
 
 } // anonymous namespace
@@ -246,8 +246,8 @@ export_command_graph(
     Block & body = graph.getBodyBlock();
 
     llvm::DenseMap<Operation *, command_graph_node_t *> out;
-    command_graph_node_t * entryNode = nullptr;
-    command_graph_node_t * exitNode  = nullptr;
+    command_graph_node_t * entry_node = nullptr;
+    command_graph_node_t * exit_node  = nullptr;
 
     /* pass 1: resolve a POD node for every op and clear its adjacency */
     for (Operation & opref : body)
@@ -268,8 +268,8 @@ export_command_graph(
         node->predecessors.clear();
         node->successors.clear();
 
-        if (op_is_entry(op)) entryNode = node;
-        if (op_is_exit(op))  exitNode  = node;
+        if (op_is_entry(op)) entry_node = node;
+        if (op_is_exit(op))  exit_node  = node;
     }
 
     /* pass 2: relink edges from token operands */
@@ -288,12 +288,12 @@ export_command_graph(
     }
 
     /* rewire entry/exit */
-    assert(entryNode && "exported graph has no entry node");
-    assert(exitNode  && "exported graph has no exit node");
-    assert(entryNode->predecessors.size() == 0);
-    assert(exitNode->successors.size()    == 0);
-    cg->entry = entryNode;
-    cg->exit  = exitNode;
+    assert(entry_node && "exported graph has no entry node");
+    assert(exit_node  && "exported graph has no exit node");
+    assert(entry_node->predecessors.size() == 0);
+    assert(exit_node->successors.size()    == 0);
+    cg->entry = entry_node;
+    cg->exit  = exit_node;
 }
 
 } // namespace cg

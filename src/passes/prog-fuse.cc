@@ -57,6 +57,11 @@
 # include <llvm/Target/TargetMachine.h>
 # include <llvm/TargetParser/Host.h>
 
+/* In-process JIT (replaces the former Proteus dependency) */
+# include <llvm/ExecutionEngine/Orc/LLJIT.h>
+# include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
+# include <llvm/Support/Error.h>
+
 # include <cstring>
 # include <memory>
 # include <mutex>
@@ -64,10 +69,6 @@
 # include <vector>
 
 # endif /* OPENCG_SUPPORT_LLVM */
-
-# if OPENCG_SUPPORT_PROTEUS
-# include <proteus/LLVMIRJitModule.h>
-# endif /* OPENCG_SUPPORT_PROTEUS */
 
 OCG_NAMESPACE_USE;
 
@@ -190,10 +191,10 @@ command_graph_pass_prog_fuse_llvmir(
      *  before the targets are registered triggers StringMap assertion    *
      *  failures on recent LLVM builds (>= 21).                           *
      *                                                                     *
-     *  We mirror exactly what Proteus's InitLLVMTargets struct does in   *
-     *  JitEngine, but guard with std::call_once so the registration is   *
-     *  idempotent across multiple fusion calls and across the Proteus    *
-     *  singleton initialisation that happens later in compile().         *
+     *  Registering all targets covers both the host (needed by the LLJIT  *
+     *  in step 7) and any cross-target the fused IR might reference. We    *
+     *  guard with std::call_once so registration is idempotent across     *
+     *  multiple fusion calls.                                             *
      * ------------------------------------------------------------------ */
     {
         static std::once_flag llvm_init_flag;
@@ -381,18 +382,13 @@ command_graph_pass_prog_fuse_llvmir(
 
     /* ------------------------------------------------------------------ *
      * 6. Stamp the host target triple and data layout onto the merged    *
-     *    module, then verify and emit it as LLVM IR text.                *
+     *    module, then verify it.                                          *
      *                                                                     *
-     *  Parsed IR strings from the test have no target triple or data     *
-     *  layout (the .ll files omit them).  Without these fields:          *
-     *    - llvm::Module::print() walks uninitialized DataLayout fields,  *
-     *      which Valgrind reports as "uninitialised value" reads and     *
-     *      which corrupt the output string in undefined ways.            *
-     *    - Proteus's LLVMIRJitModule::compile() sets them before         *
-     *      code-gen, but print() runs before compile(), so the corrupt   *
-     *      IR string reaches Proteus and causes its ORC StringMap abort. *
-     *  We mirror what Proteus does: set the process triple, then create  *
-     *  a TargetMachine for the host and use its DataLayout.             *
+     *  Parsed IR strings have no target triple or data layout (the .ll   *
+     *  inputs omit them). The JIT needs a concrete host data layout for   *
+     *  correct code generation and symbol mangling, and serialisation     *
+     *  walks the DataLayout fields. We set the process triple, then       *
+     *  create a TargetMachine for the host and use its DataLayout.        *
      * ------------------------------------------------------------------ */
     {
         /* Set the target triple to the host process triple if not set. */
@@ -437,22 +433,18 @@ command_graph_pass_prog_fuse_llvmir(
     }
 
     /* ------------------------------------------------------------------ *
-     * 6b. Serialise to LLVM bitcode (not text IR).                       *
+     * 6b. Serialise to LLVM bitcode and store it as the fused node's      *
+     *     source blob (the in-memory module itself is consumed by the JIT *
+     *     in step 7).                                                      *
      *                                                                     *
-     *  The text printer (Module::print / AssemblyWriter::printFunction)  *
-     *  reads function attributes and argument metadata that may contain  *
+     *  We use the bitcode writer rather than the text printer because the *
+     *  text printer (Module::print / AssemblyWriter::printFunction) reads *
+     *  function attributes and argument metadata that may contain         *
      *  uninitialised padding when the input IR used legacy typed-pointer  *
-     *  syntax (double*, i64*) auto-promoted to opaque pointers by the    *
-     *  parser.  Valgrind catches these reads and the resulting corrupt   *
-     *  bytes in the output string cause Proteus's ORC SymbolStringPool  *
-     *  to assert (NumItems + NumTombstones <= NumBuckets) when it tries  *
-     *  to intern strings from the malformed IR.                          *
-     *                                                                     *
-     *  LLVM's bitcode writer serialises the in-memory IR binary fields   *
-     *  directly and never exercises the attribute-printing path, so it   *
-     *  produces a clean, well-defined byte stream regardless of any      *
-     *  uninitialised padding in the attribute structures.                *
-     *  Proteus accepts bitcode via LLVMIRInputKind::Bitcode.            *
+     *  syntax (double*, i64*) auto-promoted to opaque pointers. The       *
+     *  bitcode writer serialises the in-memory IR binary fields directly  *
+     *  and never exercises the attribute-printing path, producing a       *
+     *  clean, well-defined byte stream.                                   *
      * ------------------------------------------------------------------ */
     std::string bitcode;
     {
@@ -474,8 +466,9 @@ command_graph_pass_prog_fuse_llvmir(
     puv->source.content.llvmir.size   = bitcode.size();
 
     /* ------------------------------------------------------------------ *
-     * 7. Compile the fused bitcode with Proteus and set up the variadic  *
-     *    launcher so the fused function is directly callable.             *
+     * 7. JIT-compile the fused module in-process (LLVM ORC LLJIT) and     *
+     *    set up the variadic launcher so the fused function is directly   *
+     *    callable.                                                         *
      *                                                                     *
      *  launcher.variadic layout:                                          *
      *    fn        -> void __fused_wrapper(void** args)                  *
@@ -483,18 +476,37 @@ command_graph_pass_prog_fuse_llvmir(
      *    args_size -> (nu + nv) * sizeof(void*)                          *
      * ------------------------------------------------------------------ */
 
-    # if OPENCG_SUPPORT_PROTEUS
-
-    auto * jit_module = new proteus::LLVMIRJitModule(
-        "host", bitcode, proteus::LLVMIRInputKind::Bitcode);
-    jit_module->compile();
-
-    void * fn_ptr = jit_module->getFunctionAddress("__fused_wrapper");
-    if (!fn_ptr)
+    /* Create an LLJIT. It must outlive the JIT'd code, so we intentionally
+     * leak it (its lifetime is conceptually tied to the fused command). */
+    auto jit_exp = llvm::orc::LLJITBuilder().create();
+    if (!jit_exp)
     {
-        fprintf(stderr, "prog-fuse: could not resolve '__fused_wrapper' after JIT compilation\n");
+        llvm::logAllUnhandledErrors(jit_exp.takeError(), llvm::errs(), "prog-fuse: ");
+        fprintf(stderr, "prog-fuse: failed to create LLJIT\n");
         abort();
     }
+    std::unique_ptr<llvm::orc::LLJIT> jit = std::move(*jit_exp);
+
+    /* hand the merged module (and its owning context) to the JIT */
+    llvm::orc::ThreadSafeModule tsm(std::move(mod_u), std::move(ctx));
+    if (auto err = jit->addIRModule(std::move(tsm)))
+    {
+        llvm::logAllUnhandledErrors(std::move(err), llvm::errs(), "prog-fuse: ");
+        fprintf(stderr, "prog-fuse: failed to add IR module to LLJIT\n");
+        abort();
+    }
+
+    auto sym = jit->lookup("__fused_wrapper");
+    if (!sym)
+    {
+        llvm::logAllUnhandledErrors(sym.takeError(), llvm::errs(), "prog-fuse: ");
+        fprintf(stderr, "prog-fuse: could not resolve '__fused_wrapper' after JIT\n");
+        abort();
+    }
+    void * fn_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(sym->getValue()));
+
+    /* keep the JIT (hence the compiled code) alive for the process lifetime */
+    jit.release();
 
     /* Allocate the args buffer that the runtime will fill before calling fn.
      * Each slot holds a void* pointing to an actual argument value.
@@ -510,8 +522,6 @@ command_graph_pass_prog_fuse_llvmir(
     puv->launcher.variadic.fn        = fn_ptr;
     puv->launcher.variadic.args      = args_buf;
     puv->launcher.variadic.args_size = n_args * sizeof(void *);
-
-    # endif /* OPENCG_SUPPORT_PROTEUS */
 
     # endif /* OPENCG_SUPPORT_LLVM */
 }

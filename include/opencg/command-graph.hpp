@@ -355,7 +355,7 @@ struct command_graph_t
 
     /* Legacy C++ pass implementations (src/passes/*.cc).
      * These remain available for A/B parity testing against the MLIR pipeline. */
-    # define DEF(ENUM, FUNC, NAME) void FUNC(void);
+    # define DEF(ENUM, FUNC, NAME, MK) void FUNC(void);
     OCG_FORALL_COMMAND_GRAPH_PASS(DEF);
     # undef DEF
 
@@ -366,7 +366,7 @@ struct command_graph_t
     {
         switch (pass)
         {
-            # define DEF(ENUM, FUNC, NAME) case(ENUM): { this->FUNC(); break; }
+            # define DEF(ENUM, FUNC, NAME, MK) case(ENUM): { this->FUNC(); break; }
             OCG_FORALL_COMMAND_GRAPH_PASS(DEF);
             # undef DEF
             default:

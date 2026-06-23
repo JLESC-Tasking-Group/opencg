@@ -29,14 +29,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)  # Optional: disables compiler-specific extensions
 
 include(BooleanUtils)
 ocgoption(BUILD_C_API "Build the C API." ON)
-ocgoption(USE_LLVM    "Use LLVM for IR manipulation (required by prog-fuse)." OFF)
-ocgoption(USE_PROTEUS "Use Proteus for JIT (implies USE_LLVM)." OFF)
+ocgoption(USE_LLVM    "Use LLVM for IR manipulation and JIT (required by prog-fuse)." OFF)
 ocgoption(USE_MLIR    "Use MLIR for the command-graph IR and optimization passes." OFF)
-
-# Proteus requires LLVM; force USE_LLVM ON if USE_PROTEUS is requested.
-if (USE_PROTEUS)
-    set(USE_LLVM 1)
-endif()
 
 ##########
 # OpenCG #
@@ -63,10 +57,11 @@ endif()
 # MLIR `cg` dialect + IR pipeline #
 ###################################
 #
-# All MLIR usage is confined to src/mlir/ and compiled into an OBJECT library
-# `opencgmlir`, whose objects are folded into libopencg.so. This keeps MLIR an
-# *implementation detail* of OpenCG: no installed/public header includes MLIR,
-# so consumers (e.g. XKRT) never need MLIR to build against OpenCG.
+# The MLIR implementation lives in src/mlir/ and is folded into libopencg.so.
+# The `cg` dialect headers (include/opencg/mlir/) ARE public: another runtime
+# can build cg ops, run the passes, and convert to/from the POD command graph.
+# Using them requires MLIR, but the POD headers (opencg/command*.hpp) do not,
+# so a runtime that only wants the POD path (e.g. XKRT) never needs MLIR.
 #
 # Requires an MLIR install matching your LLVM. Point CMake at it with:
 #   -DUSE_MLIR=ON -DMLIR_DIR=/path/to/llvm-project/<build>/lib/cmake/mlir
@@ -83,10 +78,16 @@ if (USE_MLIR)
     include(AddMLIR)
 
     set(OPENCG_MLIR_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/mlir)
+    set(OPENCG_MLIR_TD  ${CMAKE_CURRENT_SOURCE_DIR}/include/opencg/mlir/CG)
+
+    # TableGen needs the dialect .td directory and MLIR's own .td on its
+    # include path (for `include "CGDialect.td"` and `include "mlir/IR/..."`).
+    include_directories(${MLIR_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${OPENCG_MLIR_TD})
 
     # Generate the `cg` dialect from TableGen. The *.inc files land in
-    # ${CMAKE_CURRENT_BINARY_DIR} and are pulled in by the dialect headers.
-    set(LLVM_TARGET_DEFINITIONS ${OPENCG_MLIR_SRC}/CG/CGOps.td)
+    # ${CMAKE_CURRENT_BINARY_DIR}; the public dialect headers include them with
+    # quote-includes, so on install we place the decl *.inc next to the headers.
+    set(LLVM_TARGET_DEFINITIONS ${OPENCG_MLIR_TD}/CGOps.td)
     mlir_tablegen(CGDialect.h.inc   -gen-dialect-decls -dialect=cg)
     mlir_tablegen(CGDialect.cpp.inc -gen-dialect-defs  -dialect=cg)
     mlir_tablegen(CGTypes.h.inc     -gen-typedef-decls -typedefs-dialect=cg)
@@ -111,10 +112,9 @@ if (USE_MLIR)
     add_dependencies(opencgmlir OpenCGMLIRIncGen)
     set_target_properties(opencgmlir PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_include_directories(opencgmlir PRIVATE
-        ${CMAKE_CURRENT_BINARY_DIR}                 # generated CG*.inc
-        ${OPENCG_MLIR_SRC}
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_BINARY_DIR}/include
+        ${CMAKE_CURRENT_BINARY_DIR}                 # generated CG*.inc (quote-include)
+        ${CMAKE_CURRENT_SOURCE_DIR}/include         # public opencg/ + opencg/mlir/ headers
+        ${CMAKE_CURRENT_BINARY_DIR}/include         # generated opencg/support.h
         ${LLVM_INCLUDE_DIRS}
         ${MLIR_INCLUDE_DIRS}
     )
@@ -159,22 +159,9 @@ set(OpenCG_TARGETS ${OpenCG})
 # DEPENDENCES #
 ###############
 
-if (USE_PROTEUS)
-    # Find Proteus first so that its find_package(LLVM) call populates
-    # LLVM_DIR, LLVM_INCLUDE_DIRS, LLVM_DEFINITIONS, LLVM_LINK_LLVM_DYLIB,
-    # etc. before our own find_package(LLVM) runs.  This guarantees that both
-    # OpenCG and Proteus resolve LLVM from the exact same installation.
-    find_package(proteus CONFIG REQUIRED)
-    find_package(Threads REQUIRED)
-    target_link_libraries(opencg PRIVATE proteusFrontend)
-endif()
-
 if (USE_LLVM)
     # Allow the user to point at a specific LLVM installation via
-    # -DLLVM_DIR=<path/to/lib/cmake/llvm> or the legacy
-    # -DLLVM_INSTALL_DIR=<prefix>.  When USE_PROTEUS is also set,
-    # find_package(proteus) above has already set LLVM_DIR to the
-    # installation Proteus was built against, so both use the same LLVM.
+    # -DLLVM_DIR=<path/to/lib/cmake/llvm> or the legacy -DLLVM_INSTALL_DIR=<prefix>.
     if (DEFINED LLVM_INSTALL_DIR AND NOT DEFINED LLVM_DIR)
         set(LLVM_DIR "${LLVM_INSTALL_DIR}/lib/cmake/llvm")
     endif()
@@ -188,53 +175,27 @@ if (USE_LLVM)
     # Add LLVM's own include directories (source tree + build tree headers).
     target_include_directories(${OpenCG} PRIVATE ${LLVM_INCLUDE_DIRS})
 
-    # Link LLVM.
-    #
-    # When USE_PROTEUS is also enabled, Proteus already links LLVM (either the
-    # monolithic libLLVM.so dylib or individual static archives).  Linking a
-    # *second* set of LLVM libraries — even from the same installation — causes
-    # two copies of LLVM's global state (StringMap, LLVMContext registry, …) to
-    # be initialised in the same process, which triggers assertion failures such
-    # as the StringMap "NumItems + NumTombstones <= NumBuckets" abort.
-    #
-    # The safe strategy is:
-    #
-    #   USE_LLVM only (no Proteus):
-    #     Link per-component static libraries normally; they are the only LLVM
-    #     copy in the process so there is no duplication.
-    #
-    #   USE_LLVM + USE_PROTEUS + LLVM_LINK_LLVM_DYLIB:
-    #     Both OpenCG and Proteus link the monolithic libLLVM.so.  The dynamic
-    #     linker loads it once; a single global state is shared.
-    #
-    #   USE_LLVM + USE_PROTEUS + static LLVM (no dylib):
-    #     Proteus hides its LLVM archives via --exclude-libs on its INTERFACE
-    #     link flags, so the symbols are not exported from libproteus into
-    #     libopencg.so.  OpenCG must link the same archives directly.
-    #     Because find_package(proteus) ran first and fixed LLVM_DIR, both pick
-    #     the same .a files, so the static linker sees only one copy of each
-    #     translation unit and there is no duplicate global state at runtime.
-
-    if (USE_PROTEUS AND LLVM_LINK_LLVM_DYLIB)
-        # Single libLLVM.so — one global state, no duplication.
-        message(STATUS "LLVM: linking monolithic dylib (LLVM_LINK_LLVM_DYLIB=ON)")
-        target_link_libraries(${OpenCG} PRIVATE LLVM)
-    else()
-        # Static component libs (standalone or Proteus-static path).
-        llvm_map_components_to_libnames(LLVM_LIBS
-            core            # LLVMCore      – IRBuilder, Module, Function, …
-            irreader        # LLVMIRReader  – parseIR()
-            bitwriter       # LLVMBitWriter – WriteBitcodeToFile()
-            linker          # LLVMLinker    – Linker::linkInModule()
-            support         # LLVMSupport   – raw_ostream, MemoryBuffer, SourceMgr
-            analysis        # LLVMAnalysis  – verifyModule()
-            mc              # LLVMMC        – TargetRegistry::lookupTarget()
-            target          # LLVMTarget    – TargetMachine, InitializeAllTargets()
-            ${LLVM_TARGETS_TO_BUILD}  # architecture-specific codegen/MC/asm libs
-        )
-        message(STATUS "LLVM: linking component libs: ${LLVM_LIBS}")
-        target_link_libraries(${OpenCG} PRIVATE ${LLVM_LIBS})
-    endif()
+    # Link the LLVM component libraries used by prog-fuse: IR manipulation /
+    # linking / bitcode plus the in-process ORC JIT (LLJIT) that compiles the
+    # fused module (this replaces the former Proteus dependency).
+    llvm_map_components_to_libnames(LLVM_LIBS
+        core            # LLVMCore         - IRBuilder, Module, Function, ...
+        irreader        # LLVMIRReader     - parseIR()
+        bitwriter       # LLVMBitWriter    - WriteBitcodeToFile()
+        linker          # LLVMLinker       - Linker::linkInModule()
+        support         # LLVMSupport      - raw_ostream, MemoryBuffer, SourceMgr
+        analysis        # LLVMAnalysis     - verifyModule()
+        mc              # LLVMMC           - TargetRegistry::lookupTarget()
+        target          # LLVMTarget       - TargetMachine, InitializeAllTargets()
+        orcjit          # LLVMOrcJIT       - LLJIT
+        executionengine # LLVMExecutionEngine
+        jitlink         # LLVMJITLink      - LLJIT object linking
+        native          # host target codegen/asm (CodeGen, AsmPrinter, ...)
+        nativecodegen   # host target codegen registration
+        ${LLVM_TARGETS_TO_BUILD}  # architecture-specific codegen/MC/asm libs
+    )
+    message(STATUS "LLVM: linking component libs: ${LLVM_LIBS}")
+    target_link_libraries(${OpenCG} PRIVATE ${LLVM_LIBS})
 endif()
 
 ################
@@ -255,6 +216,21 @@ install(
 # Installation - lib and include files
 install(TARGETS ${OpenCG_TARGETS} LIBRARY DESTINATION lib ARCHIVE DESTINATION lib)
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ DESTINATION include FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp")
+
+# Installation - public MLIR `cg` dialect: its TableGen sources and the generated
+# declaration .inc files (placed next to the dialect headers so their
+# quote-includes resolve against the install tree).
+if (USE_MLIR)
+    install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/opencg/mlir/
+            DESTINATION include/opencg/mlir
+            FILES_MATCHING PATTERN "*.td")
+    install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/CGDialect.h.inc
+        ${CMAKE_CURRENT_BINARY_DIR}/CGTypes.h.inc
+        ${CMAKE_CURRENT_BINARY_DIR}/CGOps.h.inc
+        DESTINATION include/opencg/mlir/CG
+    )
+endif()
 
 # Installation - cmake files
 target_include_directories(${OpenCG} PUBLIC

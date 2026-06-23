@@ -41,17 +41,26 @@
 
 OCG_NAMESPACE_BEGIN
 
-# define OCG_FORALL_COMMAND_GRAPH_PASS(F)                                               \
-    F(COMMAND_GRAPH_PASS_BATCH,             pass_batch,             "batch")            \
-    F(COMMAND_GRAPH_PASS_COPY_FUSE,         pass_copy_fuse,         "copy-fuse")        \
-    F(COMMAND_GRAPH_PASS_COPY_NORMALIZE,    pass_copy_normalize,    "copy-normalize")   \
-    F(COMMAND_GRAPH_PASS_PROG_FUSE,         pass_prog_fuse,         "prog-fuse")        \
-    F(COMMAND_GRAPH_PASS_REDUCE_NODE,       pass_reduce_node,       "reduce-node")      \
-    F(COMMAND_GRAPH_PASS_REDUCE_EDGE,       pass_reduce_edge,       "reduce-edge")
+/* For each command graph optimization pass:
+ *   - ENUM : the command_graph_pass_t enumerator
+ *   - FUNC : the legacy (POD) member function on command_graph_t
+ *   - NAME : a human readable name
+ *   - MK   : the MLIR pass factory in namespace ocg::cg (see opencg/mlir).
+ *            A not-yet-ported pass uses a factory that returns nullptr, so the
+ *            dispatcher transparently falls back to the legacy POD pass.
+ * The MK column is only referenced by the (MLIR-only) src/mlir translation
+ * units; POD consumers expand this macro ignoring it. */
+# define OCG_FORALL_COMMAND_GRAPH_PASS(F)                                                                   \
+    F(COMMAND_GRAPH_PASS_BATCH,             pass_batch,             "batch",            create_batch_pass)          \
+    F(COMMAND_GRAPH_PASS_COPY_FUSE,         pass_copy_fuse,         "copy-fuse",        create_copy_fuse_pass)      \
+    F(COMMAND_GRAPH_PASS_COPY_NORMALIZE,    pass_copy_normalize,    "copy-normalize",   create_copy_normalize_pass) \
+    F(COMMAND_GRAPH_PASS_PROG_FUSE,         pass_prog_fuse,         "prog-fuse",        create_prog_fuse_pass)      \
+    F(COMMAND_GRAPH_PASS_REDUCE_NODE,       pass_reduce_node,       "reduce-node",      create_reduce_node_pass)    \
+    F(COMMAND_GRAPH_PASS_REDUCE_EDGE,       pass_reduce_edge,       "reduce-edge",      create_reduce_edge_pass)
 
 enum command_graph_pass_t
 {
-    # define DEF(ENUM, FUNC, NAME) ENUM,
+    # define DEF(ENUM, FUNC, NAME, MK) ENUM,
     OCG_FORALL_COMMAND_GRAPH_PASS(DEF)
     # undef DEF
     COMMAND_GRAPH_PASS_MAX
@@ -62,7 +71,7 @@ command_graph_pass_to_str(command_graph_pass_t opt)
 {
     switch (opt)
     {
-        # define DEF(ENUM, FUNC, NAME) case(ENUM): return NAME;
+        # define DEF(ENUM, FUNC, NAME, MK) case(ENUM): return NAME;
         OCG_FORALL_COMMAND_GRAPH_PASS(DEF);
         # undef DEF
         default:

@@ -94,9 +94,14 @@ command_graph_t::pass_copy_normalize(void)
                         }                                                                           \
                         else                                                                        \
                         {                                                                           \
+                            /* normalize to byte units: scale the column extent AND both   */       \
+                            /* leading dimensions by the element size, otherwise the row   */       \
+                            /* strides would lose the 'sizeof_type' factor.                */       \
                             const size_t s = u->command->copy_2D.sizeof_type;                       \
                             u->command->copy_2D.sizeof_type = 1;                                    \
-                            u->command->copy_2D.m = u->command->copy_2D.m * s;                      \
+                            u->command->copy_2D.m      = u->command->copy_2D.m      * s;            \
+                            u->command->copy_2D.src_ld = u->command->copy_2D.src_ld * s;            \
+                            u->command->copy_2D.dst_ld = u->command->copy_2D.dst_ld * s;            \
                             break ;                                                                 \
                         }                                                                           \
                     }

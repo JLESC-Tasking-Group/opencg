@@ -10,15 +10,15 @@
 ** non-1-D fusions rather than abort.
 */
 
-#include "bridge.h"
+# include <opencg/mlir/opencg-mlir.hpp>
 
-#include "mlir/Pass/Pass.h"
-#include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/SmallPtrSet.h"
-#include "llvm/ADT/SmallVector.h"
+# include "mlir/Pass/Pass.h"
+# include "llvm/ADT/STLExtras.h"
+# include "llvm/ADT/SmallPtrSet.h"
+# include "llvm/ADT/SmallVector.h"
 
-#include <algorithm>
-#include <cstdint>
+# include <algorithm>
+# include <cstdint>
 
 using namespace mlir;
 
@@ -162,7 +162,7 @@ struct CopyFusePass
 } // anonymous namespace
 
 std::unique_ptr<Pass>
-ocg::cg::createCopyFusePass()
+ocg::cg::create_copy_fuse_pass(void)
 {
     return std::make_unique<CopyFusePass>();
 }
