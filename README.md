@@ -2,7 +2,8 @@
 
 # OpenCG - Open Command Graphs
 
-OpenCG is a library to manipulate directed acyclic graph **command graphs** (**CG**) that is **Vendor-agnostic**, supports **Multi-devices** and includes **Optimization passes**
+OpenCG is a library that defines **commands graph** (**CG**) - a **Vendor-agnostic** and **Multi-devices** Intermediate Representation (IR) for programming [**Command Processor**](https://rocm.docs.amd.com/projects/rocprofiler-compute/en/latest/conceptual/command-processor.html
+) available on modern GPUs. OpenCG provides **Optimization passes** of its IR.
 
 In a command graph
 - Nodes hold a **device unique identifier** and are either
