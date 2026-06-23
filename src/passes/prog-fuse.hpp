@@ -22,22 +22,25 @@
 OCG_NAMESPACE_BEGIN
 
 /**
- *  Fuse two LLVM-IR PROG commands into one.
- *      - pu  : the first program (executed first)
- *      - pv  : the second program (executed after pu)
- *      - puv : the destination program (may alias pu for in-place fusion)
+ *  Fuse a chain of N >= 2 LLVM-IR PROG commands into one.
+ *      - progs : the programs to fuse, in execution order (progs[0] first)
+ *      - n     : number of programs (>= 2)
+ *      - dst   : the destination program (may alias progs[0] for in-place fusion)
  *
- *  Links the two LLVM IR modules, builds a sequential wrapper, JIT-compiles it
- *  in-process and sets puv's variadic launcher to the fused function. Both pu
- *  and pv must have a COMMAND_PROG_SOURCE_TYPE_LLVMIR source.
+ *  Links all N LLVM IR modules, builds a single sequential wrapper that calls
+ *  each program's entry in order, JIT-compiles it in-process and sets dst's
+ *  variadic launcher to the fused function. Each program must have a
+ *  COMMAND_PROG_SOURCE_TYPE_LLVMIR source. Fusion is composable: a program that
+ *  is itself the result of a previous fusion is handled correctly, so arbitrary
+ *  chains fuse into one wrapper.
  *
  *  Requires OPENCG_SUPPORT_LLVM; aborts otherwise.
  */
 void
 command_graph_prog_fuse_llvmir(
-    command_prog_t * pu,
-    command_prog_t * pv,
-    command_prog_t * puv
+    command_prog_t ** progs,
+    size_t n,
+    command_prog_t * dst
 );
 
 OCG_NAMESPACE_END

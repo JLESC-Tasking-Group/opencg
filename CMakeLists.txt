@@ -37,13 +37,14 @@ ocgoption(USE_MLIR    "Use MLIR for the command-graph IR and optimization passes
 ##########
 
 SET(SOURCE_FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/command-graph.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/passes/batch.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/passes/copy-fuse.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/passes/copy-normalize.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/passes/prog-fuse-llvmir.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/passes/prog-fuse.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/passes/reduce-edge.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/passes/reduce-node.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/command-graph.cc
 )
 
 if (BUILD_C_API)

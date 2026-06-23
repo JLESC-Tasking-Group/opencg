@@ -4,20 +4,20 @@
 ** Contributors :
 ** Romain PEREIRA, rpereira@anl.gov
 **
-** cg-prog-fuse : fuse adjacent LLVM-IR programs.
+** cg-prog-fuse : fuse chains of adjacent LLVM-IR programs.
 ** Mirrors the legacy command_graph_t::pass_prog_fuse.
 **
-** A u -> v series of PROG commands (u with a single successor v, v with a
-** single predecessor u), both with an LLVM-IR source, is fused: the two LLVM
-** modules are linked and JIT-compiled into one (delegated to the shared
-** command_graph_prog_fuse_llvmir core, which also backs the legacy pass), then
-** v is contracted away.
+** A maximal chain u -> v -> w -> ... of PROG commands in series (each link: a
+** single successor / single predecessor), all with an LLVM-IR source, is fused:
+** all the LLVM modules are linked and JIT-compiled into ONE wrapper (delegated
+** to the shared N-ary command_graph_prog_fuse_llvmir core, which also backs the
+** legacy pass), then the rest of the chain is contracted away into u.
 **
 ** PROG commands are carried in the `cg` dialect as cg.generic ops (an opaque
 ** command blob). The actual fusion operates on the originating POD command
 ** (reached via the cg.src_node attribute), so this pass requires ops imported
 ** from a POD command graph; cg.generic PROG ops without a source node are
-** skipped. Non-LLVM-IR program pairs are also skipped (left unfused).
+** skipped. Non-LLVM-IR programs are also skipped (left unfused).
 **
 ** This software is governed by the CeCILL-C license. See the LICENSE file.
 **/
@@ -86,8 +86,9 @@ struct ProgFusePass
         Block & body = graph.getBodyBlock();
 
         const uint32_t prog_kind = (uint32_t) ::ocg::COMMAND_TYPE_PROG;
+        const auto LLVMIR = ::ocg::COMMAND_PROG_SOURCE_TYPE_LLVMIR;
 
-        /* snapshot PROG ops; v's are erased lazily and tracked in `dead` */
+        /* snapshot PROG ops; chain members are erased lazily, tracked in `dead` */
         llvm::SmallVector<Operation *> work;
         for (Operation & o : body)
             if (GenericOp g = dyn_cast<GenericOp>(&o))
@@ -103,52 +104,66 @@ struct ProgFusePass
 
             GenericOp u = cast<GenericOp>(uop);
             ::ocg::command_graph_node_t * un = prog_src_node(u);
-            if (un == nullptr)
+            if (un == nullptr || un->command->prog.source.type != LLVMIR)
                 continue;
 
-            /* greedily fuse the chain u -> v -> ... starting at u */
-            bool changed = true;
-            while (changed)
+            /* collect the maximal chain u -> v -> w -> ... of fusable
+             * LLVM-IR programs in series */
+            llvm::SmallVector<Operation *> chain_ops;
+            llvm::SmallVector<::ocg::command_graph_node_t *> chain_nodes;
+            chain_ops.push_back(uop);
+            chain_nodes.push_back(un);
+
+            Operation * cur = uop;
+            ::ocg::command_graph_node_t * cur_node = un;
+            for (;;)
             {
-                changed = false;
-
-                Value ut = u.getToken();
-                if (!ut.hasOneUse())
+                Value ct = cur->getResult(0);
+                if (!ct.hasOneUse())
                     break;
 
-                Operation * user = *ut.user_begin();
-                if (dead.count(user))
+                Operation * w = *ct.user_begin();
+                if (dead.count(w))
                     break;
 
-                GenericOp v = dyn_cast<GenericOp>(user);
-                if (!v || v.getKind() != prog_kind)
+                GenericOp wg = dyn_cast<GenericOp>(w);
+                if (!wg || wg.getKind() != prog_kind)
                     break;
 
-                ::ocg::command_graph_node_t * vn = prog_src_node(v);
-                if (vn == nullptr)
+                ::ocg::command_graph_node_t * wn = prog_src_node(wg);
+                if (wn == nullptr)
+                    break;
+                if (!is_series(cur, w))
+                    break;
+                if (cur_node->command->prog.source.type != LLVMIR ||
+                    wn->command->prog.source.type       != LLVMIR)
                     break;
 
-                if (!is_series(u.getOperation(), v.getOperation()))
-                    break;
+                chain_ops.push_back(w);
+                chain_nodes.push_back(wn);
+                cur = w;
+                cur_node = wn;
+            }
 
-                /* only LLVM-IR programs can be fused */
-                if (un->command->prog.source.type != ::ocg::COMMAND_PROG_SOURCE_TYPE_LLVMIR ||
-                    vn->command->prog.source.type != ::ocg::COMMAND_PROG_SOURCE_TYPE_LLVMIR)
-                    break;
+            if (chain_ops.size() < 2)
+                continue;
 
-                /* fuse v into u (in place on u's command) */
-                ::ocg::command_graph_prog_fuse_llvmir(
-                    &un->command->prog,
-                    &vn->command->prog,
-                    &un->command->prog
-                );
+            /* fuse the whole chain into u's command (N-ary, single wrapper) */
+            llvm::SmallVector<::ocg::command_prog_t *> progs;
+            progs.reserve(chain_nodes.size());
+            for (::ocg::command_graph_node_t * cn : chain_nodes)
+                progs.push_back(&cn->command->prog);
 
-                /* contract the series: v's successors now depend on u */
-                dead.insert(v.getOperation());
-                v.getToken().replaceAllUsesWith(u.getToken());
-                v->erase();
+            ::ocg::command_graph_prog_fuse_llvmir(progs.data(), progs.size(), &un->command->prog);
 
-                changed = true;
+            /* contract the chain into u: u's token takes over the chain tail's
+             * successors, and the rest of the chain is erased (back to front) */
+            Value u_tok = u.getToken();
+            chain_ops.back()->getResult(0).replaceAllUsesWith(u_tok);
+            for (size_t k = chain_ops.size(); k-- > 1; )
+            {
+                dead.insert(chain_ops[k]);
+                chain_ops[k]->erase();
             }
         }
     }
