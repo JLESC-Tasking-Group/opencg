@@ -59,10 +59,13 @@ namespace OCG_NAMESPACE { void command_graph_optimize_mlir(command_graph_t * cg,
 static inline bool
 command_graph_use_mlir_optimizer(void)
 {
-    const char * s = getenv("OPENCG_OPTIMIZER");
-    if (s && strcmp(s, "legacy") == 0)
-        return false;
-    return true;
+    static int use_mlir_optimized = -1;
+    if (use_mlir_optimized == -1)
+    {
+        const char * s = getenv("OPENCG_OPTIMIZER");
+        use_mlir_optimized = (s && strcmp(s, "legacy") == 0) ? 0 : 1;
+    }
+    return (bool) use_mlir_optimized;
 }
 # endif /* OPENCG_USE_MLIR */
 

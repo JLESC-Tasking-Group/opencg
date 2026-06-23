@@ -104,6 +104,9 @@ if (USE_MLIR)
         ${OPENCG_MLIR_SRC}/optimize.cpp
         ${OPENCG_MLIR_SRC}/passes/ReduceNode.cpp
         ${OPENCG_MLIR_SRC}/passes/ReduceEdge.cpp
+        ${OPENCG_MLIR_SRC}/passes/CopyNormalize.cpp
+        ${OPENCG_MLIR_SRC}/passes/CopyFuse.cpp
+        ${OPENCG_MLIR_SRC}/passes/Batch.cpp
     )
     add_dependencies(opencgmlir OpenCGMLIRIncGen)
     set_target_properties(opencgmlir PROPERTIES POSITION_INDEPENDENT_CODE ON)

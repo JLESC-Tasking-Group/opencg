@@ -49,10 +49,16 @@ void CGDialect::initialize()
 #include "CGOps.cpp.inc"
 
 //===----------------------------------------------------------------------===//
-// RegionKindInterface : cg.graph holds a *graph* region (no SSA dominance).
+// RegionKindInterface : cg.graph and cg.batch hold *graph* regions
+// (no SSA dominance).
 //===----------------------------------------------------------------------===//
 
 RegionKind GraphOp::getRegionKind(unsigned /*index*/)
+{
+    return RegionKind::Graph;
+}
+
+RegionKind BatchOp::getRegionKind(unsigned /*index*/)
 {
     return RegionKind::Graph;
 }

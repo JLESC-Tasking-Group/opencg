@@ -101,4 +101,33 @@ def GenericOp : CG_Op<"generic"> {
   let results = (outs CG_TokenType:$token);
 }
 
+//===----------------------------------------------------------------------===//
+// cg.batch : a contracted monochromatic sub-graph
+//
+// Produced by the batch pass. The body region holds the batched member node ops
+// connected by their internal !cg.token edges; member ops only reference values
+// defined within the region (IsolatedFromAbove). External precedence enters via
+// the op's $predecessors operands and leaves via its $token result. On export
+// this becomes a COMMAND_TYPE_BATCH command whose batch.cg is a sub command
+// graph (consumed by drivers, e.g. mapped to a CUgraph).
+//===----------------------------------------------------------------------===//
+
+def BatchOp : CG_Op<"batch", [
+    IsolatedFromAbove,
+    NoTerminator,
+    SingleBlock,
+    DeclareOpInterfaceMethods<RegionKindInterface>
+  ]> {
+  let summary = "A batched sub-graph of same-device commands.";
+  let arguments = (ins
+    Variadic<CG_TokenType>:$predecessors,
+    I32Attr:$duid
+  );
+  let results = (outs CG_TokenType:$token);
+  let regions = (region SizedRegion<1>:$body);
+  let extraClassDeclaration = [{
+    ::mlir::Block & getBodyBlock() { return getBody().front(); }
+  }];
+}
+
 #endif // OPENCG_CG_OPS_TD

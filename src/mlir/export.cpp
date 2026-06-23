@@ -10,6 +10,7 @@
 #include "bridge.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
+#include "llvm/ADT/DenseMap.h"
 
 #include <opencg/command.hpp>
 #include <opencg/command-graph.hpp>
@@ -91,11 +92,17 @@ update_node_from_op(command_graph_node_t * node, Operation * op)
     /* EmptyOp / GenericOp: nothing besides duid to update */
 }
 
+/* forward declaration: build a POD batch node (+ sub command graph) */
+static command_graph_node_t * build_batch_node(command_graph_t * cg, BatchOp batch);
+
 /* Allocate a fresh POD node+command for an op created by a pass (no source). */
 static command_graph_node_t *
 create_pod_node_from_op(command_graph_t * cg, Operation * op)
 {
     const uint8_t duid = get_duid(op);
+
+    if (auto batch = dyn_cast<BatchOp>(op))
+        return build_batch_node(cg, batch);
 
     if (isa<EmptyOp>(op))
         return cg->command_graph_node_new(cg, duid, COMMAND_GRAPH_NODE_TYPE_EMPTY);
@@ -147,13 +154,94 @@ create_pod_node_from_op(command_graph_t * cg, Operation * op)
     abort();
 }
 
+/* Build a POD batch node: a COMMAND_TYPE_BATCH command whose batch.cg is a sub
+ * command graph populated from the cg.batch region. Member commands are reused
+ * from their originating nodes (via cg.src_node); fresh sub-nodes are allocated
+ * in the sub-graph. Drivers later turn batch.cg into a backend batch (CUgraph). */
+static command_graph_node_t *
+build_batch_node(command_graph_t * cg, BatchOp batch)
+{
+    const uint8_t duid = get_duid(batch.getOperation());
+
+    /* allocate + (callback-)initialize the sub command graph (entry/exit set) */
+    command_graph_t * sub = cg->command_graph_new(cg);
+    assert(sub);
+    command_graph_node_t * sentry = sub->node_get_entry();
+    command_graph_node_t * sexit  = sub->node_get_exit();
+    assert(sentry && sexit);
+
+    /* detach the default entry->exit edge */
+    sentry->successors.clear();
+    sexit->predecessors.clear();
+
+    Block & rb = batch.getBodyBlock();
+    llvm::DenseMap<Operation *, command_graph_node_t *> subout;
+
+    /* create one sub-node per member */
+    for (Operation & mref : rb)
+    {
+        Operation * m = &mref;
+        command_graph_node_t * node;
+
+        command_graph_node_t * sn = get_src_node(m);
+        if (sn && sn->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && sn->command)
+        {
+            node = sub->command_graph_node_new(sub, get_duid(m), COMMAND_GRAPH_NODE_TYPE_COMMAND);
+            node->command = sn->command;      /* reuse original command */
+            update_node_from_op(node, m);     /* writeback any pass-modified fields */
+        }
+        else if (sn && sn->type == COMMAND_GRAPH_NODE_TYPE_EMPTY)
+        {
+            node = sub->command_graph_node_new(sub, get_duid(m), COMMAND_GRAPH_NODE_TYPE_EMPTY);
+        }
+        else
+        {
+            node = create_pod_node_from_op(sub, m);
+        }
+
+        subout[m] = node;
+        node->predecessors.clear();
+        node->successors.clear();
+    }
+
+    /* internal edges (all operands reference members: graph region) */
+    for (Operation & mref : rb)
+    {
+        Operation * m = &mref;
+        command_graph_node_t * node = subout[m];
+        for (Value t : m->getOperands())
+        {
+            Operation * d = t.getDefiningOp();
+            assert(d && subout.count(d));
+            subout[d]->precedes(node);
+        }
+    }
+
+    /* connect entry -> sources and sinks -> exit within the sub-graph */
+    for (Operation & mref : rb)
+    {
+        Operation * m = &mref;
+        command_graph_node_t * node = subout[m];
+        if (node->predecessors.size() == 0) sentry->precedes(node);
+        if (node->successors.size()   == 0) node->precedes(sexit);
+    }
+
+    /* build the BATCH command + node in the parent graph */
+    command_t * bcmd = cg->command_new(cg, COMMAND_TYPE_BATCH);
+    bcmd->batch.cg            = sub;
+    bcmd->batch.driver_handle = NULL;
+
+    command_graph_node_t * bnode = cg->command_graph_node_new(cg, duid, COMMAND_GRAPH_NODE_TYPE_COMMAND);
+    bnode->command = bcmd;
+    return bnode;
+}
+
 } // anonymous namespace
 
 void
 export_command_graph(
     GraphOp graph,
-    command_graph_t * cg,
-    NodeMap & map
+    command_graph_t * cg
 ) {
     Block & body = graph.getBodyBlock();
 
@@ -166,12 +254,10 @@ export_command_graph(
     {
         Operation * op = &opref;
 
-        command_graph_node_t * node;
-        auto it = map.find(op);
-        if (it != map.end())
+        command_graph_node_t * node = get_src_node(op);
+        if (node)
         {
-            node = it->second;            /* reuse: keeps command/flags/replay state */
-            update_node_from_op(node, op);
+            update_node_from_op(node, op);   /* reuse: keeps command/flags/replay state */
         }
         else
         {

@@ -38,8 +38,11 @@ command_graph_optimize_mlir(
     std::unique_ptr<Pass> p;
     switch (pass)
     {
-        case COMMAND_GRAPH_PASS_REDUCE_NODE: p = createReduceNodePass(); break;
-        case COMMAND_GRAPH_PASS_REDUCE_EDGE: p = createReduceEdgePass(); break;
+        case COMMAND_GRAPH_PASS_REDUCE_NODE:    p = createReduceNodePass();    break;
+        case COMMAND_GRAPH_PASS_REDUCE_EDGE:    p = createReduceEdgePass();    break;
+        case COMMAND_GRAPH_PASS_COPY_NORMALIZE: p = createCopyNormalizePass(); break;
+        case COMMAND_GRAPH_PASS_COPY_FUSE:      p = createCopyFusePass();      break;
+        case COMMAND_GRAPH_PASS_BATCH:          p = createBatchPass();         break;
         default:
             cg->optimize_legacy(pass);
             return;
@@ -50,8 +53,7 @@ command_graph_optimize_mlir(
     context.getOrLoadDialect<CGDialect>();
 
     /* import POD -> MLIR */
-    NodeMap map;
-    OwningOpRef<ModuleOp> module = import_command_graph(context, cg, map);
+    OwningOpRef<ModuleOp> module = import_command_graph(context, cg);
     GraphOp graph = get_graph(module.get());
     if (!graph)
     {
@@ -75,7 +77,7 @@ command_graph_optimize_mlir(
     }
 
     /* export MLIR -> POD */
-    export_command_graph(graph, cg, map);
+    export_command_graph(graph, cg);
 }
 
 } // namespace ocg

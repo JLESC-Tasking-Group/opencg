@@ -128,11 +128,25 @@ get_graph(ModuleOp module)
     return GraphOp();
 }
 
+command_graph_node_t *
+get_src_node(Operation * op)
+{
+    if (auto a = op->getAttrOfType<IntegerAttr>(kSrcNodeAttr))
+        return reinterpret_cast<command_graph_node_t *>((uintptr_t) a.getInt());
+    return nullptr;
+}
+
+void
+set_src_node(Operation * op, command_graph_node_t * node)
+{
+    OpBuilder b(op->getContext());
+    op->setAttr(kSrcNodeAttr, b.getI64IntegerAttr((int64_t) (uintptr_t) node));
+}
+
 OwningOpRef<ModuleOp>
 import_command_graph(
     MLIRContext & ctx,
-    command_graph_t * cg,
-    NodeMap & map
+    command_graph_t * cg
 ) {
     OpBuilder b(&ctx);
     Location loc = b.getUnknownLoc();
@@ -168,7 +182,7 @@ import_command_graph(
         Operation * op = create_node_op(b, loc, tok, node, node == entry, node == exit);
         assert(node->iterator_index < n);
         ops[node->iterator_index] = op;
-        map[op] = node;
+        set_src_node(op, node);
     }
 
     /* pass 2: wire predecessor tokens (order-independent: graph region) */

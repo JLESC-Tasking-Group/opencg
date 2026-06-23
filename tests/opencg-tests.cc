@@ -56,7 +56,14 @@ command_graph_node_new(
 static command_graph_t *
 command_graph_new(command_graph_t * original_cg)
 {
-    return new command_graph_t();
+    command_graph_t * cg = new command_graph_t();
+    /* When invoked as the allocator callback for a *sub*-graph (e.g. a batch),
+     * initialize it so it has entry/exit nodes and allocator callbacks. The
+     * top-level graph is created with original_cg == NULL and is initialized
+     * explicitly by the caller via cg->init(...). */
+    if (original_cg)
+        cg->init(command_new, command_graph_node_new, command_graph_new);
+    return cg;
 }
 
 static command_graph_t *
