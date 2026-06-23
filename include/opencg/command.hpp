@@ -112,10 +112,17 @@ struct command_prog_t
     // TODO: shouldnt this bellow be user-defined instead ?
 
     /* source of the prog */
-    void * source;
+    struct {
 
-    /* format of the prog */
-    command_prog_source_type_t source_type;
+        /* format of the prog */
+        command_prog_source_type_t type;
+        union {
+            struct {
+                void * raw;
+                size_t size;
+            } llvmir;
+        } content;
+    } source;
 
     /* grid parameters */
     struct {

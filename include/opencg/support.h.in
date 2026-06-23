@@ -38,7 +38,10 @@
 #ifndef __OPENCG_SUPPORT_H__
 # define __OPENCG_SUPPORT_H__
 
-/* If Proteus JIT is enabled */
+/* If LLVM IR manipulation is enabled */
+# define OPENCG_SUPPORT_LLVM    @USE_LLVM@
+
+/* If Proteus JIT is enabled (implies OPENCG_SUPPORT_LLVM) */
 # define OPENCG_SUPPORT_PROTEUS @USE_PROTEUS@
 
 #endif /* __OPENCG_SUPPORT_H__ */

@@ -34,6 +34,7 @@
 ** knowledge of the CeCILL-C license and that you accept its terms.
 **/
 
+# include <stdint.h>
 # include <stdlib.h>
 # include <stdio.h>
 # include <string.h>
@@ -158,8 +159,9 @@ main(void)
     /* Node u: scale(s, y, n)  =>  y := s * y */
     command_t * cmd_u = command_new(cg, COMMAND_TYPE_PROG);
     assert(cmd_u);
-    cmd_u->prog.source      = (void *) scale_llvm_ir;
-    cmd_u->prog.source_type = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
+    cmd_u->prog.source.type                 = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
+    cmd_u->prog.source.content.llvmir.raw   = (void *) scale_llvm_ir;
+    cmd_u->prog.source.content.llvmir.size  = sizeof(scale_llvm_ir);
 
     constexpr device_unique_id_t host_device = 0;
     command_graph_node_t * u = command_graph_node_new(cg, host_device, COMMAND_GRAPH_NODE_TYPE_COMMAND);
@@ -169,8 +171,9 @@ main(void)
     /* Node v: axpy(a, x, y, n)  =>  y := a * x + y */
     command_t * cmd_v = command_new(cg, COMMAND_TYPE_PROG);
     assert(cmd_v);
-    cmd_v->prog.source      = (void *) axpy_llvm_ir;
-    cmd_v->prog.source_type = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
+    cmd_v->prog.source.type                 = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
+    cmd_v->prog.source.content.llvmir.raw   = (void *) axpy_llvm_ir;
+    cmd_v->prog.source.content.llvmir.size  = sizeof(axpy_llvm_ir);
 
     command_graph_node_t * v = command_graph_node_new(cg, host_device, COMMAND_GRAPH_NODE_TYPE_COMMAND);
     assert(v);
@@ -219,14 +222,15 @@ main(void)
         return 1;
     }
 
-    if (fused->command->prog.source_type != COMMAND_PROG_SOURCE_TYPE_LLVMIR)
+    if (fused->command->prog.source.type != COMMAND_PROG_SOURCE_TYPE_LLVMIR)
     {
         fprintf(stderr, "FAIL: fused node source is not LLVM-IR (type=%d)\n",
-                fused->command->prog.source_type);
+                fused->command->prog.source.type);
         return 1;
     }
 
-    if (fused->command->prog.source == nullptr)
+    if (fused->command->prog.source.content.llvmir.raw == nullptr ||
+        fused->command->prog.source.content.llvmir.size == 0)
     {
         fprintf(stderr, "FAIL: fused node has NULL source\n");
         return 1;
@@ -234,5 +238,84 @@ main(void)
 
     fprintf(stdout, "PASS: prog-fuse produced 1 fused PROG node with LLVM-IR source\n");
 
+    /* ------------------------------------------------------------------ *
+     *  Numerical correctness test                                         *
+     *                                                                     *
+     *  The fused wrapper has signature:                                   *
+     *    void __fused_wrapper(void ** args)                               *
+     *                                                                     *
+     *  args[] layout (set by the pass, filled here by the caller):       *
+     *    args[0] = &s       (double   — scale factor for scale())        *
+     *    args[1] = &yp      (double * — array pointer  for scale())      *
+     *    args[2] = &nn      (int64_t  — length         for scale())      *
+     *    args[3] = &a       (double   — scale factor for axpy())         *
+     *    args[4] = &xp      (double * — x array pointer for axpy())      *
+     *    args[5] = &yp      (double * — y array pointer for axpy())      *
+     *    args[6] = &nn      (int64_t  — length         for axpy())       *
+     *                                                                     *
+     *  Each slot holds a void* that points to the actual value, matching *
+     *  the double-dereference in load_arg() inside the wrapper.          *
+     * ------------------------------------------------------------------ */
+
+    /* The variadic launcher stores fn, the pre-allocated args buffer, and
+     * its byte size.  args_size / sizeof(void*) gives the slot count.   */
+    void *   fn        = fused->command->prog.launcher.variadic.fn;
+    void **  args_buf  = static_cast<void **>(fused->command->prog.launcher.variadic.args);
+    size_t   args_size = fused->command->prog.launcher.variadic.args_size;
+
+    if (!fn)
+    {
+        fprintf(stderr, "FAIL: fused launcher fn is NULL\n");
+        return 1;
+    }
+
+    size_t n_args = args_size / sizeof(void *);
+    if (n_args != 7)
+    {
+        fprintf(stderr, "FAIL: expected 7 args slots (3 for scale + 4 for axpy), got %zu\n", n_args);
+        return 1;
+    }
+
+    /* Typed variables whose addresses are passed to the wrapper.
+     * Use int64_t for the length to match the i64 IR parameter type.    */
+    double    s_val  = s;
+    double    a_val  = a;
+    double *  xp     = x;
+    double *  yp     = y;
+    int64_t   nn     = static_cast<int64_t>(n);
+
+    /* Populate the args buffer: each slot = pointer to the typed value. */
+    args_buf[0] = &s_val;   /* scale: s      */
+    args_buf[1] = &yp;      /* scale: y*     */
+    args_buf[2] = &nn;      /* scale: n      */
+    args_buf[3] = &a_val;   /* axpy:  a      */
+    args_buf[4] = &xp;      /* axpy:  x*     */
+    args_buf[5] = &yp;      /* axpy:  y*     */
+    args_buf[6] = &nn;      /* axpy:  n      */
+
+    /* Call the fused wrapper. */
+    typedef void (*fused_fn_t)(void **);
+    reinterpret_cast<fused_fn_t>(fn)(args_buf);
+
+    /* Check results: the fused kernel performed scale then axpy, so:
+     *   y[i]  = a * x[i] + s * y_init[i]
+     * which matches y_expected[] computed above.                         */
+    bool all_correct = true;
+    for (size_t i = 0; i < n; ++i)
+    {
+        double diff = fabs(y[i] - y_expected[i]);
+        if (diff > 1e-10)
+        {
+            fprintf(stderr,
+                    "FAIL: y[%zu] = %.6f, expected %.6f (diff = %.2e)\n",
+                    i, y[i], y_expected[i], diff);
+            all_correct = false;
+        }
+    }
+
+    if (!all_correct)
+        return 1;
+
+    fprintf(stdout, "PASS: fused kernel produced numerically correct results\n");
     return 0;
 }
