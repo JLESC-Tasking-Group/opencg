@@ -37,7 +37,51 @@
 # include <opencg/command.hpp>
 # include <opencg/command-graph.hpp>
 
+# include <stdlib.h>
+# include <string.h>
+
 OCG_NAMESPACE_USE;
+
+////////////////////////////
+// OPTIMIZATION DISPATCHER //
+////////////////////////////
+
+# if OPENCG_USE_MLIR
+/* Defined in src/mlir/optimize.cpp. MLIR-free signature so this translation
+ * unit (and any consumer) never needs MLIR headers. */
+namespace OCG_NAMESPACE { void command_graph_optimize_mlir(command_graph_t * cg, command_graph_pass_t pass); }
+
+/* Returns true if the MLIR optimizer should be used.
+ * Controlled by the OPENCG_OPTIMIZER environment variable:
+ *   - "legacy" -> use the legacy C++ passes
+ *   - anything else (or unset) -> use the MLIR pipeline (default)
+ * This enables A/B parity testing within a single binary. */
+static inline bool
+command_graph_use_mlir_optimizer(void)
+{
+    const char * s = getenv("OPENCG_OPTIMIZER");
+    if (s && strcmp(s, "legacy") == 0)
+        return false;
+    return true;
+}
+# endif /* OPENCG_USE_MLIR */
+
+void
+OCG_NAMESPACE::command_graph_optimize(
+    command_graph_t * cg,
+    command_graph_pass_t pass
+) {
+    # if OPENCG_USE_MLIR
+    if (command_graph_use_mlir_optimizer())
+    {
+        command_graph_optimize_mlir(cg, pass);
+        return ;
+    }
+    # endif /* OPENCG_USE_MLIR */
+
+    /* legacy C++ passes */
+    cg->optimize_legacy(pass);
+}
 
 ///////////
 //  DUMP //

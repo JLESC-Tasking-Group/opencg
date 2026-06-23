@@ -44,5 +44,11 @@
 /* If Proteus JIT is enabled (implies OPENCG_SUPPORT_LLVM) */
 # define OPENCG_SUPPORT_PROTEUS @USE_PROTEUS@
 
+/* If the MLIR-based intermediate representation and optimization passes are
+ * enabled. When enabled, `command_graph_optimize` can route optimization to
+ * the MLIR `cg` dialect pipeline (see src/mlir/). This is fully encapsulated
+ * inside libopencg: no MLIR header is ever exposed to consumers (e.g., XKRT). */
+# define OPENCG_USE_MLIR        @USE_MLIR@
+
 #endif /* __OPENCG_SUPPORT_H__ */
 

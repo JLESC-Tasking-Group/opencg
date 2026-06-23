@@ -60,6 +60,19 @@ struct command_t;
 struct command_graph_node_t;
 struct command_graph_t;
 
+/**
+ *  Out-of-line optimization dispatcher.
+ *
+ *  This is THE public boundary for running optimization passes. It is defined
+ *  in the OpenCG shared library and dispatches either to the legacy C++ passes
+ *  or (when built with OPENCG_USE_MLIR) to the MLIR `cg` dialect pipeline.
+ *
+ *  Crucially, its signature exposes no MLIR type, so consumers of OpenCG (e.g.
+ *  XKRT) never need to see or link MLIR: the whole MLIR machinery is hidden
+ *  behind this function inside libopencg.
+ */
+void command_graph_optimize(command_graph_t * cg, command_graph_pass_t pass);
+
 /* Integer type to use for indexing command graph nodes */
 typedef size_t command_graph_node_index_t;
 
@@ -340,13 +353,16 @@ struct command_graph_t
     /* coherence checks */
     void coherence_checks(void);
 
+    /* Legacy C++ pass implementations (src/passes/*.cc).
+     * These remain available for A/B parity testing against the MLIR pipeline. */
     # define DEF(ENUM, FUNC, NAME) void FUNC(void);
     OCG_FORALL_COMMAND_GRAPH_PASS(DEF);
     # undef DEF
 
-    /* Run an passimization pass */
+    /* Run the legacy C++ pass directly (no MLIR). Used as the fallback path and
+     * for A/B parity testing. */
     inline void
-    optimize(command_graph_pass_t pass)
+    optimize_legacy(command_graph_pass_t pass)
     {
         switch (pass)
         {
@@ -359,6 +375,14 @@ struct command_graph_t
                 abort();
             }
         }
+    }
+
+    /* Run an optimization pass. Routes through the out-of-line dispatcher, which
+     * selects the MLIR pipeline or the legacy passes (see command_graph_optimize). */
+    inline void
+    optimize(command_graph_pass_t pass)
+    {
+        command_graph_optimize(this, pass);
     }
 
     /* get entry node */
