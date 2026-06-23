@@ -12,8 +12,9 @@
 **    selected. It imports the POD command graph into the `cg` dialect, runs the
 **    requested pass, then exports the result back into the POD graph.
 **
-** Passes not yet ported to MLIR (e.g. prog-fuse) have a factory returning
-** nullptr and transparently fall back to the legacy POD implementations.
+** All passes are available as MLIR passes. As a safety net, if a factory ever
+** returns nullptr (pass not implemented in MLIR), the dispatcher transparently
+** falls back to the legacy POD implementation.
 **
 ** This software is governed by the CeCILL-C license. See the LICENSE file.
 **/
@@ -38,15 +39,6 @@ void
 load_dialect(mlir::MLIRContext & ctx)
 {
     ctx.getOrLoadDialect<CGDialect>();
-}
-
-/* prog-fuse is intentionally not ported to MLIR (it relies on LLVM IR linking +
- * JIT). Returning nullptr makes the dispatcher fall back to the legacy POD
- * implementation. */
-std::unique_ptr<mlir::Pass>
-create_prog_fuse_pass(void)
-{
-    return nullptr;
 }
 
 std::unique_ptr<mlir::Pass>

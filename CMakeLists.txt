@@ -108,6 +108,7 @@ if (USE_MLIR)
         ${OPENCG_MLIR_SRC}/passes/CopyNormalize.cpp
         ${OPENCG_MLIR_SRC}/passes/CopyFuse.cpp
         ${OPENCG_MLIR_SRC}/passes/Batch.cpp
+        ${OPENCG_MLIR_SRC}/passes/ProgFuse.cpp
     )
     add_dependencies(opencgmlir OpenCGMLIRIncGen)
     set_target_properties(opencgmlir PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -115,6 +116,7 @@ if (USE_MLIR)
         ${CMAKE_CURRENT_BINARY_DIR}                 # generated CG*.inc (quote-include)
         ${CMAKE_CURRENT_SOURCE_DIR}/include         # public opencg/ + opencg/mlir/ headers
         ${CMAKE_CURRENT_BINARY_DIR}/include         # generated opencg/support.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/src             # internal shared headers (passes/prog-fuse.hpp)
         ${LLVM_INCLUDE_DIRS}
         ${MLIR_INCLUDE_DIRS}
     )

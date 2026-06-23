@@ -38,6 +38,8 @@
 # include <opencg/command.hpp>
 # include <opencg/command-graph.hpp>
 
+# include "prog-fuse.hpp"
+
 # if OPENCG_SUPPORT_LLVM
 
 # include <llvm/IR/Function.h>
@@ -170,9 +172,8 @@ prefix_functions(llvm::Module & M, const std::string & prefix)
 
 # endif /* OPENCG_SUPPORT_LLVM */
 
-static inline void
-command_graph_pass_prog_fuse_llvmir(
-    command_graph_t * cg,
+void
+OCG_NAMESPACE::command_graph_prog_fuse_llvmir(
     command_prog_t * pu,
     command_prog_t * pv,
     command_prog_t * puv
@@ -554,8 +555,7 @@ command_graph_pass_prog_fuse(
     }
 
     /* fuse programs to the node 'u' */
-    command_graph_pass_prog_fuse_llvmir(
-        cg,
+    command_graph_prog_fuse_llvmir(
         &u->command->prog,
         &v->command->prog,
         &u->command->prog
