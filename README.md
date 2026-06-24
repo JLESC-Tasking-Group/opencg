@@ -31,6 +31,11 @@ cmake -DCMAKE_BUILD_TYPE=Debug -DCMAKE_INSTALL_PREFIX=/path/to/install ..
 make
 ```
 
+# Runtime Configuration
+You may set the following environment variables
+- `OPENCG_OPTIMIZER` as `mlir` or `pod` to switch the optimizer representation.
+
+
 # Example
 OpenCG is integrated into the [XKRT](https://github.com/anlsys/xkrt) runtime system.
 It serves as its abstraction for representing commands, notably to record and replay.
