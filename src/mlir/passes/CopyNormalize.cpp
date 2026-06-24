@@ -80,7 +80,7 @@ struct CopyNormalizePass
                 Operation * node_1d = b.create(st);
 
                 /* preserve the originating POD node, then replace */
-                if (command_graph_node_t * sn = get_src_node(c))
+                if (::ocg::command_graph_node_t * sn = get_src_node(c))
                     set_src_node(node_1d, sn);
 
                 c.getToken().replaceAllUsesWith(node_1d->getResult(0));
