@@ -555,16 +555,16 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      * (parseIR materialises the module), so the old buffer is no longer
      * referenced and is safe to release here. */
     if (dst->source.type == COMMAND_PROG_SOURCE_TYPE_LLVMIR &&
-        dst->source.content.llvmir.owned &&
+        dst->source.content.llvmir._owned &&
         dst->source.content.llvmir.raw)
     {
         free(dst->source.content.llvmir.raw);
     }
 
-    dst->source.type                 = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
-    dst->source.content.llvmir.raw   = bc_buf;
-    dst->source.content.llvmir.size  = bitcode.size();
-    dst->source.content.llvmir.owned = true;   /* heap (malloc) — the pass owns it */
+    dst->source.type                  = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
+    dst->source.content.llvmir.raw    = bc_buf;
+    dst->source.content.llvmir.size   = bitcode.size();
+    dst->source.content.llvmir._owned = true;   /* heap (malloc) — the pass owns it */
 
     /* ------------------------------------------------------------------ *
      * 10. JIT the optimized module and resolve the wrapper.               *
@@ -613,13 +613,13 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      * may alias progs[0], whose arg slot VALUES were copied into unique_slots
      * in step 2/3b, so the old buffer is no longer referenced and is safe to
      * release here. */
-    if (dst->launcher.variadic.args_owned && dst->launcher.variadic.args)
+    if (dst->launcher.variadic._args_owned && dst->launcher.variadic.args)
         free(dst->launcher.variadic.args);
 
-    dst->launcher.variadic.fn         = fn_ptr;
-    dst->launcher.variadic.args       = args_buf;
-    dst->launcher.variadic.args_size  = n_args * sizeof(void *);
-    dst->launcher.variadic.args_owned = true;  /* heap (calloc) — the pass owns it */
+    dst->launcher.variadic.fn          = fn_ptr;
+    dst->launcher.variadic.args        = args_buf;
+    dst->launcher.variadic.args_size   = n_args * sizeof(void *);
+    dst->launcher.variadic._args_owned = true;  /* heap (calloc) — the pass owns it */
 
     /* ------------------------------------------------------------------ *
      * 12. Release the consumed inputs' owned heap buffers.                 *
@@ -639,21 +639,21 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             continue ;
 
         if (progs[i]->source.type == COMMAND_PROG_SOURCE_TYPE_LLVMIR &&
-            progs[i]->source.content.llvmir.owned &&
+            progs[i]->source.content.llvmir._owned &&
             progs[i]->source.content.llvmir.raw)
         {
             free(progs[i]->source.content.llvmir.raw);
             progs[i]->source.content.llvmir.raw   = nullptr;
             progs[i]->source.content.llvmir.size  = 0;
-            progs[i]->source.content.llvmir.owned = false;
+            progs[i]->source.content.llvmir._owned = false;
         }
 
-        if (progs[i]->launcher.variadic.args_owned && progs[i]->launcher.variadic.args)
+        if (progs[i]->launcher.variadic._args_owned && progs[i]->launcher.variadic.args)
         {
             free(progs[i]->launcher.variadic.args);
-            progs[i]->launcher.variadic.args       = nullptr;
-            progs[i]->launcher.variadic.args_size  = 0;
-            progs[i]->launcher.variadic.args_owned = false;
+            progs[i]->launcher.variadic.args        = nullptr;
+            progs[i]->launcher.variadic.args_size   = 0;
+            progs[i]->launcher.variadic._args_owned = false;
         }
     }
 

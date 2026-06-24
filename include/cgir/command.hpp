@@ -111,7 +111,7 @@ struct command_prog_t
              * owner frees `args` before overwriting/discarding it. Defaults to
              * false (see command_t's constructor) so a caller-owned static or
              * stack buffer is never freed on the first fusion. */
-            bool args_owned;
+            bool _args_owned;
         } variadic;
 
     } launcher;
@@ -132,7 +132,7 @@ struct command_prog_t
                  * bitcode produced by the prog-fuse pass). The owner frees
                  * `raw` before overwriting/discarding it. Defaults to false
                  * (see command_t's constructor). */
-                bool owned;
+                bool _owned;
             } llvmir;
         } content;
     } source;
@@ -230,8 +230,8 @@ struct command_t
          * pass sets them true once it installs its own heap buffers. */
         if (type == COMMAND_TYPE_PROG)
         {
-            prog.source.content.llvmir.owned  = false;
-            prog.launcher.variadic.args_owned = false;
+            prog.source.content.llvmir._owned  = false;
+            prog.launcher.variadic._args_owned = false;
         }
     }
 };
