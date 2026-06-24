@@ -37,6 +37,26 @@
 // Shared core of the prog-fuse optimization: the N-ary LLVM-IR kernel fusion
 // routine command_graph_prog_fuse_llvmir(), used by BOTH the legacy POD pass
 // (prog-fuse.cc) and the MLIR pass (../mlir/passes/ProgFuse.cpp).
+//
+// It links the LLVM modules of a chain of programs into a single
+// `void __fused_wrapper(void ** args)` that calls each program in order, then
+// JIT-compiles it. Two optimizations are applied while building the wrapper:
+//
+//   1. Argument deduplication. Each input program carries its argument pointers
+//      in `launcher.variadic.args` (one void* slot per kernel parameter, each
+//      the address of the actual value). Two parameters that receive the SAME
+//      slot (same void* address-of-value) are merged into a single slot in the
+//      fused args buffer; the wrapper routes both to that slot. The pass itself
+//      fills the (compacted) fused buffer at fusion time from the originals'
+//      slots, so the args are known/stable for every replay.
+//
+//   2. noalias marking (restrict-like). For a kernel's pointer parameters, if
+//      the actual pointer value (deref of the slot) is distinct from the kernel's
+//      other pointer parameters, the parameter is marked `noalias`. Combined with
+//      inlining the kernels into the wrapper and running an O3 pipeline, this lets
+//      LLVM vectorize and (where legal) fuse the kernels' loops. Distinct pointer
+//      args are ASSUMED non-overlapping; identical args are routed through one
+//      slot (a single SSA load), so genuine cross-kernel dependencies are kept.
 
 # include <cgir/namespace.hpp>
 # include <cgir/command.hpp>
@@ -62,11 +82,18 @@
 # include <llvm/TargetParser/Host.h>
 # include <llvm/TargetParser/Triple.h>
 
+/* Optimization pipeline (inline + loop-fuse + vectorize) run on the fused
+ * module before JIT, so noalias/dedup actually translate into fused loops. */
+# include <llvm/Passes/PassBuilder.h>
+# include <llvm/Passes/OptimizationLevel.h>
+# include <llvm/Transforms/Scalar/LoopFuse.h>
+
 /* In-process JIT (replaces the former Proteus dependency) */
 # include <llvm/ExecutionEngine/Orc/LLJIT.h>
 # include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 # include <llvm/Support/Error.h>
 
+# include <cassert>
 # include <cstdint>
 # include <cstdio>
 # include <cstdlib>
@@ -75,6 +102,7 @@
 # include <mutex>
 # include <optional>
 # include <string>
+# include <unordered_map>
 # include <vector>
 
 # endif /* CGIR_SUPPORT_LLVM */
@@ -82,28 +110,6 @@
 CGIR_NAMESPACE_USE;
 
 # if CGIR_SUPPORT_LLVM
-
-/**
- *  Fused launcher state: holds the compiled JIT module and the function
- *  pointer for the sequential wrapper, plus a flat args buffer concatenating
- *  every fused program's argument layout.
- *
- *  The variadic launcher stores:
- *    fn        -> address of the compiled __fused_wrapper symbol
- *    args      -> heap-allocated array of (sum of all arities) void* pointers
- *    args_size -> (sum of all arities) * sizeof(void *)
- *
- *  The wrapper has the signature:
- *    void __fused_wrapper(void** args)
- *
- *  It unpacks the void* array and calls each program's entry in order. Fusion
- *  is composable: a program that is itself a fused wrapper is invoked on its
- *  args slice, so chains (a -> b -> c -> ...) fuse correctly.
- *
- *  The JIT must stay alive for as long as the node is reachable, so we leak it
- *  intentionally. (A proper implementation would tie its lifetime to the
- *  command_prog_t.)
- */
 
 /**
  *  Parse an LLVM IR (textual .ll, NUL-terminated) or LLVM bitcode (binary) blob
@@ -147,10 +153,6 @@ parse_llvmir(const char * ir, size_t size, llvm::LLVMContext & ctx)
 /**
  *  Return the first void-returning, non-declaration function defined in the
  *  module.  This is the "kernel" we want to call.  Returns nullptr if none.
- *
- *  We explicitly require a void return type to avoid accidentally selecting
- *  a non-void helper that happens to appear before the actual kernel in the
- *  module's function list.
  */
 static llvm::Function *
 find_kernel(llvm::Module & M)
@@ -165,13 +167,12 @@ find_kernel(llvm::Module & M)
 
 /**
  *  Rename every function definition in the module by prepending 'prefix'.
- *  We only rename definitions (not declarations) to avoid touching
- *  external references that might matter.
+ *  We only rename definitions (not declarations) to avoid touching external
+ *  references that might matter.
  */
 static void
 prefix_functions(llvm::Module & M, const std::string & prefix)
 {
-    /* Collect first to avoid iterator invalidation during rename */
     std::vector<llvm::Function *> defs;
     for (llvm::Function & F : M)
         if (!F.isDeclaration())
@@ -179,6 +180,37 @@ prefix_functions(llvm::Module & M, const std::string & prefix)
 
     for (llvm::Function * F : defs)
         F->setName(prefix + F->getName().str());
+}
+
+/* Run an O3 module pipeline (inlining + loop-fuse + vectorization) on the
+ * merged module, so the inlined kernels' loops can vectorize/fuse. */
+static void
+optimize_module(llvm::Module & M, llvm::TargetMachine * tm)
+{
+    llvm::PassBuilder PB(tm);
+
+    llvm::LoopAnalysisManager     LAM;
+    llvm::FunctionAnalysisManager FAM;
+    llvm::CGSCCAnalysisManager    CGAM;
+    llvm::ModuleAnalysisManager   MAM;
+
+    PB.registerModuleAnalyses(MAM);
+    PB.registerCGSCCAnalyses(CGAM);
+    PB.registerFunctionAnalyses(FAM);
+    PB.registerLoopAnalyses(LAM);
+    PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+    /* Insert loop fusion into the default pipeline, after the scalar loop
+     * optimizations and before vectorization. LoopFuse is experimental and a
+     * no-op when fusion is illegal, so this is a best-effort enabler. */
+    PB.registerScalarOptimizerLateEPCallback(
+        [] (llvm::FunctionPassManager & FPM, llvm::OptimizationLevel)
+        {
+            FPM.addPass(llvm::LoopFusePass());
+        });
+
+    llvm::ModulePassManager MPM = PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3);
+    MPM.run(M, MAM);
 }
 
 # endif /* CGIR_SUPPORT_LLVM */
@@ -198,17 +230,6 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
 
     /* ------------------------------------------------------------------ *
      * 0. One-time LLVM global initialisation                             *
-     *                                                                     *
-     *  LLVM's ManagedStatic infrastructure (statistics, target registry, *
-     *  command-line option tables, …) must be bootstrapped before ANY    *
-     *  other LLVM API is called, including parseIR().  Calling these     *
-     *  before the targets are registered triggers StringMap assertion    *
-     *  failures on recent LLVM builds (>= 21).                           *
-     *                                                                     *
-     *  Registering all targets covers both the host (needed by the LLJIT  *
-     *  in step 7) and any cross-target the fused IR might reference. We    *
-     *  guard with std::call_once so registration is idempotent across     *
-     *  multiple fusion calls.                                             *
      * ------------------------------------------------------------------ */
     {
         static std::once_flag llvm_init_flag;
@@ -223,17 +244,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
 
     /* ------------------------------------------------------------------ *
      * 1. Parse all N IR modules into the SAME LLVMContext                 *
-     *                                                                     *
-     *  LLVM types and IR values are context-specific: mixing types from  *
-     *  different LLVMContext objects causes undefined behaviour. We       *
-     *  therefore parse every IR blob into a single shared context so that *
-     *  llvm::Linker and IRBuilder can freely reference types from any of  *
-     *  them.                                                               *
-     *                                                                     *
-     *  Ownership of the context is transferred to the JIT at step 7 (we   *
-     *  intentionally leak it to keep the compiled code alive).            *
      * ------------------------------------------------------------------ */
-
     auto ctx = std::make_unique<llvm::LLVMContext>();
 
     std::vector<std::unique_ptr<llvm::Module>> mods(n);
@@ -253,21 +264,21 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     }
 
     /* ------------------------------------------------------------------ *
-     * 2/3. Identify each program's entry function and arity, then rename   *
-     *      its definitions with a unique prefix to avoid clashes on link.  *
+     * 2/3. Per input: identify the entry function and arity, snapshot its *
+     *      argument slots (from launcher.variadic.args), then prefix-rename*
+     *      its definitions so they do not clash on link.                  *
      *                                                                     *
-     *  An entry is normally the program's kernel (first void definition). *
-     *  If a program is itself a previously-fused module it instead exposes *
-     *  a `void __fused_wrapper(void**)` entry; we then call it with a      *
-     *  pointer into the args slice and take its arity from the recorded    *
-     *  launcher.variadic.args_size. This makes fusion composable (chains). *
+     *  An entry is the program's kernel (first void definition). A program *
+     *  that is itself a previously-fused module instead exposes a          *
+     *  `void __fused_wrapper(void**)` entry; its arity comes from the      *
+     *  recorded launcher.variadic.args_size and it is invoked on a slice.  *
      * ------------------------------------------------------------------ */
-
     struct fuse_input_t
     {
-        std::string fused_name; /* entry name after prefixing */
-        bool        is_wrapper; /* true if entry is void(void**) */
-        unsigned    arity;      /* number of arg slots consumed */
+        std::string         fused_name; /* entry name after prefixing */
+        bool                is_wrapper; /* true if entry is void(void**) */
+        unsigned            arity;      /* number of arg slots consumed */
+        std::vector<void *> slots;      /* the originals' arg slots (&value) */
     };
     std::vector<fuse_input_t> inputs(n);
 
@@ -279,7 +290,6 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         bool is_wrapper = false;
         unsigned arity = 0;
 
-        /* a previously-fused program exposes void __fused_wrapper(void**) */
         if (llvm::Function * w = M.getFunction("__fused_wrapper"))
         {
             if (!w->isDeclaration() &&
@@ -292,7 +302,6 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             }
         }
 
-        /* otherwise it is an ordinary kernel */
         if (entry == nullptr)
         {
             entry = find_kernel(M);
@@ -301,8 +310,19 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             arity      = entry->getFunctionType()->getNumParams();
         }
 
-        const std::string name = entry->getName().str();
+        /* snapshot the originals' argument slots (each is a void* = &value) */
+        void ** av = static_cast<void **>(progs[i]->launcher.variadic.args);
+        if (av == nullptr && arity > 0)
+        {
+            fprintf(stderr, "prog-fuse: program %zu has no variadic args populated "
+                            "(fusible progs must use the variadic launcher)\n", i);
+            abort();
+        }
+        inputs[i].slots.resize(arity);
+        for (unsigned k = 0 ; k < arity ; ++k)
+            inputs[i].slots[k] = av ? av[k] : nullptr;
 
+        const std::string name = entry->getName().str();
         char prefix[32];
         snprintf(prefix, sizeof(prefix), "__fz%zu_", i);
         prefix_functions(M, prefix);
@@ -313,11 +333,55 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     }
 
     /* ------------------------------------------------------------------ *
-     * 4. Link every module into the first one (the merged module).        *
-     *    All share the same LLVMContext, so no cross-context cloning.      *
-     *    linkInModule takes ownership of each linked-in module.            *
+     * 3b. Deduplicate argument slots across all leaf kernels.             *
+     *                                                                     *
+     *  Two parameters that receive the SAME slot (same void* address) map  *
+     *  to a single compacted index. `unique_slots` becomes the fused args  *
+     *  buffer contents (in first-occurrence order). A wrapper input keeps  *
+     *  a contiguous (non-deduplicated) block, since it expects a void**    *
+     *  slice.                                                              *
      * ------------------------------------------------------------------ */
+    std::vector<void *>                  unique_slots;
+    std::unordered_map<void *, unsigned> slot_to_index;
+    std::vector<std::vector<unsigned>>   index_map(n);
+    std::vector<unsigned>                wrapper_block_start(n, 0);
 
+    for (size_t i = 0 ; i < n ; ++i)
+    {
+        if (inputs[i].is_wrapper)
+        {
+            wrapper_block_start[i] = (unsigned) unique_slots.size();
+            for (unsigned k = 0 ; k < inputs[i].arity ; ++k)
+                unique_slots.push_back(inputs[i].slots[k]);
+        }
+        else
+        {
+            index_map[i].resize(inputs[i].arity);
+            for (unsigned j = 0 ; j < inputs[i].arity ; ++j)
+            {
+                void * s = inputs[i].slots[j];
+                auto it = slot_to_index.find(s);
+                unsigned idx;
+                if (it == slot_to_index.end())
+                {
+                    idx = (unsigned) unique_slots.size();
+                    unique_slots.push_back(s);
+                    slot_to_index[s] = idx;
+                }
+                else
+                {
+                    idx = it->second;
+                }
+                index_map[i][j] = idx;
+            }
+        }
+    }
+
+    const unsigned total_args = (unsigned) unique_slots.size();
+
+    /* ------------------------------------------------------------------ *
+     * 4. Link every module into the first one (the merged module).        *
+     * ------------------------------------------------------------------ */
     std::unique_ptr<llvm::Module> mod_u = std::move(mods[0]);
     llvm::Linker linker(*mod_u);
     for (size_t i = 1 ; i < n ; ++i)
@@ -330,53 +394,75 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     }
 
     /* ------------------------------------------------------------------ *
-     * 5. Build the fused wrapper function inside the merged module        *
-     *                                                                     *
-     *  The wrapper has the signature:                                     *
-     *    void __fused_wrapper(void** args)                                *
-     *                                                                     *
-     *  Layout of the args array (each element is a void* pointing to     *
-     *  the actual value; matches the standard CUDA/variadic convention): *
-     *  the concatenation of each program's argument pointers, in order.  *
-     *                                                                     *
-     *  For each argument we:                                              *
-     *    1. GEP into the args array to get args[i]  (a void*)            *
-     *    2. Load the void* stored there             (the arg pointer)    *
-     *    3. Load the typed value through that pointer                     *
-     *                                                                     *
-     *  This double-dereference matches how the caller is expected to     *
-     *  populate the args buffer:                                          *
-     *    double s = 2.0;  args[0] = &s;                                  *
-     *    double *y = ...; args[1] = &y;                                  *
-     *    int64_t n = 8;   args[2] = &n;                                  *
+     * 5. Make the constituent functions inlinable, and mark noalias on    *
+     *    pointer parameters whose pointer value is distinct from the       *
+     *    kernel's other pointer parameters (restrict-like).               *
      * ------------------------------------------------------------------ */
+    for (size_t i = 0 ; i < n ; ++i)
+    {
+        llvm::Function * F = mod_u->getFunction(inputs[i].fused_name);
+        if (!F)
+        {
+            fprintf(stderr, "prog-fuse: symbol '%s' missing after link\n", inputs[i].fused_name.c_str());
+            abort();
+        }
 
+        /* fold the constituent into __fused_wrapper */
+        F->setLinkage(llvm::GlobalValue::InternalLinkage);
+        F->addFnAttr(llvm::Attribute::AlwaysInline);
+
+        if (inputs[i].is_wrapper)
+            continue;
+
+        llvm::FunctionType * fty = F->getFunctionType();
+        for (unsigned j = 0 ; j < inputs[i].arity ; ++j)
+        {
+            if (!fty->getParamType(j)->isPointerTy())
+                continue;
+            if (inputs[i].slots[j] == nullptr)
+                continue;
+
+            /* the slot holds &ptr; dereference once to get the actual base */
+            void * base_j = *static_cast<void **>(inputs[i].slots[j]);
+
+            bool distinct = true;
+            for (unsigned k = 0 ; k < inputs[i].arity ; ++k)
+            {
+                if (k == j) continue;
+                if (!fty->getParamType(k)->isPointerTy()) continue;
+                if (inputs[i].slots[k] == nullptr) continue;
+                if (*static_cast<void **>(inputs[i].slots[k]) == base_j)
+                {
+                    distinct = false;
+                    break;
+                }
+            }
+
+            if (distinct)
+                F->addParamAttr(j, llvm::Attribute::NoAlias);
+        }
+    }
+
+    /* ------------------------------------------------------------------ *
+     * 6. Build the fused wrapper: void __fused_wrapper(void** args)        *
+     *    Each kernel reads its (deduplicated) arg slots; a wrapper input   *
+     *    is handed its contiguous slice.                                   *
+     * ------------------------------------------------------------------ */
     llvm::LLVMContext & llvmctx = mod_u->getContext();
-    llvm::Type * void_ty   = llvm::Type::getVoidTy(llvmctx);
-    llvm::Type * ptr_ty    = llvm::PointerType::getUnqual(llvmctx);  /* opaque ptr (void*) */
-    llvm::Type * i64_ty    = llvm::Type::getInt64Ty(llvmctx);
+    llvm::Type * void_ty = llvm::Type::getVoidTy(llvmctx);
+    llvm::Type * ptr_ty  = llvm::PointerType::getUnqual(llvmctx);
+    llvm::Type * i64_ty  = llvm::Type::getInt64Ty(llvmctx);
 
-    /* Create:  void __fused_wrapper(void** args) */
     llvm::FunctionType * wrapper_fty = llvm::FunctionType::get(void_ty, { ptr_ty }, false);
     llvm::Function * wrapper = llvm::Function::Create(
-        wrapper_fty,
-        llvm::GlobalValue::ExternalLinkage,
-        "__fused_wrapper",
-        mod_u.get()
-    );
+        wrapper_fty, llvm::GlobalValue::ExternalLinkage, "__fused_wrapper", mod_u.get());
 
     llvm::BasicBlock * bb = llvm::BasicBlock::Create(llvmctx, "entry", wrapper);
     llvm::IRBuilder<> builder(bb);
+    llvm::Value * args_ptr = wrapper->getArg(0);
 
-    llvm::Value * args_ptr = wrapper->getArg(0);  /* void** args */
-
-    /* Helper: load args[idx] and dereference to obtain a value of type T.
-     *
-     *   slot  = &args[idx]              (GEP into the outer void** array)
-     *   voidp = *slot                   (load the void* stored at args[idx])
-     *   value = *(T*)voidp              (load the actual typed value)
-     */
-    auto load_arg = [&](unsigned idx, llvm::Type * T) -> llvm::Value *
+    /* load args[idx] (a void* = &value) and dereference to a value of type T */
+    auto load_arg = [&] (unsigned idx, llvm::Type * T) -> llvm::Value *
     {
         llvm::Value * slot  = builder.CreateGEP(ptr_ty, args_ptr,
                                   llvm::ConstantInt::get(i64_ty, idx), "slot");
@@ -384,93 +470,60 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         return builder.CreateLoad(T, voidp, "argval");
     };
 
-    /* Helper: pointer to args[off] (a void** slice), for sub-wrapper calls. */
-    auto slice_ptr = [&](unsigned off) -> llvm::Value *
+    /* &args[off] : a void** slice, for a sub-wrapper call */
+    auto slice_ptr = [&] (unsigned off) -> llvm::Value *
     {
         return builder.CreateGEP(ptr_ty, args_ptr,
                                  llvm::ConstantInt::get(i64_ty, off), "slice");
     };
 
-    /* Emit, in order, a call to each program's entry, consuming a contiguous
-     * slice of the args array. The fused args layout is the concatenation of
-     * every program's argument pointers:
-     *   [ prog0 args | prog1 args | ... | progN-1 args ]
-     * An ordinary kernel's slice is unpacked into typed values; a fused
-     * sub-wrapper is handed &args[off] directly (it unpacks its own slice). */
-    unsigned off = 0;
     for (size_t i = 0 ; i < n ; ++i)
     {
         llvm::Function * fn = mod_u->getFunction(inputs[i].fused_name);
-        if (!fn)
-        {
-            fprintf(stderr, "prog-fuse: symbol '%s' missing after link\n", inputs[i].fused_name.c_str());
-            abort();
-        }
         llvm::FunctionType * fty = fn->getFunctionType();
 
         if (inputs[i].is_wrapper)
         {
-            builder.CreateCall(fty, fn, { slice_ptr(off) });
+            builder.CreateCall(fty, fn, { slice_ptr(wrapper_block_start[i]) });
         }
         else
         {
             std::vector<llvm::Value *> call_args;
+            call_args.reserve(inputs[i].arity);
             for (unsigned j = 0 ; j < inputs[i].arity ; ++j)
-                call_args.push_back(load_arg(off + j, fty->getParamType(j)));
+                call_args.push_back(load_arg(index_map[i][j], fty->getParamType(j)));
             builder.CreateCall(fty, fn, call_args);
         }
-
-        off += inputs[i].arity;
     }
 
     builder.CreateRetVoid();
 
-    const unsigned total_args = off;
-
     /* ------------------------------------------------------------------ *
-     * 6. Stamp the host target triple and data layout onto the merged    *
-     *    module, then verify it.                                          *
-     *                                                                     *
-     *  Parsed IR strings have no target triple or data layout (the .ll   *
-     *  inputs omit them). The JIT needs a concrete host data layout for   *
-     *  correct code generation and symbol mangling, and serialisation     *
-     *  walks the DataLayout fields. We set the process triple, then       *
-     *  create a TargetMachine for the host and use its DataLayout.        *
+     * 7. Stamp the host triple + data layout (parsed IR omits them) and    *
+     *    create a host TargetMachine (also used by the opt pipeline).      *
      * ------------------------------------------------------------------ */
+    std::unique_ptr<llvm::TargetMachine> tm;
     {
-        /* Set the target triple to the host process triple if not set. */
         if (mod_u->getTargetTriple().empty())
             mod_u->setTargetTriple(llvm::Triple(llvm::sys::getProcessTriple()));
 
-        /* Create a TargetMachine for the host to get the correct DataLayout. */
-        if (mod_u->getDataLayout().isDefault())
+        const llvm::Triple & TT = mod_u->getTargetTriple();
+        std::string err;
+        const llvm::Target * tgt = llvm::TargetRegistry::lookupTarget(TT, err);
+        if (!tgt)
         {
-            /* Both lookupTarget() and createTargetMachine() take Triple on
-             * LLVM >= 22.  Use getTargetTriple() which returns const Triple&. */
-            const llvm::Triple & TT = mod_u->getTargetTriple();
-            std::string err;
-            const llvm::Target * tgt = llvm::TargetRegistry::lookupTarget(TT, err);
-            if (!tgt)
-            {
-                fprintf(stderr, "prog-fuse: cannot find target '%s': %s\n",
-                        TT.str().c_str(), err.c_str());
-                abort();
-            }
-            llvm::TargetOptions opts;
-            std::unique_ptr<llvm::TargetMachine> tm(
-                tgt->createTargetMachine(
-                    TT,
-                    llvm::sys::getHostCPUName(),
-                    /* features */ "",
-                    opts,
-                    /* reloc      */ std::nullopt,
-                    /* code model */ std::nullopt,
-                    llvm::CodeGenOptLevel::Default
-                )
-            );
-            if (tm)
-                mod_u->setDataLayout(tm->createDataLayout());
+            fprintf(stderr, "prog-fuse: cannot find target '%s': %s\n", TT.str().c_str(), err.c_str());
+            abort();
         }
+        llvm::TargetOptions opts;
+        tm.reset(tgt->createTargetMachine(
+            TT, llvm::sys::getHostCPUName(), /* features */ "", opts,
+            /* reloc */ std::nullopt, /* code model */ std::nullopt,
+            /* match the O3 IR pipeline below for end-to-end aggressive codegen */
+            llvm::CodeGenOptLevel::Aggressive));
+
+        if (tm && mod_u->getDataLayout().isDefault())
+            mod_u->setDataLayout(tm->createDataLayout());
     }
 
     if (llvm::verifyModule(*mod_u, &llvm::errs()))
@@ -480,51 +533,42 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     }
 
     /* ------------------------------------------------------------------ *
-     * 6b. Serialise to LLVM bitcode and store it as the fused node's      *
-     *     source blob (the in-memory module itself is consumed by the JIT *
-     *     in step 7).                                                      *
-     *                                                                     *
-     *  We use the bitcode writer rather than the text printer because the *
-     *  text printer (Module::print / AssemblyWriter::printFunction) reads *
-     *  function attributes and argument metadata that may contain         *
-     *  uninitialised padding when the input IR used legacy typed-pointer  *
-     *  syntax (double*, i64*) auto-promoted to opaque pointers. The       *
-     *  bitcode writer serialises the in-memory IR binary fields directly  *
-     *  and never exercises the attribute-printing path, producing a       *
-     *  clean, well-defined byte stream.                                   *
+     * 8. Optimize (inline the kernels into the wrapper, vectorize, fuse).  *
+     * ------------------------------------------------------------------ */
+    if (tm)
+        optimize_module(*mod_u, tm.get());
+
+    /* ------------------------------------------------------------------ *
+     * 9. Serialise the optimized module to bitcode for dst->source.       *
      * ------------------------------------------------------------------ */
     std::string bitcode;
     {
         llvm::raw_string_ostream os(bitcode);
         llvm::WriteBitcodeToFile(*mod_u, os);
     }
-
-    /* Store the bitcode blob as the fused node's source.
-     * dst may alias progs[0] (in-place fusion); we update the pointer last.
-     * The old buffer (user-supplied static literal or prior malloc) is
-     * intentionally not freed — ownership tracking is absent in
-     * command_prog_t.  TODO: add an ownership flag for proper cleanup. */
     char * bc_buf = static_cast<char *>(malloc(bitcode.size()));
     if (!bc_buf) { fprintf(stderr, "prog-fuse: malloc failed\n"); abort(); }
     memcpy(bc_buf, bitcode.data(), bitcode.size());
 
-    dst->source.type                  = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
-    dst->source.content.llvmir.raw    = bc_buf;
-    dst->source.content.llvmir.size   = bitcode.size();
+    /* Free the previous source buffer iff a prior fusion produced (owns) it.
+     * dst may alias progs[0], whose source was already fully parsed in step 1
+     * (parseIR materialises the module), so the old buffer is no longer
+     * referenced and is safe to release here. */
+    if (dst->source.type == COMMAND_PROG_SOURCE_TYPE_LLVMIR &&
+        dst->source.content.llvmir.owned &&
+        dst->source.content.llvmir.raw)
+    {
+        free(dst->source.content.llvmir.raw);
+    }
+
+    dst->source.type                 = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
+    dst->source.content.llvmir.raw   = bc_buf;
+    dst->source.content.llvmir.size  = bitcode.size();
+    dst->source.content.llvmir.owned = true;   /* heap (malloc) — the pass owns it */
 
     /* ------------------------------------------------------------------ *
-     * 7. JIT-compile the fused module in-process (LLVM ORC LLJIT) and     *
-     *    set up the variadic launcher so the fused function is directly   *
-     *    callable.                                                         *
-     *                                                                     *
-     *  launcher.variadic layout:                                          *
-     *    fn        -> void __fused_wrapper(void** args)                  *
-     *    args      -> void*[total_args]  (runtime fills arg pointers here)*
-     *    args_size -> total_args * sizeof(void*)                          *
+     * 10. JIT the optimized module and resolve the wrapper.               *
      * ------------------------------------------------------------------ */
-
-    /* Create an LLJIT. It must outlive the JIT'd code, so we intentionally
-     * leak it (its lifetime is conceptually tied to the fused command). */
     auto jit_exp = llvm::orc::LLJITBuilder().create();
     if (!jit_exp)
     {
@@ -534,7 +578,6 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     }
     std::unique_ptr<llvm::orc::LLJIT> jit = std::move(*jit_exp);
 
-    /* hand the merged module (and its owning context) to the JIT */
     llvm::orc::ThreadSafeModule tsm(std::move(mod_u), std::move(ctx));
     if (auto err = jit->addIRModule(std::move(tsm)))
     {
@@ -555,20 +598,64 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     /* keep the JIT (hence the compiled code) alive for the process lifetime */
     jit.release();
 
-    /* Allocate the args buffer that the runtime will fill before calling fn.
-     * Each slot holds a void* pointing to an actual argument value.
-     * The buffer is zeroed; the runtime is responsible for populating it. */
+    /* ------------------------------------------------------------------ *
+     * 11. Fill the compacted args buffer with the deduplicated slots and   *
+     *     install the variadic launcher. dst may alias progs[0]; we read   *
+     *     all originals' slots in step 2, so writing dst now is safe.      *
+     * ------------------------------------------------------------------ */
     const size_t n_args = (size_t) total_args;
-    void ** args_buf = static_cast<void **>(calloc(n_args, sizeof(void *)));
-    if (!args_buf && n_args > 0)
-    {
-        fprintf(stderr, "prog-fuse: calloc failed\n");
-        abort();
-    }
+    void ** args_buf = static_cast<void **>(calloc(n_args ? n_args : 1, sizeof(void *)));
+    if (!args_buf) { fprintf(stderr, "prog-fuse: calloc failed\n"); abort(); }
+    for (unsigned k = 0 ; k < total_args ; ++k)
+        args_buf[k] = unique_slots[k];
 
-    dst->launcher.variadic.fn        = fn_ptr;
-    dst->launcher.variadic.args      = args_buf;
-    dst->launcher.variadic.args_size = n_args * sizeof(void *);
+    /* Free the previous args buffer iff a prior fusion produced (owns) it. dst
+     * may alias progs[0], whose arg slot VALUES were copied into unique_slots
+     * in step 2/3b, so the old buffer is no longer referenced and is safe to
+     * release here. */
+    if (dst->launcher.variadic.args_owned && dst->launcher.variadic.args)
+        free(dst->launcher.variadic.args);
+
+    dst->launcher.variadic.fn         = fn_ptr;
+    dst->launcher.variadic.args       = args_buf;
+    dst->launcher.variadic.args_size  = n_args * sizeof(void *);
+    dst->launcher.variadic.args_owned = true;  /* heap (calloc) — the pass owns it */
+
+    /* ------------------------------------------------------------------ *
+     * 12. Release the consumed inputs' owned heap buffers.                 *
+     *                                                                      *
+     *  Every prog other than dst has been merged into dst and the caller   *
+     *  will contract it out of the graph. If such an input owns heap        *
+     *  buffers from an EARLIER fusion (e.g. re-fusing a node this pass      *
+     *  produced), free them now to avoid leaking on re-fusion. All reads of *
+     *  the inputs completed in steps 1-4 (source parsed/linked, arg slot   *
+     *  values copied into unique_slots), so this is safe. We skip any prog  *
+     *  aliasing dst (its old buffers were already handled above) and clear  *
+     *  each freed slot so an accidentally repeated prog is not double-freed.*
+     * ------------------------------------------------------------------ */
+    for (size_t i = 0 ; i < n ; ++i)
+    {
+        if (progs[i] == dst)
+            continue ;
+
+        if (progs[i]->source.type == COMMAND_PROG_SOURCE_TYPE_LLVMIR &&
+            progs[i]->source.content.llvmir.owned &&
+            progs[i]->source.content.llvmir.raw)
+        {
+            free(progs[i]->source.content.llvmir.raw);
+            progs[i]->source.content.llvmir.raw   = nullptr;
+            progs[i]->source.content.llvmir.size  = 0;
+            progs[i]->source.content.llvmir.owned = false;
+        }
+
+        if (progs[i]->launcher.variadic.args_owned && progs[i]->launcher.variadic.args)
+        {
+            free(progs[i]->launcher.variadic.args);
+            progs[i]->launcher.variadic.args       = nullptr;
+            progs[i]->launcher.variadic.args_size  = 0;
+            progs[i]->launcher.variadic.args_owned = false;
+        }
+    }
 
     # endif /* CGIR_SUPPORT_LLVM */
 }

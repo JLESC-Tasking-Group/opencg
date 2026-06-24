@@ -144,6 +144,21 @@ main(void)
     for (size_t i = 0 ; i < n ; ++i)
         y_expected[i] = a * x[i] + s * y[i];
 
+    /* Typed argument values; their addresses are the launcher arg slots.
+     * y and n are shared by both kernels (scale's y == axpy's y, same n), so
+     * argument deduplication should compact 7 slots -> 5. These must outlive the
+     * fused-wrapper call (their addresses are stored in the fused args buffer). */
+    double   s_val = s;
+    double   a_val = a;
+    double * xp    = x;
+    double * yp    = y;
+    int64_t  nn    = static_cast<int64_t>(n);
+
+    /* Per-program argument slot arrays (each slot = &value), populated BEFORE
+     * fusion so the pass can read them, deduplicate, and fill the fused buffer. */
+    void * scale_args[3] = { &s_val, &yp, &nn };       /* scale(s, y, n)   */
+    void * axpy_args[4]  = { &a_val, &xp, &yp, &nn };  /* axpy(a, x, y, n) */
+
     /* Create a command graph */
     command_graph_t * cg = command_graph_new();
     assert(cg);
@@ -162,6 +177,9 @@ main(void)
     cmd_u->prog.source.type                 = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
     cmd_u->prog.source.content.llvmir.raw   = (void *) scale_llvm_ir;
     cmd_u->prog.source.content.llvmir.size  = sizeof(scale_llvm_ir);
+    cmd_u->prog.launcher.variadic.fn        = nullptr;
+    cmd_u->prog.launcher.variadic.args      = scale_args;
+    cmd_u->prog.launcher.variadic.args_size = sizeof(scale_args);
 
     constexpr device_unique_id_t host_device = 0;
     command_graph_node_t * u = command_graph_node_new(cg, host_device, COMMAND_GRAPH_NODE_TYPE_COMMAND);
@@ -174,6 +192,9 @@ main(void)
     cmd_v->prog.source.type                 = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
     cmd_v->prog.source.content.llvmir.raw   = (void *) axpy_llvm_ir;
     cmd_v->prog.source.content.llvmir.size  = sizeof(axpy_llvm_ir);
+    cmd_v->prog.launcher.variadic.fn        = nullptr;
+    cmd_v->prog.launcher.variadic.args      = axpy_args;
+    cmd_v->prog.launcher.variadic.args_size = sizeof(axpy_args);
 
     command_graph_node_t * v = command_graph_node_new(cg, host_device, COMMAND_GRAPH_NODE_TYPE_COMMAND);
     assert(v);
@@ -244,21 +265,20 @@ main(void)
      *  The fused wrapper has signature:                                   *
      *    void __fused_wrapper(void ** args)                               *
      *                                                                     *
-     *  args[] layout (set by the pass, filled here by the caller):       *
-     *    args[0] = &s       (double   — scale factor for scale())        *
-     *    args[1] = &yp      (double * — array pointer  for scale())      *
-     *    args[2] = &nn      (int64_t  — length         for scale())      *
-     *    args[3] = &a       (double   — scale factor for axpy())         *
-     *    args[4] = &xp      (double * — x array pointer for axpy())      *
-     *    args[5] = &yp      (double * — y array pointer for axpy())      *
-     *    args[6] = &nn      (int64_t  — length         for axpy())       *
-     *                                                                     *
-     *  Each slot holds a void* that points to the actual value, matching *
-     *  the double-dereference in load_arg() inside the wrapper.          *
+     *  The pass read the originals' args (scale_args / axpy_args), merged  *
+     *  the shared slots (y and n), and filled the fused buffer with the    *
+     *  5 deduplicated slots:                                               *
+     *    args[0] = &s_val   (scale s)                                      *
+     *    args[1] = &yp      (y*, shared by scale and axpy)                 *
+     *    args[2] = &nn      (n,  shared by scale and axpy)                 *
+     *    args[3] = &a_val   (axpy a)                                       *
+     *    args[4] = &xp      (axpy x*)                                      *
+     *  Each slot holds a void* that points to the actual value, matching   *
+     *  the double-dereference in load_arg() inside the wrapper.            *
      * ------------------------------------------------------------------ */
 
-    /* The variadic launcher stores fn, the pre-allocated args buffer, and
-     * its byte size.  args_size / sizeof(void*) gives the slot count.   */
+    /* The variadic launcher stores fn, the args buffer (already filled by the
+     * pass), and its byte size.  args_size / sizeof(void*) gives the slots.  */
     void *   fn        = fused->command->prog.launcher.variadic.fn;
     void **  args_buf  = static_cast<void **>(fused->command->prog.launcher.variadic.args);
     size_t   args_size = fused->command->prog.launcher.variadic.args_size;
@@ -270,30 +290,15 @@ main(void)
     }
 
     size_t n_args = args_size / sizeof(void *);
-    if (n_args != 7)
+    if (n_args != 5)
     {
-        fprintf(stderr, "FAIL: expected 7 args slots (3 for scale + 4 for axpy), got %zu\n", n_args);
+        fprintf(stderr, "FAIL: expected 5 deduplicated arg slots "
+                        "(scale{s,y,n} + axpy{a,x,y,n} with y and n shared), got %zu\n", n_args);
         return 1;
     }
 
-    /* Typed variables whose addresses are passed to the wrapper.
-     * Use int64_t for the length to match the i64 IR parameter type.    */
-    double    s_val  = s;
-    double    a_val  = a;
-    double *  xp     = x;
-    double *  yp     = y;
-    int64_t   nn     = static_cast<int64_t>(n);
-
-    /* Populate the args buffer: each slot = pointer to the typed value. */
-    args_buf[0] = &s_val;   /* scale: s      */
-    args_buf[1] = &yp;      /* scale: y*     */
-    args_buf[2] = &nn;      /* scale: n      */
-    args_buf[3] = &a_val;   /* axpy:  a      */
-    args_buf[4] = &xp;      /* axpy:  x*     */
-    args_buf[5] = &yp;      /* axpy:  y*     */
-    args_buf[6] = &nn;      /* axpy:  n      */
-
-    /* Call the fused wrapper. */
+    /* The pass already filled args_buf with the deduplicated slots (pointing at
+     * s_val / yp / nn / a_val / xp declared above), so just invoke the wrapper. */
     typedef void (*fused_fn_t)(void **);
     reinterpret_cast<fused_fn_t>(fn)(args_buf);
 

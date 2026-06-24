@@ -193,6 +193,7 @@ if (USE_LLVM)
         orcjit          # LLVMOrcJIT       - LLJIT
         executionengine # LLVMExecutionEngine
         jitlink         # LLVMJITLink      - LLJIT object linking
+        passes          # LLVMPasses       - PassBuilder O3 pipeline, LoopFuse, vectorizers
         native          # host target codegen/asm (CodeGen, AsmPrinter, ...)
         nativecodegen   # host target codegen registration
         ${LLVM_TARGETS_TO_BUILD}  # architecture-specific codegen/MC/asm libs

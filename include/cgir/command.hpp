@@ -105,6 +105,13 @@ struct command_prog_t
             void * fn;
             void * args;
             size_t args_size;
+
+            /* true iff `args` is a heap buffer owned by this prog (e.g. the
+             * compacted argument buffer produced by the prog-fuse pass). The
+             * owner frees `args` before overwriting/discarding it. Defaults to
+             * false (see command_t's constructor) so a caller-owned static or
+             * stack buffer is never freed on the first fusion. */
+            bool args_owned;
         } variadic;
 
     } launcher;
@@ -120,6 +127,12 @@ struct command_prog_t
             struct {
                 void * raw;
                 size_t size;
+
+                /* true iff `raw` is a heap buffer owned by this prog (e.g. the
+                 * bitcode produced by the prog-fuse pass). The owner frees
+                 * `raw` before overwriting/discarding it. Defaults to false
+                 * (see command_t's constructor). */
+                bool owned;
             } llvmir;
         } content;
     } source;
@@ -208,7 +221,19 @@ struct command_t
         command_ctrl_demux_t    demux;
     };
 
-    command_t(command_type_t type) : type(type) {}
+    command_t(command_type_t type) : type(type)
+    {
+        /* A program may own heap buffers filled by the prog-fuse pass (the
+         * compacted args buffer and the serialized bitcode). Clear the
+         * ownership flags so the pass never frees a caller-owned (static or
+         * stack) buffer when it overwrites the node on the first fusion; the
+         * pass sets them true once it installs its own heap buffers. */
+        if (type == COMMAND_TYPE_PROG)
+        {
+            prog.source.content.llvmir.owned  = false;
+            prog.launcher.variadic.args_owned = false;
+        }
+    }
 };
 
 CGIR_NAMESPACE_END
