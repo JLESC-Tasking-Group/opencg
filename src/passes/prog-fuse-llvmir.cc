@@ -65,13 +65,17 @@
 
 # if CGIR_SUPPORT_LLVM
 
+# include <llvm/Analysis/ValueTracking.h>
 # include <llvm/IR/Function.h>
 # include <llvm/IR/IRBuilder.h>
+# include <llvm/IR/Instructions.h>
 # include <llvm/IR/LLVMContext.h>
+# include <llvm/IR/MDBuilder.h>
 # include <llvm/IR/Module.h>
 # include <llvm/IR/Verifier.h>
 # include <llvm/IRReader/IRReader.h>
 # include <llvm/Linker/Linker.h>
+# include <llvm/Transforms/Utils/Cloning.h>
 # include <llvm/Bitcode/BitcodeWriter.h>
 # include <llvm/MC/TargetRegistry.h>
 # include <llvm/Support/FileSystem.h>
@@ -489,9 +493,17 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     }
 
     /* ------------------------------------------------------------------ *
-     * 5. Make the constituent functions inlinable, and mark noalias on    *
-     *    pointer parameters whose pointer value is distinct from the       *
-     *    kernel's other pointer parameters (restrict-like).               *
+     * 5. Make the constituent functions inlinable.                        *
+     *                                                                     *
+     *  noalias is NOT marked on the kernel parameters here: when a callee  *
+     *  with noalias params is inlined, the inliner clones its alias scopes *
+     *  into a fresh domain per call site, so two kernels' pointers end up  *
+     *  in unrelated domains and are NOT known to be mutually non-aliasing. *
+     *  That defeats loop fusion (DependenceAnalysis cannot disambiguate    *
+     *  e.g. scale's `y` from axpy's `x`). Instead we inline the kernels    *
+     *  ourselves (step 6b) and then attach shared-domain scoped-noalias    *
+     *  metadata to the inlined accesses, so all distinct base pointers are  *
+     *  mutually non-aliasing in ONE domain.                               *
      * ------------------------------------------------------------------ */
     for (size_t i = 0 ; i < n ; ++i)
     {
@@ -505,37 +517,6 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         /* fold the constituent into __fused_wrapper */
         F->setLinkage(llvm::GlobalValue::InternalLinkage);
         F->addFnAttr(llvm::Attribute::AlwaysInline);
-
-        if (inputs[i].is_wrapper)
-            continue;
-
-        llvm::FunctionType * fty = F->getFunctionType();
-        for (unsigned j = 0 ; j < inputs[i].arity ; ++j)
-        {
-            if (!fty->getParamType(j)->isPointerTy())
-                continue;
-            if (inputs[i].slots[j] == nullptr)
-                continue;
-
-            /* the slot holds &ptr; dereference once to get the actual base */
-            void * base_j = *static_cast<void **>(inputs[i].slots[j]);
-
-            bool distinct = true;
-            for (unsigned k = 0 ; k < inputs[i].arity ; ++k)
-            {
-                if (k == j) continue;
-                if (!fty->getParamType(k)->isPointerTy()) continue;
-                if (inputs[i].slots[k] == nullptr) continue;
-                if (*static_cast<void **>(inputs[i].slots[k]) == base_j)
-                {
-                    distinct = false;
-                    break;
-                }
-            }
-
-            if (distinct)
-                F->addParamAttr(j, llvm::Attribute::NoAlias);
-        }
     }
 
     /* ------------------------------------------------------------------ *
@@ -613,6 +594,8 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         if (slot_type[k] != nullptr)
             slot_value[k] = load_arg(k, slot_type[k]);
 
+    std::vector<llvm::CallInst *> kernel_calls;
+    kernel_calls.reserve(n);
     for (size_t i = 0 ; i < n ; ++i)
     {
         llvm::Function * fn = mod_u->getFunction(inputs[i].fused_name);
@@ -621,7 +604,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         if (inputs[i].is_wrapper)
         {
             /* a previously-fused sub-wrapper consumes a raw void** slice */
-            builder.CreateCall(fty, fn, { slice_ptr(wrapper_block_start[i]) });
+            kernel_calls.push_back(builder.CreateCall(fty, fn, { slice_ptr(wrapper_block_start[i]) }));
         }
         else
         {
@@ -629,11 +612,106 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             call_args.reserve(inputs[i].arity);
             for (unsigned j = 0 ; j < inputs[i].arity ; ++j)
                 call_args.push_back(slot_value[index_map[i][j]]);
-            builder.CreateCall(fty, fn, call_args);
+            kernel_calls.push_back(builder.CreateCall(fty, fn, call_args));
         }
     }
 
     builder.CreateRetVoid();
+
+    /* ------------------------------------------------------------------ *
+     * 6b. Inline the kernels into the wrapper ourselves, then attach       *
+     *     shared-domain scoped-noalias metadata to the inlined accesses.   *
+     *                                                                     *
+     *  Doing the inlining here (instead of leaving it to the O3 pipeline)  *
+     *  lets us tag the memory accesses AFTER inlining with ONE alias       *
+     *  domain: each distinct base pointer value gets its own scope, and    *
+     *  every access is marked noalias against all the OTHER bases' scopes. *
+     *  Pointers that share a base (e.g. a `y` used by several kernels) end  *
+     *  up in the same scope, so their genuine dependence is preserved.     *
+     *  This is the restrict-like assumption (distinct base => no overlap)  *
+     *  applied across the whole fused body, which is what lets             *
+     *  DependenceAnalysis disambiguate the kernels and LoopFuse fuse them. *
+     * ------------------------------------------------------------------ */
+    for (llvm::CallInst * ci : kernel_calls)
+    {
+        llvm::InlineFunctionInfo ifi;
+        llvm::InlineResult ir = llvm::InlineFunction(*ci, ifi);
+        if (!ir.isSuccess())
+        {
+            fprintf(stderr, "prog-fuse: failed to inline a kernel: %s\n", ir.getFailureReason());
+            abort();
+        }
+    }
+
+    /* drop the now-inlined (dead) constituent functions */
+    for (size_t i = 0 ; i < n ; ++i)
+    {
+        llvm::Function * F = mod_u->getFunction(inputs[i].fused_name);
+        if (F && F->use_empty())
+            F->eraseFromParent();
+    }
+
+    {
+        /* One alias-scope domain for the whole fused body; one scope per
+         * distinct base pointer value (the deref of each pointer arg slot). */
+        llvm::MDBuilder mdb(llvmctx);
+        llvm::MDNode *  domain = mdb.createAnonymousAliasScopeDomain("cgir.prog-fuse");
+
+        std::unordered_map<void *, llvm::MDNode *> base_to_scope;
+        std::vector<llvm::Metadata *>              all_scopes;
+        std::unordered_map<llvm::Value *, void *>  load_base; /* hoisted ptr load -> base */
+
+        for (unsigned k = 0 ; k < total_args ; ++k)
+        {
+            if (slot_value[k] == nullptr)                                continue; /* wrapper-block slot */
+            if (slot_type[k] == nullptr || !slot_type[k]->isPointerTy()) continue; /* not a pointer    */
+            if (unique_slots[k] == nullptr)                              continue; /* no &value         */
+
+            void * base = *static_cast<void **>(unique_slots[k]);
+            if (base == nullptr)
+                continue;
+
+            load_base[slot_value[k]] = base;
+            if (base_to_scope.find(base) == base_to_scope.end())
+            {
+                llvm::MDNode * sc = mdb.createAnonymousAliasScope(domain, "cgir.prog-fuse.ptr");
+                base_to_scope[base] = sc;
+                all_scopes.push_back(sc);
+            }
+        }
+
+        /* With <2 distinct bases there is nothing to disambiguate. */
+        if (all_scopes.size() >= 2)
+        {
+            for (llvm::BasicBlock & BB : *wrapper)
+            {
+                for (llvm::Instruction & I : BB)
+                {
+                    if (!I.mayReadOrWriteMemory())
+                        continue;
+                    llvm::Value * ptr = llvm::getLoadStorePointerOperand(&I);
+                    if (ptr == nullptr)
+                        continue;
+
+                    auto it = load_base.find(llvm::getUnderlyingObject(ptr));
+                    if (it == load_base.end())
+                        continue;
+
+                    llvm::Metadata * own = base_to_scope[it->second];
+                    I.setMetadata(llvm::LLVMContext::MD_alias_scope,
+                                  llvm::MDNode::get(llvmctx, { own }));
+
+                    std::vector<llvm::Metadata *> others;
+                    others.reserve(all_scopes.size() - 1);
+                    for (llvm::Metadata * s : all_scopes)
+                        if (s != own)
+                            others.push_back(s);
+                    I.setMetadata(llvm::LLVMContext::MD_noalias,
+                                  llvm::MDNode::get(llvmctx, others));
+                }
+            }
+        }
+    }
 
     /* ------------------------------------------------------------------ *
      * 7. Stamp the host triple + data layout (parsed IR omits them) and    *
