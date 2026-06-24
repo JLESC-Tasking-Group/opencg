@@ -23,6 +23,7 @@
 
 # include <mlir/IR/MLIRContext.h>
 # include <mlir/IR/Verifier.h>
+# include <mlir/Pass/Pass.h>
 # include <mlir/Pass/PassManager.h>
 
 # include <opencg/command-graph.hpp>

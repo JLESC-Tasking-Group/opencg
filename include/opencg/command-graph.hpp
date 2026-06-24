@@ -353,7 +353,7 @@ struct command_graph_t
     /* coherence checks */
     void coherence_checks(void);
 
-    /* Legacy C++ pass implementations (src/passes/*.cc).
+    /* Legacy C++ pass implementations (in src/passes/).
      * These remain available for A/B parity testing against the MLIR pipeline. */
     # define DEF(ENUM, FUNC, NAME, MK) void FUNC(void);
     OCG_FORALL_COMMAND_GRAPH_PASS(DEF);
