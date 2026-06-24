@@ -2,8 +2,7 @@
 ** Copyright 2024,2025 INRIA
 **
 ** Contributors :
-** Thierry Gautier, thierry.gautier@inrialpes.fr
-** Romain PEREIRA, romain.pereira@inria.fr + rpereira@anl.gov
+** Romain PEREIRA, rpereira@anl.gov
 **
 ** This software is a computer program whose purpose is to execute
 ** blas subroutines on multi-GPUs system.
@@ -35,17 +34,14 @@
 ** knowledge of the CeCILL-C license and that you accept its terms.
 **/
 
-#ifndef __OPENCG_SUPPORT_H__
-# define __OPENCG_SUPPORT_H__
+#ifndef __CGIR_NAMESPACE_H__
+# define __CGIR_NAMESPACE_H__
 
-/* If LLVM IR manipulation and in-process JIT are enabled */
-# define OPENCG_SUPPORT_LLVM    @USE_LLVM@
+# define CGIR_NAMESPACE         cgir
 
-/* If the MLIR-based intermediate representation and optimization passes are
- * enabled. When enabled, `command_graph_optimize` can route optimization to
- * the MLIR `cg` dialect pipeline (see src/mlir/). This is fully encapsulated
- * inside libopencg: no MLIR header is ever exposed to consumers (e.g., XKRT). */
-# define OPENCG_USE_MLIR        @USE_MLIR@
+# define CGIR_NAMESPACE_BEGIN   namespace CGIR_NAMESPACE {
+# define CGIR_NAMESPACE_END     }
 
-#endif /* __OPENCG_SUPPORT_H__ */
+# define CGIR_NAMESPACE_USE     using namespace CGIR_NAMESPACE
 
+#endif /* __CGIR_NAMESPACE_H__ */

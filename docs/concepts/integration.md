@@ -1,21 +1,21 @@
 # Integration {#integration}
 
-OpenCG is designed as a building block for runtime systems that manage heterogeneous computing on multi-device architectures.
+CGIR is designed as a building block for runtime systems that manage heterogeneous computing on multi-device architectures.
 
 ## XKRT
 
-OpenCG is integrated into the [XKRT](https://github.com/anlsys/xkrt) runtime system, where it serves as the command graph abstraction for record-and-replay execution:
+CGIR is integrated into the [XKRT](https://github.com/anlsys/xkrt) runtime system, where it serves as the command graph abstraction for record-and-replay execution:
 
-- The [record/replay executioner](https://github.com/anlsys/xkrt/blob/master/src/command/command-graph.cc#L418) records device commands into an OpenCG command graph
+- The [record/replay executioner](https://github.com/anlsys/xkrt/blob/master/src/command/command-graph.cc#L418) records device commands into an CGIR command graph
 - The [CUDA driver](https://github.com/anlsys/xkrt/blob/master/src/driver/driver_cu.cc#L618) executes optimized command graphs on NVIDIA GPUs
 
 ## XKOMP
 
-The [XKOMP](https://github.com/anlsys/xkomp) compiler provides support for the `taskgraph` construct, which eventually maps to OpenCG command graphs for execution via XKRT.
+The [XKOMP](https://github.com/anlsys/xkomp) compiler provides support for the `taskgraph` construct, which eventually maps to CGIR command graphs for execution via XKRT.
 
 ## Custom Integration
 
-To integrate OpenCG into your own runtime:
+To integrate CGIR into your own runtime:
 
 1. **Provide allocators**: implement `command_allocator_t`, `command_graph_node_allocator_t`, and `command_graph_allocator_t` for your memory management scheme
 2. **Build the graph**: create nodes with commands and connect them with precedence edges
@@ -31,9 +31,9 @@ See `tests/h2d-distribute.cc` for a complete example that:
 
 ## CMake Integration
 
-OpenCG installs CMake package configuration files. In your project:
+CGIR installs CMake package configuration files. In your project:
 
 ```cmake
-find_package(OpenCG REQUIRED)
-target_link_libraries(my_target OpenCG::opencg)
+find_package(CGIR REQUIRED)
+target_link_libraries(my_target CGIR::cgir)
 ```

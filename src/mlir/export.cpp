@@ -1,5 +1,5 @@
 /*
-** MLIR -> OpenCG export.
+** MLIR -> CGIR export.
 **
 ** Rebuilds the POD command graph topology from an (optimized) cg.graph,
 ** reusing original POD nodes/commands when an op still maps to one (preserving
@@ -7,14 +7,14 @@
 ** nodes/commands via the graph's allocator callbacks otherwise.
 */
 
-# include <opencg/mlir/opencg-mlir.hpp>
+# include <cgir/mlir/cgir-mlir.hpp>
 
 # include "mlir/IR/BuiltinAttributes.h"
 # include "llvm/ADT/DenseMap.h"
 
-# include <opencg/command.hpp>
-# include <opencg/command-graph.hpp>
-# include <opencg/command-type.hpp>
+# include <cgir/command.hpp>
+# include <cgir/command-graph.hpp>
+# include <cgir/command-type.hpp>
 
 # include <cstdint>
 # include <cstring>
@@ -23,7 +23,7 @@
 
 using namespace mlir;
 
-namespace ocg {
+namespace cgir {
 namespace cg {
 
 namespace {
@@ -141,15 +141,15 @@ create_pod_node_from_op(command_graph_t * cg, Operation * op)
     {
         command_t * cmd = cg->command_new(cg, (command_type_t) g.getKind());
         llvm::ArrayRef<int8_t> blob = g.getBlob();
-        assert(blob.size() == sizeof(::ocg::command_t));
+        assert(blob.size() == sizeof(::cgir::command_t));
         /* overwrite the base command subobject with the saved bytes */
-        memcpy((void *) static_cast<::ocg::command_t *>(cmd), blob.data(), blob.size());
+        memcpy((void *) static_cast<::cgir::command_t *>(cmd), blob.data(), blob.size());
         command_graph_node_t * node = cg->command_graph_node_new(cg, duid, COMMAND_GRAPH_NODE_TYPE_COMMAND);
         node->command = cmd;
         return node;
     }
 
-    fprintf(stderr, "opencg/mlir: unsupported op '%s' during export\n",
+    fprintf(stderr, "cgir/mlir: unsupported op '%s' during export\n",
             op->getName().getStringRef().str().c_str());
     abort();
 }
@@ -297,4 +297,4 @@ export_command_graph(
 }
 
 } // namespace cg
-} // namespace ocg
+} // namespace cgir

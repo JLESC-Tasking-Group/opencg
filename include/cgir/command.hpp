@@ -34,16 +34,16 @@
 ** knowledge of the CeCILL-C license and that you accept its terms.
 **/
 
-#ifndef __OPENCG_COMMAND_HPP__
-# define __OPENCG_COMMAND_HPP__
+#ifndef __CGIR_COMMAND_HPP__
+# define __CGIR_COMMAND_HPP__
 
-# include <opencg/opencg.hpp>
-# include <opencg/device-type.hpp>
-# include <opencg/namespace.hpp>
+# include <cgir/cgir.hpp>
+# include <cgir/device-type.hpp>
+# include <cgir/namespace.hpp>
 
 # include <stddef.h>
 
-OCG_NAMESPACE_BEGIN
+CGIR_NAMESPACE_BEGIN
 
 /* Move data between devices */
 struct command_copy_1D_t
@@ -95,9 +95,9 @@ struct command_prog_t
 
         /* Fixed argument sizes */
         struct {
-            # define OCG_CALLBACK_ARGS_MAX 3
-            void (*fn)(void * [OCG_CALLBACK_ARGS_MAX]);
-            void * args[OCG_CALLBACK_ARGS_MAX];
+            # define CGIR_CALLBACK_ARGS_MAX 3
+            void (*fn)(void * [CGIR_CALLBACK_ARGS_MAX]);
+            void * args[CGIR_CALLBACK_ARGS_MAX];
         } fixed;
 
         /* variadic argument sizes */
@@ -173,11 +173,11 @@ struct command_ctrl_loop_t
 typedef int command_ctrl_demux_bitset_t;
 
 /* Maximum number of commands in a demuxer */
-# define OCG_COMMAND_CTRL_DEMUX_SIZE_MAX (8 * sizeof(command_ctrl_demux_bitset_t))
+# define CGIR_COMMAND_CTRL_DEMUX_SIZE_MAX (8 * sizeof(command_ctrl_demux_bitset_t))
 
 /* demuxer sizes */
 typedef uint8_t command_ctrl_demux_size_t;
-static_assert((1LU << (8 * sizeof(command_ctrl_demux_size_t))) - 1 >= OCG_COMMAND_CTRL_DEMUX_SIZE_MAX);
+static_assert((1LU << (8 * sizeof(command_ctrl_demux_size_t))) - 1 >= CGIR_COMMAND_CTRL_DEMUX_SIZE_MAX);
 
 /* a loop in the command graph */
 struct command_ctrl_demux_t
@@ -211,6 +211,6 @@ struct command_t
     command_t(command_type_t type) : type(type) {}
 };
 
-OCG_NAMESPACE_END
+CGIR_NAMESPACE_END
 
-#endif /* __OPENCG_COMMAND_HPP__ */
+#endif /* __CGIR_COMMAND_HPP__ */

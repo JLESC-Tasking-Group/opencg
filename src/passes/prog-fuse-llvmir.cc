@@ -38,12 +38,12 @@
 // routine command_graph_prog_fuse_llvmir(), used by BOTH the legacy POD pass
 // (prog-fuse.cc) and the MLIR pass (../mlir/passes/ProgFuse.cpp).
 
-# include <opencg/namespace.hpp>
-# include <opencg/command.hpp>
+# include <cgir/namespace.hpp>
+# include <cgir/command.hpp>
 
 # include "prog-fuse.hpp"
 
-# if OPENCG_SUPPORT_LLVM
+# if CGIR_SUPPORT_LLVM
 
 # include <llvm/IR/Function.h>
 # include <llvm/IR/IRBuilder.h>
@@ -77,11 +77,11 @@
 # include <string>
 # include <vector>
 
-# endif /* OPENCG_SUPPORT_LLVM */
+# endif /* CGIR_SUPPORT_LLVM */
 
-OCG_NAMESPACE_USE;
+CGIR_NAMESPACE_USE;
 
-# if OPENCG_SUPPORT_LLVM
+# if CGIR_SUPPORT_LLVM
 
 /**
  *  Fused launcher state: holds the compiled JIT module and the function
@@ -181,15 +181,15 @@ prefix_functions(llvm::Module & M, const std::string & prefix)
         F->setName(prefix + F->getName().str());
 }
 
-# endif /* OPENCG_SUPPORT_LLVM */
+# endif /* CGIR_SUPPORT_LLVM */
 
 void
-OCG_NAMESPACE::command_graph_prog_fuse_llvmir(
+CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     command_prog_t ** progs,
     size_t n,
     command_prog_t * dst
 ) {
-    # if !OPENCG_SUPPORT_LLVM
+    # if !CGIR_SUPPORT_LLVM
     (void) progs; (void) n; (void) dst;
     fprintf(stderr, "prog-fuse: LLVM support not enabled (rebuild with -DUSE_LLVM=ON)\n");
     abort();
@@ -570,5 +570,5 @@ OCG_NAMESPACE::command_graph_prog_fuse_llvmir(
     dst->launcher.variadic.args      = args_buf;
     dst->launcher.variadic.args_size = n_args * sizeof(void *);
 
-    # endif /* OPENCG_SUPPORT_LLVM */
+    # endif /* CGIR_SUPPORT_LLVM */
 }

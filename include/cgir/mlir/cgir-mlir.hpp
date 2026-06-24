@@ -4,27 +4,27 @@
 ** Contributors :
 ** Romain PEREIRA, rpereira@anl.gov
 **
-** Public C++ API of the OpenCG `cg` MLIR dialect.
+** Public C++ API of the CGIR `cg` MLIR dialect.
 **
 ** This header (and the `cg` dialect it exposes) lets a runtime system other
-** than XKRT interoperate with OpenCG at the MLIR level: it may build `cg` ops
+** than XKRT interoperate with CGIR at the MLIR level: it may build `cg` ops
 ** directly, run the optimization passes, and/or convert to and from the POD
 ** command graph. Using this header requires MLIR; the POD command graph headers
-** (opencg/command*.hpp) do NOT, so a runtime that only wants the POD path never
+** (cgir/command*.hpp) do NOT, so a runtime that only wants the POD path never
 ** needs MLIR.
 **
 ** This software is governed by the CeCILL-C license under French law and
 ** abiding by the rules of distribution of free software. See the LICENSE file.
 **/
 
-#ifndef __OPENCG_MLIR_HPP__
-# define __OPENCG_MLIR_HPP__
+#ifndef __CGIR_MLIR_HPP__
+# define __CGIR_MLIR_HPP__
 
-# include <opencg/mlir/CG/CGDialect.h>
+# include <cgir/mlir/CG/CGDialect.h>
 
-# include <opencg/command.hpp>
-# include <opencg/command-graph.hpp>
-# include <opencg/command-graph-pass.hpp>
+# include <cgir/command.hpp>
+# include <cgir/command-graph.hpp>
+# include <cgir/command-graph-pass.hpp>
 
 # include <mlir/IR/BuiltinOps.h>
 # include <mlir/IR/MLIRContext.h>
@@ -34,7 +34,7 @@
 
 namespace mlir { class Pass; }
 
-OCG_NAMESPACE_BEGIN
+CGIR_NAMESPACE_BEGIN
 namespace cg {
 
 /**
@@ -80,7 +80,7 @@ export_command_graph(GraphOp graph, command_graph_t * cg);
 
 /* Pass factories. The factory matching a not-yet-ported pass returns nullptr. */
 # define DEF(ENUM, FUNC, NAME, MK) std::unique_ptr<::mlir::Pass> MK(void);
-OCG_FORALL_COMMAND_GRAPH_PASS(DEF)
+CGIR_FORALL_COMMAND_GRAPH_PASS(DEF)
 # undef DEF
 
 /* Create the MLIR pass implementing `pass`, or nullptr if not ported to MLIR. */
@@ -88,6 +88,6 @@ std::unique_ptr<::mlir::Pass>
 create_pass(command_graph_pass_t pass);
 
 } /* namespace cg */
-OCG_NAMESPACE_END
+CGIR_NAMESPACE_END
 
-#endif /* __OPENCG_MLIR_HPP__ */
+#endif /* __CGIR_MLIR_HPP__ */

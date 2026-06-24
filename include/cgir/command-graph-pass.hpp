@@ -34,23 +34,23 @@
 ** knowledge of the CeCILL-C license and that you accept its terms.
 **/
 
-#ifndef __OPENCG_COMMAND_GRAPH_PASS_HPP__
-# define __OPENCG_COMMAND_GRAPH_PASS_HPP__
+#ifndef __CGIR_COMMAND_GRAPH_PASS_HPP__
+# define __CGIR_COMMAND_GRAPH_PASS_HPP__
 
-# include <opencg/namespace.hpp>
+# include <cgir/namespace.hpp>
 
-OCG_NAMESPACE_BEGIN
+CGIR_NAMESPACE_BEGIN
 
 /* For each command graph optimization pass:
  *   - ENUM : the command_graph_pass_t enumerator
  *   - FUNC : the legacy (POD) member function on command_graph_t
  *   - NAME : a human readable name
- *   - MK   : the MLIR pass factory in namespace ocg::cg (see opencg/mlir).
+ *   - MK   : the MLIR pass factory in namespace cgir::cg (see cgir/mlir).
  *            A not-yet-ported pass uses a factory that returns nullptr, so the
  *            dispatcher transparently falls back to the legacy POD pass.
  * The MK column is only referenced by the (MLIR-only) src/mlir translation
  * units; POD consumers expand this macro ignoring it. */
-# define OCG_FORALL_COMMAND_GRAPH_PASS(F)                                                                   \
+# define CGIR_FORALL_COMMAND_GRAPH_PASS(F)                                                                   \
     F(COMMAND_GRAPH_PASS_BATCH,             pass_batch,             "batch",            create_batch_pass)          \
     F(COMMAND_GRAPH_PASS_COPY_FUSE,         pass_copy_fuse,         "copy-fuse",        create_copy_fuse_pass)      \
     F(COMMAND_GRAPH_PASS_COPY_NORMALIZE,    pass_copy_normalize,    "copy-normalize",   create_copy_normalize_pass) \
@@ -61,7 +61,7 @@ OCG_NAMESPACE_BEGIN
 enum command_graph_pass_t
 {
     # define DEF(ENUM, FUNC, NAME, MK) ENUM,
-    OCG_FORALL_COMMAND_GRAPH_PASS(DEF)
+    CGIR_FORALL_COMMAND_GRAPH_PASS(DEF)
     # undef DEF
     COMMAND_GRAPH_PASS_MAX
 };
@@ -72,13 +72,13 @@ command_graph_pass_to_str(command_graph_pass_t opt)
     switch (opt)
     {
         # define DEF(ENUM, FUNC, NAME, MK) case(ENUM): return NAME;
-        OCG_FORALL_COMMAND_GRAPH_PASS(DEF);
+        CGIR_FORALL_COMMAND_GRAPH_PASS(DEF);
         # undef DEF
         default:
             return "(null)";
     }
 }
 
-OCG_NAMESPACE_END
+CGIR_NAMESPACE_END
 
-#endif /* __OPENCG_COMMAND_GRAPH_PASS_HPP__ */
+#endif /* __CGIR_COMMAND_GRAPH_PASS_HPP__ */

@@ -1,15 +1,15 @@
 /*
-** OpenCG `cg` MLIR dialect - definitions.
+** CGIR `cg` MLIR dialect - definitions.
 */
 
-# include <opencg/mlir/CG/CGDialect.h>
+# include <cgir/mlir/CG/CGDialect.h>
 
 # include "mlir/IR/Builders.h"
 # include "mlir/IR/DialectImplementation.h"
 # include "llvm/ADT/TypeSwitch.h"
 
 using namespace mlir;
-using namespace ocg::cg;
+using namespace cgir::cg;
 
 //===----------------------------------------------------------------------===//
 // Types

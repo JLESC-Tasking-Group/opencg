@@ -1,19 +1,19 @@
 /*
-** OpenCG -> MLIR import.
+** CGIR -> MLIR import.
 **
 ** Builds a `cg` dialect module that is structurally isomorphic to a POD
 ** command graph: one op per node, edges encoded as !cg.token operands.
 */
 
-# include <opencg/mlir/opencg-mlir.hpp>
+# include <cgir/mlir/cgir-mlir.hpp>
 
 # include "mlir/IR/Builders.h"
 # include "mlir/IR/BuiltinAttributes.h"
 # include "mlir/IR/BuiltinOps.h"
 
-# include <opencg/command.hpp>
-# include <opencg/command-graph.hpp>
-# include <opencg/command-type.hpp>
+# include <cgir/command.hpp>
+# include <cgir/command-graph.hpp>
+# include <cgir/command-type.hpp>
 
 # include <cstdint>
 # include <cstdio>
@@ -22,7 +22,7 @@
 
 using namespace mlir;
 
-namespace ocg {
+namespace cgir {
 namespace cg {
 
 namespace {
@@ -107,13 +107,13 @@ create_node_op(
         st.addAttribute("duid", b.getI32IntegerAttr(duid));
         st.addAttribute("kind", b.getI32IntegerAttr((int32_t) cmd->type));
         llvm::ArrayRef<int8_t> bytes(
-            reinterpret_cast<const int8_t *>(cmd), sizeof(::ocg::command_t));
+            reinterpret_cast<const int8_t *>(cmd), sizeof(::cgir::command_t));
         st.addAttribute("blob", DenseI8ArrayAttr::get(b.getContext(), bytes));
         return b.create(st);
     }
 
     /* COMMAND_GRAPH / CONDITION nodes are not modeled yet (Phase 2+). */
-    fprintf(stderr, "opencg/mlir: unsupported node type %d during import\n", (int) node->type);
+    fprintf(stderr, "cgir/mlir: unsupported node type %d during import\n", (int) node->type);
     abort();
 }
 
@@ -206,4 +206,4 @@ import_command_graph(
 }
 
 } // namespace cg
-} // namespace ocg
+} // namespace cgir

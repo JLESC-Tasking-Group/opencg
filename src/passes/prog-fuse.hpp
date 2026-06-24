@@ -8,18 +8,18 @@
 ** one. Used by both the legacy POD pass (src/passes/prog-fuse.cc) and the MLIR
 ** pass (src/mlir/passes/ProgFuse.cpp). Its signature exposes no LLVM type, so
 ** callers (e.g. the MLIR pass) need not include LLVM headers; the symbol is
-** resolved within libopencg, where the LLVM machinery lives.
+** resolved within libcgir, where the LLVM machinery lives.
 **
 ** This software is governed by the CeCILL-C license. See the LICENSE file.
 **/
 
-#ifndef __OPENCG_PROG_FUSE_HPP__
-# define __OPENCG_PROG_FUSE_HPP__
+#ifndef __CGIR_PROG_FUSE_HPP__
+# define __CGIR_PROG_FUSE_HPP__
 
-# include <opencg/command.hpp>
-# include <opencg/namespace.hpp>
+# include <cgir/command.hpp>
+# include <cgir/namespace.hpp>
 
-OCG_NAMESPACE_BEGIN
+CGIR_NAMESPACE_BEGIN
 
 /**
  *  Fuse a chain of N >= 2 LLVM-IR PROG commands into one.
@@ -34,7 +34,7 @@ OCG_NAMESPACE_BEGIN
  *  is itself the result of a previous fusion is handled correctly, so arbitrary
  *  chains fuse into one wrapper.
  *
- *  Requires OPENCG_SUPPORT_LLVM; aborts otherwise.
+ *  Requires CGIR_SUPPORT_LLVM; aborts otherwise.
  */
 void
 command_graph_prog_fuse_llvmir(
@@ -43,6 +43,6 @@ command_graph_prog_fuse_llvmir(
     command_prog_t * dst
 );
 
-OCG_NAMESPACE_END
+CGIR_NAMESPACE_END
 
-#endif /* __OPENCG_PROG_FUSE_HPP__ */
+#endif /* __CGIR_PROG_FUSE_HPP__ */

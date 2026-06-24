@@ -39,15 +39,15 @@
 // command_graph_prog_fuse_llvmir() (see prog-fuse-llvmir.cc), which is also used
 // by the MLIR pass.
 
-# include <opencg/namespace.hpp>
-# include <opencg/command.hpp>
-# include <opencg/command-graph.hpp>
+# include <cgir/namespace.hpp>
+# include <cgir/command.hpp>
+# include <cgir/command-graph.hpp>
 
 # include "prog-fuse.hpp"
 
 # include <vector>
 
-OCG_NAMESPACE_USE;
+CGIR_NAMESPACE_USE;
 
 /* pass local storage */
 struct pls_t

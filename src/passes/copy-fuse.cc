@@ -34,15 +34,15 @@
 ** knowledge of the CeCILL-C license and that you accept its terms.
 **/
 
-# include <opencg/namespace.hpp>
-# include <opencg/command.hpp>
-# include <opencg/command-graph.hpp>
-# include <opencg/min-max.h>
+# include <cgir/namespace.hpp>
+# include <cgir/command.hpp>
+# include <cgir/command-graph.hpp>
+# include <cgir/min-max.h>
 
 # include <queue>
 # include <stack>
 
-OCG_NAMESPACE_USE;
+CGIR_NAMESPACE_USE;
 
 /* pass local storage */
 struct pls_t
@@ -232,7 +232,7 @@ command_graph_pass_batch_try_fuse_copy(
     # undef MUST
 }
 
-//  OPENCG can generate multiple copies with same source, same destination, on contiguous memory.
+//  CGIR can generate multiple copies with same source, same destination, on contiguous memory.
 //  In such case, these nodes would be false-twins --- in such case, this pass merges them to a single copy.
 //  TODO: does other runtimes would have similar merge needs but with different nodes relationships? (e.g., u->v sequence)
 //

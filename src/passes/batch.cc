@@ -34,14 +34,14 @@
 ** knowledge of the CeCILL-C license and that you accept its terms.
 **/
 
-# include <opencg/namespace.hpp>
-# include <opencg/command.hpp>
-# include <opencg/command-graph.hpp>
+# include <cgir/namespace.hpp>
+# include <cgir/command.hpp>
+# include <cgir/command-graph.hpp>
 
 # include <queue>
 # include <stack>
 
-OCG_NAMESPACE_USE;
+CGIR_NAMESPACE_USE;
 
 /* pass local storage */
 struct pls_t

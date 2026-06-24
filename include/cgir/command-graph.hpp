@@ -34,14 +34,14 @@
 ** knowledge of the CeCILL-C license and that you accept its terms.
 **/
 
-#ifndef __OPENCG_COMMAND_GRAPH_HPP__
-# define __OPENCG_COMMAND_GRAPH_HPP__
+#ifndef __CGIR_COMMAND_GRAPH_HPP__
+# define __CGIR_COMMAND_GRAPH_HPP__
 
-# include <opencg/bitset2d.hpp>
-# include <opencg/command-graph-pass.hpp>
-# include <opencg/command-type.hpp>
-# include <opencg/device-type.hpp>
-# include <opencg/namespace.hpp>
+# include <cgir/bitset2d.hpp>
+# include <cgir/command-graph-pass.hpp>
+# include <cgir/command-type.hpp>
+# include <cgir/device-type.hpp>
+# include <cgir/namespace.hpp>
 
 # include <algorithm>
 # include <functional>
@@ -53,7 +53,7 @@
 # include <stdio.h>
 # include <stdint.h>
 
-OCG_NAMESPACE_BEGIN
+CGIR_NAMESPACE_BEGIN
 
 /* struct command_t exists */
 struct command_t;
@@ -64,12 +64,12 @@ struct command_graph_t;
  *  Out-of-line optimization dispatcher.
  *
  *  This is THE public boundary for running optimization passes. It is defined
- *  in the OpenCG shared library and dispatches either to the legacy C++ passes
- *  or (when built with OPENCG_USE_MLIR) to the MLIR `cg` dialect pipeline.
+ *  in the CGIR shared library and dispatches either to the legacy C++ passes
+ *  or (when built with CGIR_USE_MLIR) to the MLIR `cg` dialect pipeline.
  *
- *  Crucially, its signature exposes no MLIR type, so consumers of OpenCG (e.g.
+ *  Crucially, its signature exposes no MLIR type, so consumers of CGIR (e.g.
  *  XKRT) never need to see or link MLIR: the whole MLIR machinery is hidden
- *  behind this function inside libopencg.
+ *  behind this function inside libcgir.
  */
 void command_graph_optimize(command_graph_t * cg, command_graph_pass_t pass);
 
@@ -188,11 +188,11 @@ struct command_graph_node_t
     command_graph_node_t(
         const command_graph_node_type_t type
     ) :
-        command_graph_node_t(OCG_UNSPECIFIED_DEVICE_UNIQUE_ID, type)
+        command_graph_node_t(CGIR_UNSPECIFIED_DEVICE_UNIQUE_ID, type)
     {}
 
     command_graph_node_t(void) :
-        command_graph_node_t(OCG_UNSPECIFIED_DEVICE_UNIQUE_ID, COMMAND_GRAPH_NODE_TYPE_EMPTY)
+        command_graph_node_t(CGIR_UNSPECIFIED_DEVICE_UNIQUE_ID, COMMAND_GRAPH_NODE_TYPE_EMPTY)
     {}
 
     command_graph_node_t(
@@ -342,8 +342,8 @@ struct command_graph_t
         this->command_graph_node_new = command_graph_node_new;
         this->command_graph_new = command_graph_new;
 
-        this->entry = this->command_graph_node_new(this, OCG_UNSPECIFIED_DEVICE_UNIQUE_ID, COMMAND_GRAPH_NODE_TYPE_EMPTY);
-        this->exit  = this->command_graph_node_new(this, OCG_UNSPECIFIED_DEVICE_UNIQUE_ID, COMMAND_GRAPH_NODE_TYPE_EMPTY);
+        this->entry = this->command_graph_node_new(this, CGIR_UNSPECIFIED_DEVICE_UNIQUE_ID, COMMAND_GRAPH_NODE_TYPE_EMPTY);
+        this->exit  = this->command_graph_node_new(this, CGIR_UNSPECIFIED_DEVICE_UNIQUE_ID, COMMAND_GRAPH_NODE_TYPE_EMPTY);
         assert(this->entry);
         assert(this->exit);
         this->entry->precedes(this->exit);
@@ -356,7 +356,7 @@ struct command_graph_t
     /* Legacy C++ pass implementations (in src/passes/).
      * These remain available for A/B parity testing against the MLIR pipeline. */
     # define DEF(ENUM, FUNC, NAME, MK) void FUNC(void);
-    OCG_FORALL_COMMAND_GRAPH_PASS(DEF);
+    CGIR_FORALL_COMMAND_GRAPH_PASS(DEF);
     # undef DEF
 
     /* Run the legacy C++ pass directly (no MLIR). Used as the fallback path and
@@ -367,7 +367,7 @@ struct command_graph_t
         switch (pass)
         {
             # define DEF(ENUM, FUNC, NAME, MK) case(ENUM): { this->FUNC(); break; }
-            OCG_FORALL_COMMAND_GRAPH_PASS(DEF);
+            CGIR_FORALL_COMMAND_GRAPH_PASS(DEF);
             # undef DEF
             default:
             {
@@ -518,7 +518,7 @@ struct command_graph_t
             else
             {
                 assert(this->command_graph_node_new);
-                command_graph_node_t * w = this->command_graph_node_new(this, OCG_UNSPECIFIED_DEVICE_UNIQUE_ID, COMMAND_GRAPH_NODE_TYPE_EMPTY);
+                command_graph_node_t * w = this->command_graph_node_new(this, CGIR_UNSPECIFIED_DEVICE_UNIQUE_ID, COMMAND_GRAPH_NODE_TYPE_EMPTY);
                 assert(w);
 
                 /* predecessors */
@@ -565,7 +565,7 @@ struct command_graph_t
             else
             {
                 assert(this->command_graph_node_new);
-                command_graph_node_t * w = this->command_graph_node_new(this, OCG_UNSPECIFIED_DEVICE_UNIQUE_ID, COMMAND_GRAPH_NODE_TYPE_EMPTY);
+                command_graph_node_t * w = this->command_graph_node_new(this, CGIR_UNSPECIFIED_DEVICE_UNIQUE_ID, COMMAND_GRAPH_NODE_TYPE_EMPTY);
                 assert(w);
 
                 /* predecessors */
@@ -608,7 +608,7 @@ struct command_graph_t
             else
             {
                 assert(this->command_graph_node_new);
-                command_graph_node_t * w = this->command_graph_node_new(this, OCG_UNSPECIFIED_DEVICE_UNIQUE_ID, COMMAND_GRAPH_NODE_TYPE_EMPTY);
+                command_graph_node_t * w = this->command_graph_node_new(this, CGIR_UNSPECIFIED_DEVICE_UNIQUE_ID, COMMAND_GRAPH_NODE_TYPE_EMPTY);
                 assert(w);
 
                 /* predecessors */
@@ -766,6 +766,6 @@ struct command_graph_t
 
 };
 
-OCG_NAMESPACE_END
+CGIR_NAMESPACE_END
 
-#endif /* __OPENCG_COMMAND_GRAPH_HPP__ */
+#endif /* __CGIR_COMMAND_GRAPH_HPP__ */

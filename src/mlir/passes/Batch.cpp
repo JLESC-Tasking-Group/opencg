@@ -15,7 +15,7 @@
 ** specifics are irrelevant here (batching is type-agnostic, device-based).
 */
 
-# include <opencg/mlir/opencg-mlir.hpp>
+# include <cgir/mlir/cgir-mlir.hpp>
 
 # include "mlir/IR/Builders.h"
 # include "mlir/IR/BuiltinAttributes.h"
@@ -35,8 +35,8 @@ using namespace mlir;
 
 namespace {
 
-using ::ocg::cg::BatchOp;
-using ::ocg::cg::EmptyOp;
+using ::cgir::cg::BatchOp;
+using ::cgir::cg::EmptyOp;
 
 static inline uint32_t
 get_duid(Operation * op)
@@ -119,7 +119,7 @@ materialize_batch(
 }
 
 struct BatchPass
-    : public PassWrapper<BatchPass, OperationPass<::ocg::cg::GraphOp>>
+    : public PassWrapper<BatchPass, OperationPass<::cgir::cg::GraphOp>>
 {
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(BatchPass)
 
@@ -131,7 +131,7 @@ struct BatchPass
 
     void runOnOperation() override
     {
-        using namespace ::ocg::cg;
+        using namespace ::cgir::cg;
 
         GraphOp graph = getOperation();
         Block & body = graph.getBodyBlock();
@@ -269,7 +269,7 @@ struct BatchPass
          * contracting two actual commands (cases a/b with control nodes do no
          * batching). Control/empty nodes only *bridge* commands inside a group
          * and are never batched on their own. This also guarantees the batch
-         * node device is a real command device, never OCG_UNSPECIFIED (255),
+         * node device is a real command device, never CGIR_UNSPECIFIED (255),
          * avoiding XKRT's replay assertion on COMMAND-node devices. */
         std::vector<std::pair<std::vector<Operation *>, uint32_t>> groups;
         for (int i = 0; i < n; ++i)
@@ -300,7 +300,7 @@ struct BatchPass
 } // anonymous namespace
 
 std::unique_ptr<Pass>
-ocg::cg::create_batch_pass(void)
+cgir::cg::create_batch_pass(void)
 {
     return std::make_unique<BatchPass>();
 }

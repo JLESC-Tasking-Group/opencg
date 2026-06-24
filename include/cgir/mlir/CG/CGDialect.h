@@ -4,7 +4,7 @@
 ** Contributors :
 ** Romain PEREIRA, rpereira@anl.gov
 **
-** OpenCG `cg` MLIR dialect - C++ surface.
+** CGIR `cg` MLIR dialect - C++ surface.
 **
 ** Pulls together the TableGen-generated declarations for the dialect, its
 ** `!cg.token` type, and its ops. This is a public header: using it requires
@@ -13,8 +13,8 @@
 ** This software is governed by the CeCILL-C license. See the LICENSE file.
 **/
 
-#ifndef __OPENCG_CG_CGDIALECT_H__
-# define __OPENCG_CG_CGDIALECT_H__
+#ifndef __CGIR_CG_CGDIALECT_H__
+# define __CGIR_CG_CGDIALECT_H__
 
 # include <mlir/Bytecode/BytecodeOpInterface.h>
 # include <mlir/IR/Builders.h>
@@ -36,4 +36,4 @@
 # define GET_OP_CLASSES
 # include "CGOps.h.inc"
 
-#endif /* __OPENCG_CG_CGDIALECT_H__ */
+#endif /* __CGIR_CG_CGDIALECT_H__ */

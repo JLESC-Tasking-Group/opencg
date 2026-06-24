@@ -1,6 +1,6 @@
-//===- CGTypes.td - OpenCG command-graph dialect types -----*- tablegen -*-===//
-#ifndef OPENCG_CG_TYPES_TD
-#define OPENCG_CG_TYPES_TD
+//===- CGTypes.td - CGIR command-graph dialect types -----*- tablegen -*-===//
+#ifndef CGIR_CG_TYPES_TD
+#define CGIR_CG_TYPES_TD
 
 include "CGDialect.td"
 
@@ -17,4 +17,4 @@ def CG_TokenType : CG_Type<"Token", "token"> {
   }];
 }
 
-#endif // OPENCG_CG_TYPES_TD
+#endif // CGIR_CG_TYPES_TD

@@ -7,13 +7,13 @@
 **   - Otherwise normalize it to sizeof_type == 1 (scaling m by the old size).
 */
 
-# include <opencg/mlir/opencg-mlir.hpp>
+# include <cgir/mlir/cgir-mlir.hpp>
 
 # include "mlir/IR/Builders.h"
 # include "mlir/Pass/Pass.h"
 # include "llvm/ADT/STLExtras.h"
 
-# include <opencg/command-type.hpp>
+# include <cgir/command-type.hpp>
 
 # include <cstdint>
 
@@ -27,16 +27,16 @@ copy_2d_to_1d_kind(int32_t k)
 {
     switch (k)
     {
-        case ::ocg::COMMAND_TYPE_COPY_H2H_2D: return ::ocg::COMMAND_TYPE_COPY_H2H_1D;
-        case ::ocg::COMMAND_TYPE_COPY_H2D_2D: return ::ocg::COMMAND_TYPE_COPY_H2D_1D;
-        case ::ocg::COMMAND_TYPE_COPY_D2H_2D: return ::ocg::COMMAND_TYPE_COPY_D2H_1D;
-        case ::ocg::COMMAND_TYPE_COPY_D2D_2D: return ::ocg::COMMAND_TYPE_COPY_D2D_1D;
+        case ::cgir::COMMAND_TYPE_COPY_H2H_2D: return ::cgir::COMMAND_TYPE_COPY_H2H_1D;
+        case ::cgir::COMMAND_TYPE_COPY_H2D_2D: return ::cgir::COMMAND_TYPE_COPY_H2D_1D;
+        case ::cgir::COMMAND_TYPE_COPY_D2H_2D: return ::cgir::COMMAND_TYPE_COPY_D2H_1D;
+        case ::cgir::COMMAND_TYPE_COPY_D2D_2D: return ::cgir::COMMAND_TYPE_COPY_D2D_1D;
         default:                              return k;
     }
 }
 
 struct CopyNormalizePass
-    : public PassWrapper<CopyNormalizePass, OperationPass<::ocg::cg::GraphOp>>
+    : public PassWrapper<CopyNormalizePass, OperationPass<::cgir::cg::GraphOp>>
 {
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CopyNormalizePass)
 
@@ -48,7 +48,7 @@ struct CopyNormalizePass
 
     void runOnOperation() override
     {
-        using namespace ::ocg::cg;
+        using namespace ::cgir::cg;
 
         GraphOp graph = getOperation();
         Block & body = graph.getBodyBlock();
@@ -80,7 +80,7 @@ struct CopyNormalizePass
                 Operation * node_1d = b.create(st);
 
                 /* preserve the originating POD node, then replace */
-                if (::ocg::command_graph_node_t * sn = get_src_node(c))
+                if (::cgir::command_graph_node_t * sn = get_src_node(c))
                     set_src_node(node_1d, sn);
 
                 c.getToken().replaceAllUsesWith(node_1d->getResult(0));
@@ -103,7 +103,7 @@ struct CopyNormalizePass
 } // anonymous namespace
 
 std::unique_ptr<Pass>
-ocg::cg::create_copy_normalize_pass(void)
+cgir::cg::create_copy_normalize_pass(void)
 {
     return std::make_unique<CopyNormalizePass>();
 }

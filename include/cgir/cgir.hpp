@@ -34,14 +34,15 @@
 ** knowledge of the CeCILL-C license and that you accept its terms.
 **/
 
-#ifndef __OCG_NAMESPACE_H__
-# define __OCG_NAMESPACE_H__
+#ifndef __CGIR_HPP__
+# define __CGIR_HPP__
 
-# define OCG_NAMESPACE         ocg
+#  include <cgir/command-graph-pass.hpp>
+#  include <cgir/command-graph.hpp>
+#  include <cgir/command-type.hpp>
+#  include <cgir/command.hpp>
+#  include <cgir/device-type.hpp>
+#  include <cgir/namespace.hpp>
+#  include <cgir/support.h>
 
-# define OCG_NAMESPACE_BEGIN   namespace OCG_NAMESPACE {
-# define OCG_NAMESPACE_END     }
-
-# define OCG_NAMESPACE_USE     using namespace OCG_NAMESPACE
-
-#endif /* __OCG_NAMESPACE_H__ */
+#endif /* __CGIR_HPP__ */

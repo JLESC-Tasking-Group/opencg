@@ -7,14 +7,14 @@
 ** accumulation), then redundant edges are dropped.
 */
 
-# include <opencg/mlir/opencg-mlir.hpp>
+# include <cgir/mlir/cgir-mlir.hpp>
 
 # include "mlir/Pass/Pass.h"
 # include "llvm/ADT/DenseMap.h"
 # include "llvm/ADT/SmallPtrSet.h"
 # include "llvm/ADT/SmallVector.h"
 
-# include <opencg/bitset2d.hpp>
+# include <cgir/bitset2d.hpp>
 
 # include <vector>
 
@@ -23,7 +23,7 @@ using namespace mlir;
 namespace {
 
 struct ReduceEdgePass
-    : public PassWrapper<ReduceEdgePass, OperationPass<::ocg::cg::GraphOp>>
+    : public PassWrapper<ReduceEdgePass, OperationPass<::cgir::cg::GraphOp>>
 {
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ReduceEdgePass)
 
@@ -35,7 +35,7 @@ struct ReduceEdgePass
 
     void runOnOperation() override
     {
-        using namespace ::ocg::cg;
+        using namespace ::cgir::cg;
 
         GraphOp graph = getOperation();
         Block & body = graph.getBodyBlock();
@@ -157,7 +157,7 @@ struct ReduceEdgePass
 } // anonymous namespace
 
 std::unique_ptr<Pass>
-ocg::cg::create_reduce_edge_pass(void)
+cgir::cg::create_reduce_edge_pass(void)
 {
     return std::make_unique<ReduceEdgePass>();
 }

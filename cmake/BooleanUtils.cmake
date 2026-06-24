@@ -6,7 +6,7 @@ macro(convert_bool var)
   endif()
 endmacro()
 
-macro(ocgoption NAME DESCRIPTION DEFAULT)
+macro(cgiroption NAME DESCRIPTION DEFAULT)
     option(${NAME} "${DESCRIPTION}" ${DEFAULT})
     convert_bool(${NAME})
 endmacro()

@@ -2,8 +2,7 @@
 ** Copyright 2024,2025 INRIA
 **
 ** Contributors :
-** Thierry Gautier, thierry.gautier@inrialpes.fr
-** Romain PEREIRA, romain.pereira@inria.fr + rpereira@anl.gov
+** Romain PEREIRA, rpereira@anl.gov
 **
 ** This software is a computer program whose purpose is to execute
 ** blas subroutines on multi-GPUs system.
@@ -35,15 +34,40 @@
 ** knowledge of the CeCILL-C license and that you accept its terms.
 **/
 
-#ifndef __OPENCG_MIN_MAX_H__
-# define __OPENCG_MIN_MAX_H__
+# include <cgir/cgir.hpp>
 
-# ifndef MIN
-#  define MIN(X, Y) ((Y) < (X) ? (Y) : (X))
-# endif /* MIN */
+CGIR_NAMESPACE_USE;
 
-# ifndef MAX
-#  define MAX(X, Y) ((X) < (Y) ? (Y) : (X))
-# endif /* MAX */
+static command_t *
+command_new(command_graph_t * cg, const command_type_t type)
+{
+    return new command_t(type);
+}
 
-#endif
+static command_graph_node_t *
+command_graph_node_new(
+    command_graph_t * cg,
+    const device_unique_id_t device_unique_id,
+    const command_graph_node_type_t type
+) {
+    return new command_graph_node_t(type);
+}
+
+static command_graph_t *
+command_graph_new(command_graph_t * original_cg)
+{
+    command_graph_t * cg = new command_graph_t();
+    /* When invoked as the allocator callback for a *sub*-graph (e.g. a batch),
+     * initialize it so it has entry/exit nodes and allocator callbacks. The
+     * top-level graph is created with original_cg == NULL and is initialized
+     * explicitly by the caller via cg->init(...). */
+    if (original_cg)
+        cg->init(command_new, command_graph_node_new, command_graph_new);
+    return cg;
+}
+
+static command_graph_t *
+command_graph_new(void)
+{
+    return command_graph_new(NULL);
+}

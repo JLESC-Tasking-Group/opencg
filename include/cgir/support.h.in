@@ -2,7 +2,8 @@
 ** Copyright 2024,2025 INRIA
 **
 ** Contributors :
-** Romain PEREIRA, rpereira@anl.gov
+** Thierry Gautier, thierry.gautier@inrialpes.fr
+** Romain PEREIRA, romain.pereira@inria.fr + rpereira@anl.gov
 **
 ** This software is a computer program whose purpose is to execute
 ** blas subroutines on multi-GPUs system.
@@ -34,40 +35,17 @@
 ** knowledge of the CeCILL-C license and that you accept its terms.
 **/
 
-# include <opencg/opencg.hpp>
+#ifndef __CGIR_SUPPORT_H__
+# define __CGIR_SUPPORT_H__
 
-OCG_NAMESPACE_USE;
+/* If LLVM IR manipulation and in-process JIT are enabled */
+# define CGIR_SUPPORT_LLVM    @USE_LLVM@
 
-static command_t *
-command_new(command_graph_t * cg, const command_type_t type)
-{
-    return new command_t(type);
-}
+/* If the MLIR-based intermediate representation and optimization passes are
+ * enabled. When enabled, `command_graph_optimize` can route optimization to
+ * the MLIR `cg` dialect pipeline (see src/mlir/). This is fully encapsulated
+ * inside libcgir: no MLIR header is ever exposed to consumers (e.g., XKRT). */
+# define CGIR_USE_MLIR        @USE_MLIR@
 
-static command_graph_node_t *
-command_graph_node_new(
-    command_graph_t * cg,
-    const device_unique_id_t device_unique_id,
-    const command_graph_node_type_t type
-) {
-    return new command_graph_node_t(type);
-}
+#endif /* __CGIR_SUPPORT_H__ */
 
-static command_graph_t *
-command_graph_new(command_graph_t * original_cg)
-{
-    command_graph_t * cg = new command_graph_t();
-    /* When invoked as the allocator callback for a *sub*-graph (e.g. a batch),
-     * initialize it so it has entry/exit nodes and allocator callbacks. The
-     * top-level graph is created with original_cg == NULL and is initialized
-     * explicitly by the caller via cg->init(...). */
-    if (original_cg)
-        cg->init(command_new, command_graph_node_new, command_graph_new);
-    return cg;
-}
-
-static command_graph_t *
-command_graph_new(void)
-{
-    return command_graph_new(NULL);
-}

@@ -34,15 +34,15 @@
 ** knowledge of the CeCILL-C license and that you accept its terms.
 **/
 
-#ifndef __OPENCG_C_API_H__
-# define __OPENCG_C_API_H__
+#ifndef __CGIR_C_API_H__
+# define __CGIR_C_API_H__
 
 # include <stdint.h>
 
 /* Defines the size of integers to be used as device unique identifiers */
-typedef uint8_t ocg_device_unique_id_t;
+typedef uint8_t cgir_device_unique_id_t;
 
 /* Represents an unspecified device */
-# define OCG_UNSPECIFIED_DEVICE_UNIQUE_ID ((ocg_device_unique_id_t) -1)
+# define CGIR_UNSPECIFIED_DEVICE_UNIQUE_ID ((cgir_device_unique_id_t) -1)
 
-#endif /* __OPENCG_C_API_H__ */
+#endif /* __CGIR_C_API_H__ */

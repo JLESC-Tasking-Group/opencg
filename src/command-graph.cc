@@ -34,54 +34,54 @@
 ** knowledge of the CeCILL-C license and that you accept its terms.
 **/
 
-# include <opencg/command.hpp>
-# include <opencg/command-graph.hpp>
+# include <cgir/command.hpp>
+# include <cgir/command-graph.hpp>
 
 # include <stdlib.h>
 # include <string.h>
 
-OCG_NAMESPACE_USE;
+CGIR_NAMESPACE_USE;
 
 ////////////////////////////
 // OPTIMIZATION DISPATCHER //
 ////////////////////////////
 
-# if OPENCG_USE_MLIR
+# if CGIR_USE_MLIR
 /* Defined in src/mlir/optimize.cpp. MLIR-free signature so this translation
  * unit (and any consumer) never needs MLIR headers. */
-namespace OCG_NAMESPACE { void command_graph_optimize_mlir(command_graph_t * cg, command_graph_pass_t pass); }
+namespace CGIR_NAMESPACE { void command_graph_optimize_mlir(command_graph_t * cg, command_graph_pass_t pass); }
 
 /* Returns true if the MLIR optimizer should be used.
- * Controlled by the OPENCG_OPTIMIZER environment variable:
+ * Controlled by the CGIR_OPTIMIZER environment variable:
  *   - "mlir"   -> use the MLIR `cg` pipeline
  *   - anything else (or unset) -> use the legacy POD passes (default)
  * The legacy POD passes remain the default so existing behavior is unchanged;
- * setting OPENCG_OPTIMIZER=mlir enables A/B comparison within a single binary. */
+ * setting CGIR_OPTIMIZER=mlir enables A/B comparison within a single binary. */
 static inline bool
 command_graph_use_mlir_optimizer(void)
 {
     static int use_mlir_optimizer = -1;
     if (use_mlir_optimizer == -1)
     {
-        const char * s = getenv("OPENCG_OPTIMIZER");
+        const char * s = getenv("CGIR_OPTIMIZER");
         use_mlir_optimizer = (s && strcmp(s, "mlir") == 0) ? 1 : 0;
     }
     return (bool) use_mlir_optimizer;
 }
-# endif /* OPENCG_USE_MLIR */
+# endif /* CGIR_USE_MLIR */
 
 void
-OCG_NAMESPACE::command_graph_optimize(
+CGIR_NAMESPACE::command_graph_optimize(
     command_graph_t * cg,
     command_graph_pass_t pass
 ) {
-    # if OPENCG_USE_MLIR
+    # if CGIR_USE_MLIR
     if (command_graph_use_mlir_optimizer())
     {
         command_graph_optimize_mlir(cg, pass);
         return ;
     }
-    # endif /* OPENCG_USE_MLIR */
+    # endif /* CGIR_USE_MLIR */
 
     /* legacy C++ passes */
     cg->optimize_legacy(pass);

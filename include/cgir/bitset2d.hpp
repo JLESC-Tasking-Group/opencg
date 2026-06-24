@@ -34,8 +34,8 @@
 ** knowledge of the CeCILL-C license and that you accept its terms.
 **/
 
-#ifndef __OPENCG_BITSET2D_H__
-# define __OPENCG_BITSET2D_H__
+#ifndef __CGIR_BITSET2D_H__
+# define __CGIR_BITSET2D_H__
 
 # include <stdint.h>
 # include <stdlib.h>
@@ -139,4 +139,4 @@ struct bitset2d_t
     }
 };
 
-#endif /* __OPENCG_BITSET2D_H__ */
+#endif /* __CGIR_BITSET2D_H__ */

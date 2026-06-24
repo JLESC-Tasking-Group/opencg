@@ -31,17 +31,17 @@
 ** knowledge of the CeCILL-C license and that you accept its terms.
 **/
 
-#ifndef __OPENCG_COMMAND_TYPE_HPP__
-# define __OPENCG_COMMAND_TYPE_HPP__
+#ifndef __CGIR_COMMAND_TYPE_HPP__
+# define __CGIR_COMMAND_TYPE_HPP__
 
-# include <opencg/namespace.hpp>
+# include <cgir/namespace.hpp>
 
 # include <cassert>
 
-OCG_NAMESPACE_BEGIN
+CGIR_NAMESPACE_BEGIN
 
 /* Macro to iterate through all command type */
-# define OCG_FORALL_COMMAND_TYPE(F)                                                 \
+# define CGIR_FORALL_COMMAND_TYPE(F)                                                 \
     F(COMMAND_TYPE_PROG,            command_prog_t,             "PROG")             \
     F(COMMAND_TYPE_COPY_H2H_1D,     command_copy_1D_t,          "COPY-1D-H2H")      \
     F(COMMAND_TYPE_COPY_H2D_1D,     command_copy_1D_t,          "COPY-1D-H2D")      \
@@ -60,7 +60,7 @@ OCG_NAMESPACE_BEGIN
 enum command_type_t
 {
     # define DEF(ENUM, TYPE, NAME) ENUM,
-    OCG_FORALL_COMMAND_TYPE(DEF)
+    CGIR_FORALL_COMMAND_TYPE(DEF)
     # undef DEF
     COMMAND_TYPE_MAX
 };
@@ -71,13 +71,13 @@ command_type_to_str(command_type_t type)
     switch (type)
     {
         # define DEF(ENUM, TYPE, NAME) case(ENUM): return NAME;
-        OCG_FORALL_COMMAND_TYPE(DEF);
+        CGIR_FORALL_COMMAND_TYPE(DEF);
         # undef DEF
         default:
             return "(null)";
     }
 }
 
-OCG_NAMESPACE_END
+CGIR_NAMESPACE_END
 
-#endif /* __OPENCG_COMMAND_TYPE_HPP__ */
+#endif /* __CGIR_COMMAND_TYPE_HPP__ */

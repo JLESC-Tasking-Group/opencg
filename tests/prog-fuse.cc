@@ -44,7 +44,7 @@
 #  define assert(X) X
 # endif
 
-# include "opencg-tests.cc"
+# include "cgir-tests.cc"
 
 /**
  *  LLVM-IR source for scale: y[i] = s * y[i]

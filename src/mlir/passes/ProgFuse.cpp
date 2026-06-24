@@ -22,7 +22,7 @@
 ** This software is governed by the CeCILL-C license. See the LICENSE file.
 **/
 
-# include <opencg/mlir/opencg-mlir.hpp>
+# include <cgir/mlir/cgir-mlir.hpp>
 
 # include "passes/prog-fuse.hpp"
 
@@ -34,21 +34,21 @@ using namespace mlir;
 
 namespace {
 
-using ::ocg::cg::GenericOp;
-using ::ocg::cg::get_src_node;
+using ::cgir::cg::GenericOp;
+using ::cgir::cg::get_src_node;
 
 /* Return the originating POD node iff `op` is an imported PROG command. */
-static ::ocg::command_graph_node_t *
+static ::cgir::command_graph_node_t *
 prog_src_node(GenericOp op)
 {
-    ::ocg::command_graph_node_t * node = get_src_node(op.getOperation());
+    ::cgir::command_graph_node_t * node = get_src_node(op.getOperation());
     if (node == nullptr)
         return nullptr;
-    if (node->type != ::ocg::COMMAND_GRAPH_NODE_TYPE_COMMAND)
+    if (node->type != ::cgir::COMMAND_GRAPH_NODE_TYPE_COMMAND)
         return nullptr;
     if (node->command == nullptr)
         return nullptr;
-    if (node->command->type != ::ocg::COMMAND_TYPE_PROG)
+    if (node->command->type != ::cgir::COMMAND_TYPE_PROG)
         return nullptr;
     return node;
 }
@@ -68,7 +68,7 @@ is_series(Operation * u, Operation * v)
 }
 
 struct ProgFusePass
-    : public PassWrapper<ProgFusePass, OperationPass<::ocg::cg::GraphOp>>
+    : public PassWrapper<ProgFusePass, OperationPass<::cgir::cg::GraphOp>>
 {
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ProgFusePass)
 
@@ -80,13 +80,13 @@ struct ProgFusePass
 
     void runOnOperation() override
     {
-        using namespace ::ocg::cg;
+        using namespace ::cgir::cg;
 
         GraphOp graph = getOperation();
         Block & body = graph.getBodyBlock();
 
-        const uint32_t prog_kind = (uint32_t) ::ocg::COMMAND_TYPE_PROG;
-        const auto LLVMIR = ::ocg::COMMAND_PROG_SOURCE_TYPE_LLVMIR;
+        const uint32_t prog_kind = (uint32_t) ::cgir::COMMAND_TYPE_PROG;
+        const auto LLVMIR = ::cgir::COMMAND_PROG_SOURCE_TYPE_LLVMIR;
 
         /* snapshot PROG ops; chain members are erased lazily, tracked in `dead` */
         llvm::SmallVector<Operation *> work;
@@ -103,19 +103,19 @@ struct ProgFusePass
                 continue;
 
             GenericOp u = cast<GenericOp>(uop);
-            ::ocg::command_graph_node_t * un = prog_src_node(u);
+            ::cgir::command_graph_node_t * un = prog_src_node(u);
             if (un == nullptr || un->command->prog.source.type != LLVMIR)
                 continue;
 
             /* collect the maximal chain u -> v -> w -> ... of fusable
              * LLVM-IR programs in series */
             llvm::SmallVector<Operation *> chain_ops;
-            llvm::SmallVector<::ocg::command_graph_node_t *> chain_nodes;
+            llvm::SmallVector<::cgir::command_graph_node_t *> chain_nodes;
             chain_ops.push_back(uop);
             chain_nodes.push_back(un);
 
             Operation * cur = uop;
-            ::ocg::command_graph_node_t * cur_node = un;
+            ::cgir::command_graph_node_t * cur_node = un;
             for (;;)
             {
                 Value ct = cur->getResult(0);
@@ -130,7 +130,7 @@ struct ProgFusePass
                 if (!wg || wg.getKind() != prog_kind)
                     break;
 
-                ::ocg::command_graph_node_t * wn = prog_src_node(wg);
+                ::cgir::command_graph_node_t * wn = prog_src_node(wg);
                 if (wn == nullptr)
                     break;
                 if (!is_series(cur, w))
@@ -149,12 +149,12 @@ struct ProgFusePass
                 continue;
 
             /* fuse the whole chain into u's command (N-ary, single wrapper) */
-            llvm::SmallVector<::ocg::command_prog_t *> progs;
+            llvm::SmallVector<::cgir::command_prog_t *> progs;
             progs.reserve(chain_nodes.size());
-            for (::ocg::command_graph_node_t * cn : chain_nodes)
+            for (::cgir::command_graph_node_t * cn : chain_nodes)
                 progs.push_back(&cn->command->prog);
 
-            ::ocg::command_graph_prog_fuse_llvmir(progs.data(), progs.size(), &un->command->prog);
+            ::cgir::command_graph_prog_fuse_llvmir(progs.data(), progs.size(), &un->command->prog);
 
             /* contract the chain into u: u's token takes over the chain tail's
              * successors, and the rest of the chain is erased (back to front) */
@@ -172,7 +172,7 @@ struct ProgFusePass
 } /* anonymous namespace */
 
 std::unique_ptr<Pass>
-ocg::cg::create_prog_fuse_pass(void)
+cgir::cg::create_prog_fuse_pass(void)
 {
     return std::make_unique<ProgFusePass>();
 }

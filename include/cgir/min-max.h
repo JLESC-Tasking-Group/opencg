@@ -2,7 +2,8 @@
 ** Copyright 2024,2025 INRIA
 **
 ** Contributors :
-** Romain PEREIRA, rpereira@anl.gov
+** Thierry Gautier, thierry.gautier@inrialpes.fr
+** Romain PEREIRA, romain.pereira@inria.fr + rpereira@anl.gov
 **
 ** This software is a computer program whose purpose is to execute
 ** blas subroutines on multi-GPUs system.
@@ -34,16 +35,15 @@
 ** knowledge of the CeCILL-C license and that you accept its terms.
 **/
 
-#ifndef __OPENCG_DEVICE_TYPE_HPP__
-# define __OPENCG_DEVICE_TYPE_HPP__
+#ifndef __CGIR_MIN_MAX_H__
+# define __CGIR_MIN_MAX_H__
 
-# include <opencg/c/api.h>
+# ifndef MIN
+#  define MIN(X, Y) ((Y) < (X) ? (Y) : (X))
+# endif /* MIN */
 
-OCG_NAMESPACE_BEGIN
+# ifndef MAX
+#  define MAX(X, Y) ((X) < (Y) ? (Y) : (X))
+# endif /* MAX */
 
-/* Defines the size of integers to be used as device unique identifiers */
-typedef ocg_device_unique_id_t device_unique_id_t;
-
-OCG_NAMESPACE_END;
-
-#endif /* __OPENCG_DEVICE_TYPE_HPP__ */
+#endif

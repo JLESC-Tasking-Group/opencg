@@ -1,6 +1,6 @@
-//===- CGOps.td - OpenCG command-graph dialect ops ---------*- tablegen -*-===//
-#ifndef OPENCG_CG_OPS_TD
-#define OPENCG_CG_OPS_TD
+//===- CGOps.td - CGIR command-graph dialect ops ---------*- tablegen -*-===//
+#ifndef CGIR_CG_OPS_TD
+#define CGIR_CG_OPS_TD
 
 include "CGDialect.td"
 include "CGTypes.td"
@@ -55,7 +55,7 @@ def Copy1DOp : CG_Op<"copy_1d"> {
   let arguments = (ins
     Variadic<CG_TokenType>:$predecessors,
     I32Attr:$duid,
-    I32Attr:$kind,        // ocg::command_type_t (which H2H/H2D/D2H/D2D variant)
+    I32Attr:$kind,        // cgir::command_type_t (which H2H/H2D/D2H/D2D variant)
     I32Attr:$src_duid,
     I32Attr:$dst_duid,
     I64Attr:$src_addr,
@@ -70,7 +70,7 @@ def Copy2DOp : CG_Op<"copy_2d"> {
   let arguments = (ins
     Variadic<CG_TokenType>:$predecessors,
     I32Attr:$duid,
-    I32Attr:$kind,        // ocg::command_type_t (which H2H/H2D/D2H/D2D variant)
+    I32Attr:$kind,        // cgir::command_type_t (which H2H/H2D/D2H/D2D variant)
     I32Attr:$src_duid,
     I32Attr:$dst_duid,
     I64Attr:$src_addr,
@@ -85,17 +85,17 @@ def Copy2DOp : CG_Op<"copy_2d"> {
 }
 
 def GenericOp : CG_Op<"generic"> {
-  let summary = "An opaque command node carrying raw ocg::command_t bytes.";
+  let summary = "An opaque command node carrying raw cgir::command_t bytes.";
   let description = [{
     A carrier for command kinds not yet modeled with typed ops (PROG, FD_*,
-    BATCH, CTRL_*). The full `ocg::command_t` payload is stored as a byte blob so
+    BATCH, CTRL_*). The full `cgir::command_t` payload is stored as a byte blob so
     that import/export round-trips losslessly. Topology passes treat it as an
     opaque command node.
   }];
   let arguments = (ins
     Variadic<CG_TokenType>:$predecessors,
     I32Attr:$duid,
-    I32Attr:$kind,        // ocg::command_type_t
+    I32Attr:$kind,        // cgir::command_type_t
     DenseI8ArrayAttr:$blob
   );
   let results = (outs CG_TokenType:$token);
@@ -130,4 +130,4 @@ def BatchOp : CG_Op<"batch", [
   }];
 }
 
-#endif // OPENCG_CG_OPS_TD
+#endif // CGIR_CG_OPS_TD

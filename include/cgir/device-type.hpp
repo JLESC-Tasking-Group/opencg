@@ -34,15 +34,16 @@
 ** knowledge of the CeCILL-C license and that you accept its terms.
 **/
 
-#ifndef __OPENCG_HPP__
-# define __OPENCG_HPP__
+#ifndef __CGIR_DEVICE_TYPE_HPP__
+# define __CGIR_DEVICE_TYPE_HPP__
 
-#  include <opencg/command-graph-pass.hpp>
-#  include <opencg/command-graph.hpp>
-#  include <opencg/command-type.hpp>
-#  include <opencg/command.hpp>
-#  include <opencg/device-type.hpp>
-#  include <opencg/namespace.hpp>
-#  include <opencg/support.h>
+# include <cgir/c/api.h>
 
-#endif /* __OPENCG_HPP__ */
+CGIR_NAMESPACE_BEGIN
+
+/* Defines the size of integers to be used as device unique identifiers */
+typedef cgir_device_unique_id_t device_unique_id_t;
+
+CGIR_NAMESPACE_END;
+
+#endif /* __CGIR_DEVICE_TYPE_HPP__ */

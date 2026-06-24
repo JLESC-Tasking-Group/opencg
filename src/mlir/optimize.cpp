@@ -4,9 +4,9 @@
 ** Contributors :
 ** Romain PEREIRA, rpereira@anl.gov
 **
-** OpenCG MLIR optimization entry points.
+** CGIR MLIR optimization entry points.
 **
-**  - load_dialect / create_pass : small pieces of the public ocg::cg API.
+**  - load_dialect / create_pass : small pieces of the public cgir::cg API.
 **  - command_graph_optimize_mlir : the (MLIR-free signature) hook called by the
 **    out-of-line dispatcher in src/command-graph.cc when the MLIR optimizer is
 **    selected. It imports the POD command graph into the `cg` dialect, runs the
@@ -19,21 +19,21 @@
 ** This software is governed by the CeCILL-C license. See the LICENSE file.
 **/
 
-# include <opencg/mlir/opencg-mlir.hpp>
+# include <cgir/mlir/cgir-mlir.hpp>
 
 # include <mlir/IR/MLIRContext.h>
 # include <mlir/IR/Verifier.h>
 # include <mlir/Pass/Pass.h>
 # include <mlir/Pass/PassManager.h>
 
-# include <opencg/command-graph.hpp>
-# include <opencg/command-graph-pass.hpp>
+# include <cgir/command-graph.hpp>
+# include <cgir/command-graph-pass.hpp>
 
 # include <cstdio>
 # include <cstdlib>
 # include <memory>
 
-OCG_NAMESPACE_BEGIN
+CGIR_NAMESPACE_BEGIN
 namespace cg {
 
 void
@@ -48,7 +48,7 @@ create_pass(command_graph_pass_t pass)
     switch (pass)
     {
         # define DEF(ENUM, FUNC, NAME, MK) case (ENUM): return MK();
-        OCG_FORALL_COMMAND_GRAPH_PASS(DEF);
+        CGIR_FORALL_COMMAND_GRAPH_PASS(DEF);
         # undef DEF
         default:
             return nullptr;
@@ -56,9 +56,9 @@ create_pass(command_graph_pass_t pass)
 }
 
 } /* namespace cg */
-OCG_NAMESPACE_END
+CGIR_NAMESPACE_END
 
-OCG_NAMESPACE_BEGIN
+CGIR_NAMESPACE_BEGIN
 
 void
 command_graph_optimize_mlir(
@@ -82,13 +82,13 @@ command_graph_optimize_mlir(
     cg::GraphOp graph = cg::get_graph(module.get());
     if (!graph)
     {
-        fprintf(stderr, "opencg/mlir: no cg.graph produced by import\n");
+        fprintf(stderr, "cgir/mlir: no cg.graph produced by import\n");
         abort();
     }
 
     if (mlir::failed(mlir::verify(graph.getOperation())))
     {
-        fprintf(stderr, "opencg/mlir: imported cg.graph failed verification\n");
+        fprintf(stderr, "cgir/mlir: imported cg.graph failed verification\n");
         abort();
     }
 
@@ -97,7 +97,7 @@ command_graph_optimize_mlir(
     pm.addPass(std::move(p));
     if (mlir::failed(pm.run(graph.getOperation())))
     {
-        fprintf(stderr, "opencg/mlir: pass '%s' failed\n", command_graph_pass_to_str(pass));
+        fprintf(stderr, "cgir/mlir: pass '%s' failed\n", command_graph_pass_to_str(pass));
         abort();
     }
 
@@ -105,4 +105,4 @@ command_graph_optimize_mlir(
     cg::export_command_graph(graph, cgraph);
 }
 
-OCG_NAMESPACE_END
+CGIR_NAMESPACE_END

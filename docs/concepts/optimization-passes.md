@@ -1,8 +1,8 @@
 # Optimization Passes {#optimization_passes}
 
-OpenCG includes several optimization passes that transform command graphs to reduce overhead and improve execution efficiency.
+CGIR includes several optimization passes that transform command graphs to reduce overhead and improve execution efficiency.
 
-All passes are enumerated by `OCG_FORALL_COMMAND_GRAPH_PASS` and can be invoked via:
+All passes are enumerated by `CGIR_FORALL_COMMAND_GRAPH_PASS` and can be invoked via:
 
 ```cpp
 cg.optimize(COMMAND_GRAPH_PASS_BATCH);
@@ -16,7 +16,7 @@ cg.pass_batch();
 
 Removes redundant edges from the graph. If node `v` is reachable from `u` through an intermediate path via `w`, the direct edge `u -> v` is redundant and can be removed.
 
-The implementation builds a reachability matrix using `ocg::bitset2d_t` via backward BFS, then prunes edges where the reachability test succeeds through alternative paths. This minimizes the graph complexity while preserving the execution order.
+The implementation builds a reachability matrix using `cgir::bitset2d_t` via backward BFS, then prunes edges where the reachability test succeeds through alternative paths. This minimizes the graph complexity while preserving the execution order.
 
 ### Node Reduction (reduce-node)
 
@@ -35,7 +35,7 @@ The pass detects two patterns:
 - **False twins**: nodes with identical predecessor and successor sets
 - **Sequential pairs**: `u -> v` where `u` has a single successor and `v` has a single predecessor
 
-Contracted nodes become a `ocg::command_batch_t` containing a sub-command-graph.
+Contracted nodes become a `cgir::command_batch_t` containing a sub-command-graph.
 This enables mapping to vendor-specific batching mechanisms (e.g. CUDA Graphs, HIP Graphs, Level Zero command lists).
 
 ### Copy Fusion (copy-fuse)
