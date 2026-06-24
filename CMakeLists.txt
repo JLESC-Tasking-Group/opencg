@@ -269,6 +269,14 @@ install(FILES
     DESTINATION lib/cmake/CGIR
 )
 
+##################
+# UTILITY BINARY #
+##################
+
+add_executable(cgir_info ${CMAKE_SOURCE_DIR}/src/cgir_info.cc)
+target_link_libraries(cgir_info PRIVATE ${CGIR})
+install(TARGETS cgir_info RUNTIME DESTINATION bin)
+
 ################
 # Sub projects #
 ################
