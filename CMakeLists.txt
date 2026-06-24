@@ -29,8 +29,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)  # Optional: disables compiler-specific extensions
 
 include(BooleanUtils)
 cgiroption(BUILD_C_API "Build the C API." ON)
-cgiroption(USE_LLVM    "Use LLVM for IR manipulation and JIT (required by prog-fuse)." OFF)
-cgiroption(USE_MLIR    "Use MLIR for the command-graph IR and optimization passes." OFF)
+
+# USE_LLVM / USE_MLIR default OFF, but auto-enable when the caller points cmake
+# at an install — the trailing variable names are checked by cgiroption (see
+# cmake/BooleanUtils.cmake): if any is defined, the option turns ON so the
+# variable is consumed (no "Manually-specified variables were not used" warning).
+cgiroption(USE_LLVM "Use LLVM for IR manipulation and JIT (required by prog-fuse)." OFF LLVM_DIR LLVM_INSTALL_DIR)
+cgiroption(USE_MLIR "Use MLIR for the command-graph IR and optimization passes." OFF MLIR_DIR)
 
 ##########
 # CGIR #
@@ -264,6 +269,14 @@ install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/CGIRConfig.cmake"
     DESTINATION lib/cmake/CGIR
 )
+
+##################
+# UTILITY BINARY #
+##################
+
+add_executable(cgir_info ${CMAKE_SOURCE_DIR}/src/cgir_info.cc)
+target_link_libraries(cgir_info PRIVATE ${CGIR})
+install(TARGETS cgir_info RUNTIME DESTINATION bin)
 
 ################
 # Sub projects #
