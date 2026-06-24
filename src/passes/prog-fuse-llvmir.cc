@@ -65,6 +65,7 @@
 
 # if CGIR_SUPPORT_LLVM
 
+# include <llvm/Analysis/InlineCost.h>
 # include <llvm/Analysis/ValueTracking.h>
 # include <llvm/IR/Function.h>
 # include <llvm/IR/IRBuilder.h>
@@ -92,6 +93,9 @@
 # include <llvm/Passes/PassBuilder.h>
 # include <llvm/Passes/OptimizationLevel.h>
 # include <llvm/Transforms/Scalar/LoopFuse.h>
+# include <llvm/Transforms/Scalar/LoopPassManager.h>
+# include <llvm/Transforms/Scalar/LoopRotation.h>
+# include <llvm/Transforms/Utils/LoopSimplify.h>
 
 /* In-process JIT (replaces the former Proteus dependency) */
 # include <llvm/ExecutionEngine/Orc/LLJIT.h>
@@ -206,14 +210,30 @@ optimize_module(llvm::Module & M, llvm::TargetMachine * tm)
     PB.registerLoopAnalyses(LAM);
     PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
-    /* Insert loop fusion into the default pipeline, after the scalar loop
-     * optimizations and before vectorization. LoopFuse is experimental and a
-     * no-op when fusion is illegal, so this is a best-effort enabler. */
-    PB.registerScalarOptimizerLateEPCallback(
-        [] (llvm::FunctionPassManager & FPM, llvm::OptimizationLevel)
-        {
-            FPM.addPass(llvm::LoopFusePass());
-        });
+    /* Explicitly canonicalize and fuse the loops BEFORE the O3 pipeline.
+     *
+     * Injecting LoopFuse through registerScalarOptimizerLateEPCallback did NOT
+     * fuse them in practice (the fused module came out with two separate loop
+     * nests), even though the very same pre-optimization module fuses cleanly
+     * when loop-fusion is run explicitly. So we run it ourselves here: the
+     * kernels are already inlined into the wrapper (step 6b) and carry the
+     * shared-domain noalias metadata, so loop-simplify + loop-rotate + loop-fuse
+     * reliably merges the kernels' loops into one. The subsequent O3 pipeline
+     * then vectorizes the single fused loop (e.g. scale+axpy -> one axpby). */
+    {
+        llvm::FunctionPassManager FPM;
+        FPM.addPass(llvm::LoopSimplifyPass());
+
+        llvm::LoopPassManager LPM;
+        LPM.addPass(llvm::LoopRotatePass());
+        FPM.addPass(llvm::createFunctionToLoopPassAdaptor(std::move(LPM)));
+
+        FPM.addPass(llvm::LoopFusePass());
+
+        llvm::ModulePassManager PreMPM;
+        PreMPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+        PreMPM.run(M, MAM);
+    }
 
     llvm::ModulePassManager MPM = PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3);
     MPM.run(M, MAM);
@@ -536,8 +556,8 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     /* The args buffer is a distinct allocation from the data the kernels read
      * and write, so mark it noalias: this frees the slot-table loads from being
      * clobbered by the kernels' stores, so they can be hoisted/CSE'd. (The data
-     * arrays themselves are kept independent by the per-parameter noalias added
-     * in step 5.) Both help the later loop-fusion/vectorization. */
+     * arrays are kept independent of each other by the shared-domain scoped
+     * noalias metadata attached in step 6b.) Both help loop-fusion/vectorization. */
     wrapper->addParamAttr(0, llvm::Attribute::NoAlias);
 
     llvm::BasicBlock * bb = llvm::BasicBlock::Create(llvmctx, "entry", wrapper);
