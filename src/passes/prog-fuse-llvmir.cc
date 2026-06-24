@@ -74,6 +74,7 @@
 # include <llvm/Linker/Linker.h>
 # include <llvm/Bitcode/BitcodeWriter.h>
 # include <llvm/MC/TargetRegistry.h>
+# include <llvm/Support/FileSystem.h>
 # include <llvm/Support/MemoryBuffer.h>
 # include <llvm/Support/raw_ostream.h>
 # include <llvm/Support/SourceMgr.h>
@@ -93,6 +94,7 @@
 # include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 # include <llvm/Support/Error.h>
 
+# include <atomic>
 # include <cassert>
 # include <cstdint>
 # include <cstdio>
@@ -213,6 +215,86 @@ optimize_module(llvm::Module & M, llvm::TargetMachine * tm)
     MPM.run(M, MAM);
 }
 
+/* ------------------------------------------------------------------------- *
+ * Debug dump option (CGIR_PROG_FUSE_DUMP).                                   *
+ *                                                                           *
+ * Like CGIR_OPTIMIZER, this is controlled by an environment variable that is *
+ * read once and cached. When CGIR_PROG_FUSE_DUMP is set (to anything other  *
+ * than "" or "0"), each fusion writes the input IR modules and their fused/  *
+ * optimized result as textual .ll files, so the transformation can be        *
+ * visualized:                                                                *
+ *                                                                           *
+ *   <base>/prog-fuse-<seq>/input-<i>.ll   (each original program, as parsed) *
+ *   <base>/prog-fuse-<seq>/merged.ll      (linked + wrapper, before O3)      *
+ *   <base>/prog-fuse-<seq>/fused.ll       (after the O3 fusion pipeline)     *
+ *                                                                           *
+ * <base> is ~/.cgir/tmp by default, or the value of CGIR_PROG_FUSE_DUMP when *
+ * it is an absolute path (so the output location can be overridden). <seq>   *
+ * is a per-process counter so concurrent fusions do not clobber each other.  *
+ * ------------------------------------------------------------------------- */
+static bool
+prog_fuse_dump_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled == -1)
+    {
+        const char * s = getenv("CGIR_PROG_FUSE_DUMP");
+        enabled = (s && s[0] != '\0' && strcmp(s, "0") != 0) ? 1 : 0;
+    }
+    return (bool) enabled;
+}
+
+/* Create (mkdir -p) a fresh per-fusion dump directory and return its path, or
+ * an empty string on failure. */
+static std::string
+prog_fuse_dump_make_dir(void)
+{
+    /* base directory: an absolute CGIR_PROG_FUSE_DUMP value, else ~/.cgir/tmp */
+    std::string base;
+    const char * s = getenv("CGIR_PROG_FUSE_DUMP");
+    if (s && s[0] == '/')
+    {
+        base = s;
+    }
+    else
+    {
+        const char * home = getenv("HOME");
+        base  = home ? home : ".";
+        base += "/.cgir/tmp";
+    }
+
+    static std::atomic<unsigned> seq{0};
+    char sub[32];
+    snprintf(sub, sizeof(sub), "/prog-fuse-%u", seq.fetch_add(1));
+    std::string dir = base + sub;
+
+    if (std::error_code ec = llvm::sys::fs::create_directories(dir))
+    {
+        fprintf(stderr, "prog-fuse: cannot create dump dir '%s': %s\n",
+                dir.c_str(), ec.message().c_str());
+        return std::string();
+    }
+    return dir;
+}
+
+/* Write `M` as textual IR to <dir>/<name>. No-op if `dir` is empty. */
+static void
+prog_fuse_dump_module(const std::string & dir, const char * name, llvm::Module & M)
+{
+    if (dir.empty())
+        return ;
+
+    std::string path = dir + "/" + name;
+    std::error_code ec;
+    llvm::raw_fd_ostream os(path, ec, llvm::sys::fs::OF_Text);
+    if (ec)
+    {
+        fprintf(stderr, "prog-fuse: cannot write '%s': %s\n", path.c_str(), ec.message().c_str());
+        return ;
+    }
+    M.print(os, /* AssemblyAnnotationWriter */ nullptr);
+}
+
 # endif /* CGIR_SUPPORT_LLVM */
 
 void
@@ -242,6 +324,11 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         });
     }
 
+    /* Optional IR dumping for debugging (CGIR_PROG_FUSE_DUMP). When enabled, a
+     * fresh per-fusion directory receives the input, merged and fused IR. */
+    const bool  dump     = prog_fuse_dump_enabled();
+    std::string dump_dir = dump ? prog_fuse_dump_make_dir() : std::string();
+
     /* ------------------------------------------------------------------ *
      * 1. Parse all N IR modules into the SAME LLVMContext                 *
      * ------------------------------------------------------------------ */
@@ -261,6 +348,14 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             *ctx
         );
         if (!mods[i]) { fprintf(stderr, "prog-fuse: failed to parse program %zu\n", i); abort(); }
+
+        /* dump the original input IR (before prefixing/linking) */
+        if (dump)
+        {
+            char name[32];
+            snprintf(name, sizeof(name), "input-%zu.ll", i);
+            prog_fuse_dump_module(dump_dir, name, *mods[i]);
+        }
     }
 
     /* ------------------------------------------------------------------ *
@@ -532,11 +627,23 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         abort();
     }
 
+    /* dump the merged module (wrapper + constituents) before optimization */
+    if (dump)
+        prog_fuse_dump_module(dump_dir, "merged.ll", *mod_u);
+
     /* ------------------------------------------------------------------ *
      * 8. Optimize (inline the kernels into the wrapper, vectorize, fuse).  *
      * ------------------------------------------------------------------ */
     if (tm)
         optimize_module(*mod_u, tm.get());
+
+    /* dump the final fused/optimized module */
+    if (dump)
+    {
+        prog_fuse_dump_module(dump_dir, "fused.ll", *mod_u);
+        fprintf(stderr, "prog-fuse: dumped %zu input(s) + merged + fused IR to %s\n",
+                n, dump_dir.c_str());
+    }
 
     /* ------------------------------------------------------------------ *
      * 9. Serialise the optimized module to bitcode for dst->source.       *

@@ -34,6 +34,11 @@ make
 # Runtime Configuration
 You may set the following environment variables
 - `CGIR_OPTIMIZER` as `mlir` or `pod` to switch the optimizer representation.
+- `CGIR_PROG_FUSE_DUMP` to dump the LLVM IR of each prog-fusion for debugging:
+  the input programs (`input-<i>.ll`), the merged module before optimization
+  (`merged.ll`) and the fused/optimized result (`fused.ll`). Set it to any
+  non-empty value other than `0` to write under `~/.cgir/tmp/prog-fuse-<seq>/`,
+  or to an absolute path to override the output directory.
 
 
 # Example
