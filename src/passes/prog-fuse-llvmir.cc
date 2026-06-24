@@ -552,6 +552,13 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     llvm::Function * wrapper = llvm::Function::Create(
         wrapper_fty, llvm::GlobalValue::ExternalLinkage, "__fused_wrapper", mod_u.get());
 
+    /* The args buffer is a distinct allocation from the data the kernels read
+     * and write, so mark it noalias: this frees the slot-table loads from being
+     * clobbered by the kernels' stores, so they can be hoisted/CSE'd. (The data
+     * arrays themselves are kept independent by the per-parameter noalias added
+     * in step 5.) Both help the later loop-fusion/vectorization. */
+    wrapper->addParamAttr(0, llvm::Attribute::NoAlias);
+
     llvm::BasicBlock * bb = llvm::BasicBlock::Create(llvmctx, "entry", wrapper);
     llvm::IRBuilder<> builder(bb);
     llvm::Value * args_ptr = wrapper->getArg(0);
@@ -572,6 +579,40 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
                                  llvm::ConstantInt::get(i64_ty, off), "slice");
     };
 
+    /* Determine the value type of each deduplicated leaf slot from its first
+     * use. Every kernel sharing a slot must read it as the same type (the slot
+     * holds one &value); with opaque pointers, pointer args are all `ptr`, and
+     * shared scalars (e.g. the length `n`) are consistent. */
+    std::vector<llvm::Type *> slot_type(total_args, nullptr);
+    for (size_t i = 0 ; i < n ; ++i)
+    {
+        if (inputs[i].is_wrapper)
+            continue;
+        llvm::FunctionType * fty = mod_u->getFunction(inputs[i].fused_name)->getFunctionType();
+        for (unsigned j = 0 ; j < inputs[i].arity ; ++j)
+        {
+            const unsigned idx = index_map[i][j];
+            llvm::Type *   T   = fty->getParamType(j);
+            if (slot_type[idx] == nullptr)
+                slot_type[idx] = T;
+            else
+                assert(slot_type[idx] == T && "deduplicated arg slot used with inconsistent types");
+        }
+    }
+
+    /* Load each used leaf slot ONCE, here at the wrapper entry, and reuse the
+     * resulting SSA value for every kernel that shares it. Re-loading per kernel
+     * (the previous behavior) produced distinct SSA values for shared args (e.g.
+     * `y`, `n`), which defeated loop fusion: the inlined loops then had
+     * non-identical SCEV trip counts and were separated by un-hoistable arg
+     * loads (LoopFuse requires identical trip counts AND adjacent loops). With a
+     * single hoisted load, the fused loops share the same trip count and base
+     * pointers, and nothing sits between them. */
+    std::vector<llvm::Value *> slot_value(total_args, nullptr);
+    for (unsigned k = 0 ; k < total_args ; ++k)
+        if (slot_type[k] != nullptr)
+            slot_value[k] = load_arg(k, slot_type[k]);
+
     for (size_t i = 0 ; i < n ; ++i)
     {
         llvm::Function * fn = mod_u->getFunction(inputs[i].fused_name);
@@ -579,6 +620,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
 
         if (inputs[i].is_wrapper)
         {
+            /* a previously-fused sub-wrapper consumes a raw void** slice */
             builder.CreateCall(fty, fn, { slice_ptr(wrapper_block_start[i]) });
         }
         else
@@ -586,7 +628,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             std::vector<llvm::Value *> call_args;
             call_args.reserve(inputs[i].arity);
             for (unsigned j = 0 ; j < inputs[i].arity ; ++j)
-                call_args.push_back(load_arg(index_map[i][j], fty->getParamType(j)));
+                call_args.push_back(slot_value[index_map[i][j]]);
             builder.CreateCall(fty, fn, call_args);
         }
     }
