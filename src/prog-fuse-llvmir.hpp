@@ -5,7 +5,7 @@
 ** Romain PEREIRA, rpereira@anl.gov
 **
 ** Shared core of the prog-fuse optimization: fuses two LLVM-IR programs into
-** one. Used by both the legacy POD pass (src/passes/prog-fuse.cc) and the MLIR
+** one. Used by both the legacy POD pass (src/pod/prog-fuse.cc) and the MLIR
 ** pass (src/mlir/passes/ProgFuse.cpp). Its signature exposes no LLVM type, so
 ** callers (e.g. the MLIR pass) need not include LLVM headers; the symbol is
 ** resolved within libcgir, where the LLVM machinery lives.
@@ -13,8 +13,8 @@
 ** This software is governed by the CeCILL-C license. See the LICENSE file.
 **/
 
-#ifndef __CGIR_PROG_FUSE_HPP__
-# define __CGIR_PROG_FUSE_HPP__
+#ifndef __CGIR_PROG_FUSE_LLVMIR_HPP__
+# define __CGIR_PROG_FUSE_LLVMIR_HPP__
 
 # include <cgir/command.hpp>
 # include <cgir/namespace.hpp>
@@ -45,4 +45,4 @@ command_graph_prog_fuse_llvmir(
 
 CGIR_NAMESPACE_END
 
-#endif /* __CGIR_PROG_FUSE_HPP__ */
+#endif /* __CGIR_PROG_FUSE_LLVMIR_HPP__ */

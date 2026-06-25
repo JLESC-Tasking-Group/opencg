@@ -36,7 +36,7 @@
 
 // Shared core of the prog-fuse optimization: the N-ary LLVM-IR kernel fusion
 // routine command_graph_prog_fuse_llvmir(), used by BOTH the legacy POD pass
-// (prog-fuse.cc) and the MLIR pass (../mlir/passes/ProgFuse.cpp).
+// (pod/prog-fuse.cc) and the MLIR pass (mlir/passes/ProgFuse.cpp).
 //
 // It links the LLVM modules of a chain of programs into a single
 // `void __fused_wrapper(void ** args)` that calls each program in order, then
@@ -61,7 +61,7 @@
 # include <cgir/namespace.hpp>
 # include <cgir/command.hpp>
 
-# include "prog-fuse.hpp"
+# include "prog-fuse-llvmir.hpp"
 
 # if CGIR_SUPPORT_LLVM
 

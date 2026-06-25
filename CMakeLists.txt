@@ -42,14 +42,17 @@ cgiroption(USE_MLIR "Use MLIR for the command-graph IR and optimization passes."
 ##########
 
 SET(SOURCE_FILES
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/command-graph.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/passes/batch.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/passes/copy-fuse.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/passes/copy-normalize.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/passes/prog-fuse-llvmir.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/passes/prog-fuse.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/passes/reduce-edge.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/passes/reduce-node.cc
+    # common (POD + MLIR)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/cgir.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/prog-fuse-llvmir.cc
+    # POD interface implementation
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/command-graph.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/batch.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/copy-fuse.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/copy-normalize.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/prog-fuse.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/reduce-edge.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/reduce-node.cc
 )
 
 if (BUILD_C_API)
@@ -122,7 +125,7 @@ if (USE_MLIR)
         ${CMAKE_CURRENT_BINARY_DIR}                 # generated CG*.inc (quote-include)
         ${CMAKE_CURRENT_SOURCE_DIR}/include         # public cgir/ + cgir/mlir/ headers
         ${CMAKE_CURRENT_BINARY_DIR}/include         # generated cgir/support.h
-        ${CMAKE_CURRENT_SOURCE_DIR}/src             # internal shared headers (passes/prog-fuse.hpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src             # internal shared headers (prog-fuse-llvmir.hpp)
         ${LLVM_INCLUDE_DIRS}
         ${MLIR_INCLUDE_DIRS}
     )
@@ -147,6 +150,10 @@ endif()
 
 # CGIR Lib
 add_library(${CGIR} SHARED ${SOURCE_FILES})
+
+# Internal include path so POD/shared translation units can include the shared
+# core header (src/prog-fuse-llvmir.hpp) regardless of their subdirectory.
+target_include_directories(${CGIR} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 if (USE_MLIR)
     add_dependencies(${CGIR} CGIRMLIRIncGen)

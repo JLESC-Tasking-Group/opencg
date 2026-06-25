@@ -24,7 +24,7 @@
 
 # include <cgir/mlir/cgir-mlir.hpp>
 
-# include "passes/prog-fuse.hpp"
+# include "prog-fuse-llvmir.hpp"
 
 # include <mlir/Pass/Pass.h>
 # include <llvm/ADT/SmallPtrSet.h>

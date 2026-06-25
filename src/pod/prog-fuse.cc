@@ -36,14 +36,14 @@
 
 // Legacy (POD) prog-fuse pass. It detects maximal chains of LLVM-IR programs in
 // series and delegates the actual kernel fusion to the shared core
-// command_graph_prog_fuse_llvmir() (see prog-fuse-llvmir.cc), which is also used
-// by the MLIR pass.
+// command_graph_prog_fuse_llvmir() (see ../prog-fuse-llvmir.cc), which is also
+// used by the MLIR pass.
 
 # include <cgir/namespace.hpp>
 # include <cgir/command.hpp>
 # include <cgir/command-graph.hpp>
 
-# include "prog-fuse.hpp"
+# include "prog-fuse-llvmir.hpp"
 
 # include <vector>
 
