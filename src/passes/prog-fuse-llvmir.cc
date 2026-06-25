@@ -219,7 +219,21 @@ optimize_module(llvm::Module & M, llvm::TargetMachine * tm)
      * kernels are already inlined into the wrapper (step 6b) and carry the
      * shared-domain noalias metadata, so loop-simplify + loop-rotate + loop-fuse
      * reliably merges the kernels' loops into one. The subsequent O3 pipeline
-     * then vectorizes the single fused loop (e.g. scale+axpy -> one axpby). */
+     * then vectorizes the single fused loop (e.g. scale+axpy -> one axpby).
+     *
+     * NOTE on a precondition for fusion to actually fire (LLVM >= 23): LoopFuse
+     * relies on DependenceAnalysis to prove the cross-loop dependences legal, and
+     * its sibling-loop ("SameSD") reasoning only kicks in when the access address
+     * recurrence is provably non-wrapping, i.e. the kernel's array GEPs are
+     * `inbounds` (checkSubscript -> hasNoSignedWrap in DependenceAnalysis.cpp).
+     * Compiler-emitted kernels (clang/libomptarget) always use `inbounds` GEPs,
+     * so they fuse. We currently RELY on that witness (option (i)): present =>
+     * provably safe => fuse; absent => DA stays conservative => fusion is safely
+     * skipped. A future option (ii) — for more aggressive coverage of hand-rolled
+     * or non-`inbounds` IR — would have this pass stamp `inbounds`/`nsw` onto the
+     * inlined kernel GEPs/IVs under cgir's well-formedness (in-bounds, elementwise)
+     * contract. That never produces an illegal fusion (LoopFuse still enforces
+     * legality) but does assert memory-safety, so it is deferred for now. */
     {
         llvm::FunctionPassManager FPM;
         FPM.addPass(llvm::LoopSimplifyPass());

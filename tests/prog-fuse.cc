@@ -46,6 +46,29 @@
 
 # include "cgir-tests.cc"
 
+/*
+ *  IMPORTANT — why these kernels use `getelementptr inbounds` and `add nsw`:
+ *
+ *  For the prog-fuse pass to actually FUSE the two loops (scale ; axpy) into a
+ *  single one, LLVM's LoopFuse must prove the cross-loop memory dependences are
+ *  legal. On LLVM >= 23 its DependenceAnalysis only reasons about a sibling-loop
+ *  ("SameSD") subscript when the address recurrence is known not to wrap, i.e.
+ *  the access GEP is `inbounds` (checkSubscript -> hasNoSignedWrap in
+ *  DependenceAnalysis.cpp). Without `inbounds`, the subscript is classified as
+ *  NonLinear, the SameSD level is revoked, and fusion is (conservatively)
+ *  rejected — even though it is legal. Real compiler-emitted kernels (e.g.
+ *  clang/libomptarget) always emit `inbounds` array GEPs, so they fuse; this
+ *  hand-written IR must do the same to be representative.
+ *
+ *  cgir therefore RELIES on `inbounds` as the no-wrap/legality witness (present
+ *  => provably safe => fuse; absent => DA stays conservative => skip). This is
+ *  option (i): sound and zero-risk. A future option (ii) could have the pass
+ *  defensively stamp `inbounds`/`nsw` onto kernel GEPs/IVs under cgir's
+ *  well-formedness (in-bounds, elementwise) contract to fuse un-annotated IR
+ *  more aggressively; it never causes an illegal fusion (LoopFuse still checks
+ *  legality) but does assert memory-safety, so it is left for later.
+ */
+
 /**
  *  LLVM-IR source for scale: y[i] = s * y[i]
  *
@@ -54,11 +77,11 @@
  *    br label %loop
  *  loop:
  *    %i = phi i64 [ 0, %entry ], [ %i.next, %loop ]
- *    %ptr = getelementptr double, double* %y, i64 %i
+ *    %ptr = getelementptr inbounds double, double* %y, i64 %i
  *    %val = load double, double* %ptr
  *    %res = fmul double %s, %val
  *    store double %res, double* %ptr
- *    %i.next = add i64 %i, 1
+ *    %i.next = add nsw i64 %i, 1
  *    %cond = icmp slt i64 %i.next, %n
  *    br i1 %cond, label %loop, label %exit
  *  exit:
@@ -71,11 +94,11 @@ static const char scale_llvm_ir[] =
     "  br label %loop\n"
     "loop:\n"
     "  %i = phi i64 [ 0, %entry ], [ %i.next, %loop ]\n"
-    "  %ptr = getelementptr double, double* %y, i64 %i\n"
+    "  %ptr = getelementptr inbounds double, double* %y, i64 %i\n"
     "  %val = load double, double* %ptr\n"
     "  %res = fmul double %s, %val\n"
     "  store double %res, double* %ptr\n"
-    "  %i.next = add i64 %i, 1\n"
+    "  %i.next = add nsw i64 %i, 1\n"
     "  %cond = icmp slt i64 %i.next, %n\n"
     "  br i1 %cond, label %loop, label %exit\n"
     "exit:\n"
@@ -90,14 +113,14 @@ static const char scale_llvm_ir[] =
  *    br label %loop
  *  loop:
  *    %i = phi i64 [ 0, %entry ], [ %i.next, %loop ]
- *    %xptr = getelementptr double, double* %x, i64 %i
- *    %yptr = getelementptr double, double* %y, i64 %i
+ *    %xptr = getelementptr inbounds double, double* %x, i64 %i
+ *    %yptr = getelementptr inbounds double, double* %y, i64 %i
  *    %xval = load double, double* %xptr
  *    %yval = load double, double* %yptr
  *    %prod = fmul double %a, %xval
  *    %sum  = fadd double %prod, %yval
  *    store double %sum, double* %yptr
- *    %i.next = add i64 %i, 1
+ *    %i.next = add nsw i64 %i, 1
  *    %cond = icmp slt i64 %i.next, %n
  *    br i1 %cond, label %loop, label %exit
  *  exit:
@@ -110,14 +133,14 @@ static const char axpy_llvm_ir[] =
     "  br label %loop\n"
     "loop:\n"
     "  %i = phi i64 [ 0, %entry ], [ %i.next, %loop ]\n"
-    "  %xptr = getelementptr double, double* %x, i64 %i\n"
-    "  %yptr = getelementptr double, double* %y, i64 %i\n"
+    "  %xptr = getelementptr inbounds double, double* %x, i64 %i\n"
+    "  %yptr = getelementptr inbounds double, double* %y, i64 %i\n"
     "  %xval = load double, double* %xptr\n"
     "  %yval = load double, double* %yptr\n"
     "  %prod = fmul double %a, %xval\n"
     "  %sum  = fadd double %prod, %yval\n"
     "  store double %sum, double* %yptr\n"
-    "  %i.next = add i64 %i, 1\n"
+    "  %i.next = add nsw i64 %i, 1\n"
     "  %cond = icmp slt i64 %i.next, %n\n"
     "  br i1 %cond, label %loop, label %exit\n"
     "exit:\n"
