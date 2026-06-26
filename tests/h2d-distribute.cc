@@ -90,10 +90,11 @@ main(void)
         node->precedes(exit);
     }
 
-    /* optimize the cg->*/
-    cg->optimize(COMMAND_GRAPH_PASS_REDUCE_NODE);
-    cg->optimize(COMMAND_GRAPH_PASS_REDUCE_EDGE);
-    cg->optimize(COMMAND_GRAPH_PASS_BATCH);
+    /* optimize the cg */
+    cg->optimize(
+          COMMAND_GRAPH_PASS_REDUCE_NODE_BIT
+        | COMMAND_GRAPH_PASS_REDUCE_EDGE_BIT
+        | COMMAND_GRAPH_PASS_BATCH_BIT);
 
     return 0;
 }

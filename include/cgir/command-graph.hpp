@@ -385,6 +385,21 @@ struct command_graph_t
         command_graph_optimize(this, pass);
     }
 
+    /* Run a set of optimization passes in a single call. Enabled passes are applied
+     * in the canonical pipeline order (their declaration order in
+     * CGIR_FORALL_COMMAND_GRAPH_PASS), regardless of the order of the bits. Build
+     * `passes` by OR-ing the COMMAND_GRAPH_PASS_*_BIT constants. */
+    inline void
+    optimize(command_graph_pass_set_t passes)
+    {
+        for (int p = 0; p < COMMAND_GRAPH_PASS_MAX; ++p)
+        {
+            const command_graph_pass_t pass = (command_graph_pass_t) p;
+            if ((passes & command_graph_pass_bit(pass)) != 0)
+                command_graph_optimize(this, pass);
+        }
+    }
+
     /* get entry node */
     inline command_graph_node_t *
     node_get_entry(void)

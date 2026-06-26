@@ -57,12 +57,19 @@ Planned but not yet implemented. Will merge compatible kernel launches.
 
 ## Running Multiple Passes
 
-Passes can be composed by calling them sequentially:
+Multiple passes are applied in a single call by combining their `COMMAND_GRAPH_PASS_*_BIT` constants into a `command_graph_pass_set_t`:
+
+```cpp
+cg.optimize(
+      COMMAND_GRAPH_PASS_REDUCE_NODE_BIT
+    | COMMAND_GRAPH_PASS_REDUCE_EDGE_BIT
+    | COMMAND_GRAPH_PASS_BATCH_BIT);
+```
+
+Enabled passes always run in a fixed *canonical order* — the order in which they are declared in `CGIR_FORALL_COMMAND_GRAPH_PASS` (`copy-normalize`, `copy-fuse`, `reduce-node`, `reduce-edge`, `prog-fuse`, `batch`) — regardless of the order of the bits. This guarantees the reduction passes run before batching, so the graph is simplified before it is contracted.
+
+A single pass can still be run on its own with the `command_graph_pass_t` overload:
 
 ```cpp
 cg.optimize(COMMAND_GRAPH_PASS_REDUCE_NODE);
-cg.optimize(COMMAND_GRAPH_PASS_REDUCE_EDGE);
-cg.optimize(COMMAND_GRAPH_PASS_BATCH);
 ```
-
-The order matters: typically, reduction passes should run before batching to simplify the graph first.
