@@ -232,6 +232,13 @@ struct command_t
         {
             prog.source.content.llvmir._owned  = false;
             prog.launcher.variadic._args_owned = false;
+
+            /* Default launch parameters. Producers overwrite these; zeroing them
+             * makes the value deterministic so the prog-fuse launch-parameter
+             * legality check (command_prog_launch_params_equal) is well-defined
+             * even when a producer leaves them unset. */
+            prog.grid.x  = prog.grid.y  = prog.grid.z  = 0;
+            prog.block.x = prog.block.y = prog.block.z = 0;
         }
     }
 };

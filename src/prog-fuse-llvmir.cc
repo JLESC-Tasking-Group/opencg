@@ -883,6 +883,29 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     dst->launcher.variadic._args_owned = true;  /* heap (calloc) — the pass owns it */
 
     /* ------------------------------------------------------------------ *
+     * 11b. Propagate the launch parameters to the fused program.          *
+     *                                                                     *
+     *  Every fused program shares identical grid/block dimensions: the    *
+     *  prog-fuse passes only chain programs for which                     *
+     *  command_prog_launch_params_equal() holds. The fused kernel is a    *
+     *  single launch over that common geometry, so it inherits progs[0]'s.*
+     *  We set this explicitly (rather than relying on dst aliasing        *
+     *  progs[0]) so a distinct dst is correct too. progs[0]'s grid/block  *
+     *  are never freed/modified above, so reading them here is safe even   *
+     *  when dst == progs[0].                                              *
+     * ------------------------------------------------------------------ */
+    if (dst != progs[0])
+    {
+        dst->grid  = progs[0]->grid;
+        dst->block = progs[0]->block;
+    }
+    else
+    {
+        assert(memcmp(&dst->grid,  &progs[0]->grid,  sizeof(dst->grid))  == 0);
+        assert(memcmp(&dst->block, &progs[0]->block, sizeof(dst->block)) == 0);
+    }
+
+    /* ------------------------------------------------------------------ *
      * 12. Release the consumed inputs' owned heap buffers.                 *
      *                                                                      *
      *  Every prog other than dst has been merged into dst and the caller   *

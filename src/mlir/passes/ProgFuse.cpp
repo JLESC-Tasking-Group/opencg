@@ -138,6 +138,10 @@ struct ProgFusePass
                 if (cur_node->command->prog.source.type != LLVMIR ||
                     wn->command->prog.source.type       != LLVMIR)
                     break;
+                /* only fuse programs with rigorously identical launch parameters
+                 * (grid/block); every chain member must match the head un */
+                if (!::cgir::command_prog_launch_params_equal(&un->command->prog, &wn->command->prog))
+                    break;
 
                 chain_ops.push_back(w);
                 chain_nodes.push_back(wn);

@@ -147,6 +147,102 @@ static const char axpy_llvm_ir[] =
     "  ret void\n"
     "}\n";
 
+/*
+ *  Negative test: two otherwise-fusable LLVM-IR programs in series, but with
+ *  DIFFERENT launch parameters (here, distinct grid.x while everything else is
+ *  identical), must NOT be fused. The prog-fuse legality gate
+ *  (command_prog_launch_params_equal) should reject the chain, leaving both
+ *  nodes in the graph. Returns 0 on success, 1 on failure.
+ */
+static int
+test_distinct_grid_not_fused(void)
+{
+    /* Argument slots: only needed so the nodes are well-formed PROG commands.
+     * The pass never reads them here because the chain is rejected before any
+     * fusion is attempted. */
+    double   s_val = 2.0;
+    double   a_val = 3.0;
+    double   xbuf  = 1.0;
+    double   ybuf  = 1.0;
+    double * xp    = &xbuf;
+    double * yp    = &ybuf;
+    int64_t  nn    = 8;
+
+    void * scale_args[3] = { &s_val, &yp, &nn };       /* scale(s, y, n)   */
+    void * axpy_args[4]  = { &a_val, &xp, &yp, &nn };  /* axpy(a, x, y, n) */
+
+    command_graph_t * cg = command_graph_new();
+    assert(cg);
+    cg->init(command_new, command_graph_node_new, command_graph_new);
+
+    command_graph_node_t * entry = cg->node_get_entry();
+    command_graph_node_t * exit  = cg->node_get_exit();
+    entry->successors.clear();
+    exit->predecessors.clear();
+
+    constexpr device_unique_id_t host_device = 0;
+
+    /* Node u: scale, grid = (1,1,1), block = (1,1,1) */
+    command_t * cmd_u = command_new(cg, COMMAND_TYPE_PROG);
+    assert(cmd_u);
+    cmd_u->prog.source.type                 = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
+    cmd_u->prog.source.content.llvmir.raw   = (void *) scale_llvm_ir;
+    cmd_u->prog.source.content.llvmir.size  = sizeof(scale_llvm_ir);
+    cmd_u->prog.launcher.variadic.fn        = nullptr;
+    cmd_u->prog.launcher.variadic.args      = scale_args;
+    cmd_u->prog.launcher.variadic.args_size = sizeof(scale_args);
+    cmd_u->prog.grid.x  = 1; cmd_u->prog.grid.y  = 1; cmd_u->prog.grid.z  = 1;
+    cmd_u->prog.block.x = 1; cmd_u->prog.block.y = 1; cmd_u->prog.block.z = 1;
+
+    command_graph_node_t * u = command_graph_node_new(cg, host_device, COMMAND_GRAPH_NODE_TYPE_COMMAND);
+    assert(u);
+    u->command = cmd_u;
+
+    /* Node v: axpy, same block but grid.x = 2 (DIFFERENT from u) */
+    command_t * cmd_v = command_new(cg, COMMAND_TYPE_PROG);
+    assert(cmd_v);
+    cmd_v->prog.source.type                 = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
+    cmd_v->prog.source.content.llvmir.raw   = (void *) axpy_llvm_ir;
+    cmd_v->prog.source.content.llvmir.size  = sizeof(axpy_llvm_ir);
+    cmd_v->prog.launcher.variadic.fn        = nullptr;
+    cmd_v->prog.launcher.variadic.args      = axpy_args;
+    cmd_v->prog.launcher.variadic.args_size = sizeof(axpy_args);
+    cmd_v->prog.grid.x  = 2; cmd_v->prog.grid.y  = 1; cmd_v->prog.grid.z  = 1;
+    cmd_v->prog.block.x = 1; cmd_v->prog.block.y = 1; cmd_v->prog.block.z = 1;
+
+    command_graph_node_t * v = command_graph_node_new(cg, host_device, COMMAND_GRAPH_NODE_TYPE_COMMAND);
+    assert(v);
+    v->command = cmd_v;
+
+    /* Build graph: entry -> u -> v -> exit */
+    entry->precedes(u);
+    u->precedes(v);
+    v->precedes(exit);
+
+    cg->dump("cg-pre-prog-fuse-distinct-grid.dot");
+
+    /* Run the prog-fuse pass: must be a no-op because the launch params differ */
+    cg->optimize(COMMAND_GRAPH_PASS_PROG_FUSE);
+
+    cg->dump("cg-post-prog-fuse-distinct-grid.dot");
+
+    /* Verify: both nodes remain (NOT fused) */
+    size_t node_count = 0;
+    cg->walk([&](command_graph_node_t * node) {
+        if (node != cg->node_get_entry() && node != cg->node_get_exit())
+            node_count++;
+    });
+
+    if (node_count != 2)
+    {
+        fprintf(stderr, "FAIL: expected 2 nodes (no fusion across distinct grids), got %zu\n", node_count);
+        return 1;
+    }
+
+    fprintf(stdout, "PASS: prog-fuse left programs with distinct grids unfused (2 nodes)\n");
+    return 0;
+}
+
 int
 main(void)
 {
@@ -203,6 +299,10 @@ main(void)
     cmd_u->prog.launcher.variadic.fn        = nullptr;
     cmd_u->prog.launcher.variadic.args      = scale_args;
     cmd_u->prog.launcher.variadic.args_size = sizeof(scale_args);
+    /* Identical launch params on both progs (required for fusion); the fused
+     * node must inherit these exact grid/block dimensions. */
+    cmd_u->prog.grid.x  = 4;  cmd_u->prog.grid.y  = 2; cmd_u->prog.grid.z  = 1;
+    cmd_u->prog.block.x = 32; cmd_u->prog.block.y = 1; cmd_u->prog.block.z = 1;
 
     constexpr device_unique_id_t host_device = 0;
     command_graph_node_t * u = command_graph_node_new(cg, host_device, COMMAND_GRAPH_NODE_TYPE_COMMAND);
@@ -218,6 +318,9 @@ main(void)
     cmd_v->prog.launcher.variadic.fn        = nullptr;
     cmd_v->prog.launcher.variadic.args      = axpy_args;
     cmd_v->prog.launcher.variadic.args_size = sizeof(axpy_args);
+    /* same launch params as cmd_u */
+    cmd_v->prog.grid.x  = 4;  cmd_v->prog.grid.y  = 2; cmd_v->prog.grid.z  = 1;
+    cmd_v->prog.block.x = 32; cmd_v->prog.block.y = 1; cmd_v->prog.block.z = 1;
 
     command_graph_node_t * v = command_graph_node_new(cg, host_device, COMMAND_GRAPH_NODE_TYPE_COMMAND);
     assert(v);
@@ -280,7 +383,20 @@ main(void)
         return 1;
     }
 
+    /* The fused node must inherit the (identical) launch parameters of the
+     * programs it fused (grid=(4,2,1), block=(32,1,1) set above). */
+    if (fused->command->prog.grid.x  != 4  || fused->command->prog.grid.y  != 2 || fused->command->prog.grid.z  != 1 ||
+        fused->command->prog.block.x != 32 || fused->command->prog.block.y != 1 || fused->command->prog.block.z != 1)
+    {
+        fprintf(stderr,
+                "FAIL: fused node launch params not propagated: grid=(%u,%u,%u) block=(%u,%u,%u)\n",
+                fused->command->prog.grid.x, fused->command->prog.grid.y, fused->command->prog.grid.z,
+                fused->command->prog.block.x, fused->command->prog.block.y, fused->command->prog.block.z);
+        return 1;
+    }
+
     fprintf(stdout, "PASS: prog-fuse produced 1 fused PROG node with LLVM-IR source\n");
+    fprintf(stdout, "PASS: fused node inherited the programs' launch parameters\n");
 
     /* ------------------------------------------------------------------ *
      *  Numerical correctness test                                         *
@@ -345,5 +461,10 @@ main(void)
         return 1;
 
     fprintf(stdout, "PASS: fused kernel produced numerically correct results\n");
+
+    /* Negative test: programs with distinct launch parameters must not fuse. */
+    if (test_distinct_grid_not_fused() != 0)
+        return 1;
+
     return 0;
 }

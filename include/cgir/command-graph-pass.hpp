@@ -120,6 +120,23 @@ command_graph_pass_from_str(const char * s)
     return COMMAND_GRAPH_PASS_MAX;
 }
 
+/* A comma-separated list of every pass name, with a trailing ", " separator,
+ * built at compile time from CGIR_FORALL_COMMAND_GRAPH_PASS, e.g.
+ * "copy-normalize, copy-fuse, reduce-node, reduce-edge, prog-fuse, batch, ".
+ * The trailing separator lets a caller append a final token (such as "none")
+ * without special-casing. Handy for diagnostics that enumerate valid pass names.
+ *
+ * Built by plain adjacent string-literal concatenation (no pointer arithmetic on
+ * the literal), so it stays warning-clean under -Werror/-Wstring-plus-int in the
+ * translation units that include this header. */
+static inline const char *
+command_graph_pass_names(void)
+{
+    # define DEF(ENUM, FUNC, NAME, MK) NAME ", "
+    return CGIR_FORALL_COMMAND_GRAPH_PASS(DEF);
+    # undef DEF
+}
+
 CGIR_NAMESPACE_END
 
 #endif /* __CGIR_COMMAND_GRAPH_PASS_HPP__ */
