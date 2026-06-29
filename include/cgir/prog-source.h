@@ -1,0 +1,100 @@
+/*
+** Copyright 2024,2025 INRIA
+**
+** Contributors :
+** Romain PEREIRA, rpereira@anl.gov
+**
+** This software is a computer program whose purpose is to execute
+** blas subroutines on multi-GPUs system.
+**
+** This software is governed by the CeCILL-C license under French law and
+** abiding by the rules of distribution of free software.  You can  use,
+** modify and/ or redistribute the software under the terms of the CeCILL-C
+** license as circulated by CEA, CNRS and INRIA at the following URL
+** "http://www.cecill.info".
+
+** As a counterpart to the access to the source code and  rights to copy,
+** modify and redistribute granted by the license, users are provided only
+** with a limited warranty  and the software's author,  the holder of the
+** economic rights,  and the successive licensors  have only  limited
+** liability.
+
+** In this respect, the user's attention is drawn to the risks associated
+** with loading,  using,  modifying and/or developing or reproducing the
+** software by the user in light of its specific status of free software,
+** that may mean  that it is complicated to manipulate,  and  that  also
+** therefore means  that it is reserved for developers  and  experienced
+** professionals having in-depth computer knowledge. Users are therefore
+** encouraged to load and test the software's suitability as regards their
+** requirements in conditions enabling the security of their systems and/or
+** data to be ensured and,  more generally, to use and operate it in the
+** same conditions as regards security.
+
+** The fact that you are presently reading this means that you have had
+** knowledge of the CeCILL-C license and that you accept its terms.
+**/
+
+/**
+ * @file prog-source.h
+ * @brief The source code attached to a program (PROG) command.
+ *
+ * This header is intentionally written in a C-compatible style (no C++
+ * namespace, plain POD struct) so that it can be shared between CGIR's
+ * `command_prog_t` and external runtimes (e.g. XKRT's `xkrt_task_format_t`)
+ * whose headers must remain includable from C.
+ *
+ * CGIR's C++ code aliases these global types/values into the `cgir::`
+ * namespace (see `cgir/command.hpp`), so existing names such as
+ * `cgir::command_prog_source_t` and `cgir::COMMAND_PROG_SOURCE_TYPE_LLVMIR`
+ * keep working unchanged.
+ */
+
+#ifndef __CGIR_PROG_SOURCE_H__
+# define __CGIR_PROG_SOURCE_H__
+
+# include <stddef.h>
+# include <stdbool.h>
+
+/* format of a prog source code */
+typedef enum    cgir_command_prog_source_type_t
+{
+    /* LLVM IR */
+    CGIR_COMMAND_PROG_SOURCE_TYPE_LLVMIR,
+
+    /* MLIR */
+    CGIR_COMMAND_PROG_SOURCE_TYPE_MLIR,
+
+    /* PTX */
+    CGIR_COMMAND_PROG_SOURCE_TYPE_PTX,
+
+    /* CL (OpenCL prog language) */
+    CGIR_COMMAND_PROG_SOURCE_TYPE_CL,
+
+    /* SPIRV */
+    CGIR_COMMAND_PROG_SOURCE_TYPE_SPIRV
+
+}               cgir_command_prog_source_type_t;
+
+/* source code of a prog */
+typedef struct  cgir_command_prog_source_t
+{
+    /* format of the prog */
+    cgir_command_prog_source_type_t type;
+
+    /* the source code itself */
+    union {
+        struct {
+            void * raw;
+            size_t size;
+
+            /* true iff `raw` is a heap buffer owned by this source (e.g. the
+             * bitcode produced by the prog-fuse pass). The owner frees `raw`
+             * before overwriting/discarding it. Defaults to false (see
+             * command_t's constructor). */
+            bool _owned;
+        } llvmir;
+    } content;
+
+}               cgir_command_prog_source_t;
+
+#endif /* __CGIR_PROG_SOURCE_H__ */

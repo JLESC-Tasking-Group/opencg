@@ -40,10 +40,23 @@
 # include <cgir/cgir.hpp>
 # include <cgir/device-type.hpp>
 # include <cgir/namespace.hpp>
+# include <cgir/prog-source.h>
 
 # include <stddef.h>
 
 CGIR_NAMESPACE_BEGIN
+
+/* The prog source code structure is shared (C-compatible) with external
+ * runtimes - see `cgir/prog-source.h`. We alias the global C types/values into
+ * the cgir:: namespace so existing usages keep working unchanged. */
+typedef ::cgir_command_prog_source_t        command_prog_source_t;
+typedef ::cgir_command_prog_source_type_t   command_prog_source_type_t;
+
+constexpr command_prog_source_type_t COMMAND_PROG_SOURCE_TYPE_LLVMIR = ::CGIR_COMMAND_PROG_SOURCE_TYPE_LLVMIR;
+constexpr command_prog_source_type_t COMMAND_PROG_SOURCE_TYPE_MLIR   = ::CGIR_COMMAND_PROG_SOURCE_TYPE_MLIR;
+constexpr command_prog_source_type_t COMMAND_PROG_SOURCE_TYPE_PTX    = ::CGIR_COMMAND_PROG_SOURCE_TYPE_PTX;
+constexpr command_prog_source_type_t COMMAND_PROG_SOURCE_TYPE_CL     = ::CGIR_COMMAND_PROG_SOURCE_TYPE_CL;
+constexpr command_prog_source_type_t COMMAND_PROG_SOURCE_TYPE_SPIRV  = ::CGIR_COMMAND_PROG_SOURCE_TYPE_SPIRV;
 
 /* Move data between devices */
 struct command_copy_1D_t
@@ -66,25 +79,6 @@ struct command_copy_2D_t
     size_t m;
     size_t n;
     size_t sizeof_type;
-};
-
-enum command_prog_source_type_t
-{
-    /* LLVM IR */
-    COMMAND_PROG_SOURCE_TYPE_LLVMIR,
-
-    /* MLIR */
-    COMMAND_PROG_SOURCE_TYPE_MLIR,
-
-    /* PTX */
-    COMMAND_PROG_SOURCE_TYPE_PTX,
-
-    /* CL (OpenCL prog language) */
-    COMMAND_PROG_SOURCE_TYPE_CL,
-
-    /* SPIRV */
-    COMMAND_PROG_SOURCE_TYPE_SPIRV
-
 };
 
 /* a prog to be submitted via (cuKernelLaunch, ...) */
@@ -118,24 +112,9 @@ struct command_prog_t
 
     // TODO: shouldnt this bellow be user-defined instead ?
 
-    /* source of the prog */
-    struct {
-
-        /* format of the prog */
-        command_prog_source_type_t type;
-        union {
-            struct {
-                void * raw;
-                size_t size;
-
-                /* true iff `raw` is a heap buffer owned by this prog (e.g. the
-                 * bitcode produced by the prog-fuse pass). The owner frees
-                 * `raw` before overwriting/discarding it. Defaults to false
-                 * (see command_t's constructor). */
-                bool _owned;
-            } llvmir;
-        } content;
-    } source;
+    /* source of the prog - shared (C-compatible) structure, see
+     * cgir/prog-source.h */
+    command_prog_source_t source;
 
     /* grid parameters */
     struct {

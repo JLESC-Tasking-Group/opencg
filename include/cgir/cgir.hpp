@@ -43,6 +43,7 @@
 #  include <cgir/command.hpp>
 #  include <cgir/device-type.hpp>
 #  include <cgir/namespace.hpp>
+#  include <cgir/prog-source.h>
 #  include <cgir/support.h>
 
 #endif /* __CGIR_HPP__ */
