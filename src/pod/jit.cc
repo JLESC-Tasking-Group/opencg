@@ -34,62 +34,36 @@
 ** knowledge of the CeCILL-C license and that you accept its terms.
 **/
 
-/**
- * @file prog-source.h
- * @brief The source code attached to a program (PROG) command.
- *
- * C-compatible (no namespace, POD) so it can be shared between CGIR's
- * `command_prog_t` and external runtimes (e.g. XKRT's task formats) whose
- * headers must remain includable from C. CGIR's C++ code aliases these types
- * into the `cgir::` namespace (see `cgir/command.hpp`).
- */
+// Legacy (POD) jit pass: JIT-compiles every PROG node carrying a non-null
+// LLVM-IR source (e.g. a program produced by prog-fuse) and installs the
+// resulting function pointer, via the shared core command_graph_jit_llvmir()
+// (see ../prog-fuse-llvmir.cc).
 
-#ifndef __CGIR_PROG_SOURCE_H__
-# define __CGIR_PROG_SOURCE_H__
+# include <cgir/namespace.hpp>
+# include <cgir/command.hpp>
+# include <cgir/command-graph.hpp>
 
-# include <stddef.h>
-# include <stdbool.h>
+# include "prog-fuse-llvmir.hpp"
 
-/* format of a prog source code */
-typedef enum    cgir_command_prog_source_type_t
+CGIR_NAMESPACE_USE;
+
+/* true iff `u` is a command node holding a non-null LLVM-IR program source */
+static inline bool
+node_has_llvmir_source(const command_graph_node_t * u)
 {
-    /* LLVM IR */
-    CGIR_COMMAND_PROG_SOURCE_TYPE_LLVMIR,
+    return u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND
+        && u->command != nullptr
+        && u->command->type == COMMAND_TYPE_PROG
+        && u->command->prog.source.type == COMMAND_PROG_SOURCE_TYPE_LLVMIR
+        && u->command->prog.source.content.llvmir.raw != nullptr;
+}
 
-    /* MLIR */
-    CGIR_COMMAND_PROG_SOURCE_TYPE_MLIR,
-
-    /* PTX */
-    CGIR_COMMAND_PROG_SOURCE_TYPE_PTX,
-
-    /* CL (OpenCL prog language) */
-    CGIR_COMMAND_PROG_SOURCE_TYPE_CL,
-
-    /* SPIRV */
-    CGIR_COMMAND_PROG_SOURCE_TYPE_SPIRV
-
-}               cgir_command_prog_source_type_t;
-
-/* source code of a prog */
-typedef struct  cgir_command_prog_source_t
+void
+command_graph_t::pass_jit(void)
 {
-    /* format of the prog */
-    cgir_command_prog_source_type_t type;
-
-    /* the source code itself */
-    union {
-        struct {
-            void * raw;
-            size_t size;
-
-            /* true iff `raw` is a heap buffer owned by this source (e.g. the
-             * bitcode produced by the prog-fuse pass). The owner frees `raw`
-             * before overwriting/discarding it. Defaults to false (see
-             * command_t's constructor). */
-            bool _owned;
-        } llvmir;
-    } content;
-
-}               cgir_command_prog_source_t;
-
-#endif /* __CGIR_PROG_SOURCE_H__ */
+    this->walk([&] (command_graph_node_t * node)
+    {
+        if (node_has_llvmir_source(node))
+            command_graph_jit_llvmir(&node->command->prog);
+    });
+}

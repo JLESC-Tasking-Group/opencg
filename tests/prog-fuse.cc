@@ -334,8 +334,10 @@ main(void)
     /* Dump graph before optimization */
     cg->dump("cg-pre-prog-fuse.dot");
 
-    /* Run the prog-fuse pass */
+    /* Run the prog-fuse pass (fuses IR, leaves the launcher fn NULL) followed by
+     * the jit pass (compiles the fused program and installs the fn) */
     cg->optimize(COMMAND_GRAPH_PASS_PROG_FUSE);
+    cg->optimize(COMMAND_GRAPH_PASS_JIT);
 
     /* Dump graph after optimization */
     cg->dump("cg-post-prog-fuse.dot");

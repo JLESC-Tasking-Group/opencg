@@ -46,9 +46,7 @@
 
 CGIR_NAMESPACE_BEGIN
 
-/* The prog source code structure is shared (C-compatible) with external
- * runtimes - see `cgir/prog-source.h`. We alias the global C types/values into
- * the cgir:: namespace so existing usages keep working unchanged. */
+/* Alias the shared C source types (cgir/prog-source.h) into the cgir:: namespace. */
 typedef ::cgir_command_prog_source_t        command_prog_source_t;
 typedef ::cgir_command_prog_source_type_t   command_prog_source_type_t;
 

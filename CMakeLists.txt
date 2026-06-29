@@ -51,6 +51,7 @@ SET(SOURCE_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/copy-fuse.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/copy-normalize.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/prog-fuse.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/jit.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/reduce-edge.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/reduce-node.cc
 )

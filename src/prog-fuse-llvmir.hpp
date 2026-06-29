@@ -27,12 +27,14 @@ CGIR_NAMESPACE_BEGIN
  *      - n     : number of programs (>= 2)
  *      - dst   : the destination program (may alias progs[0] for in-place fusion)
  *
- *  Links all N LLVM IR modules, builds a single sequential wrapper that calls
- *  each program's entry in order, JIT-compiles it in-process and sets dst's
- *  variadic launcher to the fused function. Each program must have a
- *  COMMAND_PROG_SOURCE_TYPE_LLVMIR source. Fusion is composable: a program that
- *  is itself the result of a previous fusion is handled correctly, so arbitrary
- *  chains fuse into one wrapper.
+ *  Links all N LLVM IR modules, builds a single sequential `__fused_wrapper`
+ *  that calls each program's entry in order, and stores it as dst's LLVM-IR
+ *  source together with the deduplicated args buffer. The wrapper is NOT
+ *  compiled here: dst->launcher.variadic.fn is left NULL and a subsequent
+ *  `jit` pass (command_graph_jit_llvmir) must compile it before execution.
+ *  Each program must have a COMMAND_PROG_SOURCE_TYPE_LLVMIR source. Fusion is
+ *  composable: a program that is itself the result of a previous fusion is
+ *  handled correctly, so arbitrary chains fuse into one wrapper.
  *
  *  Requires CGIR_SUPPORT_LLVM; aborts otherwise.
  */
@@ -41,6 +43,20 @@ command_graph_prog_fuse_llvmir(
     command_prog_t ** progs,
     size_t n,
     command_prog_t * dst
+);
+
+/**
+ *  JIT-compile a PROG's LLVM-IR source in-process and install the resulting
+ *  function pointer into prog->launcher.variadic.fn, overwriting any previous
+ *  value. The entry is `__fused_wrapper` if the module defines it (a fused
+ *  program), otherwise the module's first void-returning definition.
+ *
+ *  prog->source must be a COMMAND_PROG_SOURCE_TYPE_LLVMIR with a non-NULL raw
+ *  buffer. Requires CGIR_SUPPORT_LLVM; aborts otherwise.
+ */
+void
+command_graph_jit_llvmir(
+    command_prog_t * prog
 );
 
 /**

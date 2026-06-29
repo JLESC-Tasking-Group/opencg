@@ -60,14 +60,15 @@ struct pls_t
 
 using node_t = command_graph_t::node_iterator_t<pls_t>;
 
-/* true iff `u` is a command node holding an LLVM-IR program */
+/* true iff `u` is a command node holding a non-null LLVM-IR program source */
 static inline bool
 node_is_llvmir_prog(const command_graph_node_t * u)
 {
     return u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND
         && u->command != nullptr
         && u->command->type == COMMAND_TYPE_PROG
-        && u->command->prog.source.type == COMMAND_PROG_SOURCE_TYPE_LLVMIR;
+        && u->command->prog.source.type == COMMAND_PROG_SOURCE_TYPE_LLVMIR
+        && u->command->prog.source.content.llvmir.raw != nullptr;
 }
 
 void

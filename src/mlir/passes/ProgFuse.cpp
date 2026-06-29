@@ -104,7 +104,8 @@ struct ProgFusePass
 
             GenericOp u = cast<GenericOp>(uop);
             ::cgir::command_graph_node_t * un = prog_src_node(u);
-            if (un == nullptr || un->command->prog.source.type != LLVMIR)
+            if (un == nullptr || un->command->prog.source.type != LLVMIR ||
+                un->command->prog.source.content.llvmir.raw == nullptr)
                 continue;
 
             /* collect the maximal chain u -> v -> w -> ... of fusable
@@ -136,7 +137,9 @@ struct ProgFusePass
                 if (!is_series(cur, w))
                     break;
                 if (cur_node->command->prog.source.type != LLVMIR ||
-                    wn->command->prog.source.type       != LLVMIR)
+                    wn->command->prog.source.type       != LLVMIR ||
+                    cur_node->command->prog.source.content.llvmir.raw == nullptr ||
+                    wn->command->prog.source.content.llvmir.raw       == nullptr)
                     break;
                 /* only fuse programs with rigorously identical launch parameters
                  * (grid/block); every chain member must match the head un */

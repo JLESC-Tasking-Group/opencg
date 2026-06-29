@@ -64,6 +64,7 @@ CGIR_NAMESPACE_BEGIN
     F(COMMAND_GRAPH_PASS_REDUCE_NODE,       pass_reduce_node,       "reduce-node",      create_reduce_node_pass)    \
     F(COMMAND_GRAPH_PASS_REDUCE_EDGE,       pass_reduce_edge,       "reduce-edge",      create_reduce_edge_pass)    \
     F(COMMAND_GRAPH_PASS_PROG_FUSE,         pass_prog_fuse,         "prog-fuse",        create_prog_fuse_pass)      \
+    F(COMMAND_GRAPH_PASS_JIT,               pass_jit,               "jit",              create_jit_pass)            \
     F(COMMAND_GRAPH_PASS_BATCH,             pass_batch,             "batch",            create_batch_pass)
 
 enum command_graph_pass_t

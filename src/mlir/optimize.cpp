@@ -42,6 +42,15 @@ load_dialect(mlir::MLIRContext & ctx)
     ctx.getOrLoadDialect<CGDialect>();
 }
 
+/* The `jit` pass is not an MLIR graph transformation (it only installs function
+ * pointers on PROG commands); returning nullptr makes the dispatcher fall back
+ * to the legacy POD pass_jit, which operates directly on the POD graph. */
+std::unique_ptr<mlir::Pass>
+create_jit_pass(void)
+{
+    return nullptr;
+}
+
 std::unique_ptr<mlir::Pass>
 create_pass(command_graph_pass_t pass)
 {

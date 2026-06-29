@@ -175,6 +175,21 @@ find_kernel(llvm::Module & M)
     return nullptr;
 }
 
+/* One-time LLVM target/codegen initialization, shared by the fuse and jit
+ * passes (both build a host TargetMachine / JIT). */
+static void
+ensure_llvm_initialized(void)
+{
+    static std::once_flag llvm_init_flag;
+    std::call_once(llvm_init_flag, []() {
+        llvm::InitializeAllTargetInfos();
+        llvm::InitializeAllTargets();
+        llvm::InitializeAllTargetMCs();
+        llvm::InitializeAllAsmParsers();
+        llvm::InitializeAllAsmPrinters();
+    });
+}
+
 /**
  *  Rename every function definition in the module by prepending 'prefix'.
  *  We only rename definitions (not declarations) to avoid touching external
@@ -351,16 +366,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     /* ------------------------------------------------------------------ *
      * 0. One-time LLVM global initialisation                             *
      * ------------------------------------------------------------------ */
-    {
-        static std::once_flag llvm_init_flag;
-        std::call_once(llvm_init_flag, []() {
-            llvm::InitializeAllTargetInfos();
-            llvm::InitializeAllTargets();
-            llvm::InitializeAllTargetMCs();
-            llvm::InitializeAllAsmParsers();
-            llvm::InitializeAllAsmPrinters();
-        });
-    }
+    ensure_llvm_initialized();
 
     /* Optional IR dumping for debugging (CGIR_PROG_FUSE_DUMP). When enabled, a
      * fresh per-fusion directory receives the input, merged and fused IR. */
@@ -827,42 +833,16 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     dst->source.content.llvmir.size   = bitcode.size();
     dst->source.content.llvmir._owned = true;   /* heap (malloc) — the pass owns it */
 
-    /* ------------------------------------------------------------------ *
-     * 10. JIT the optimized module and resolve the wrapper.               *
-     * ------------------------------------------------------------------ */
-    auto jit_exp = llvm::orc::LLJITBuilder().create();
-    if (!jit_exp)
-    {
-        llvm::logAllUnhandledErrors(jit_exp.takeError(), llvm::errs(), "prog-fuse: ");
-        fprintf(stderr, "prog-fuse: failed to create LLJIT\n");
-        abort();
-    }
-    std::unique_ptr<llvm::orc::LLJIT> jit = std::move(*jit_exp);
-
-    llvm::orc::ThreadSafeModule tsm(std::move(mod_u), std::move(ctx));
-    if (auto err = jit->addIRModule(std::move(tsm)))
-    {
-        llvm::logAllUnhandledErrors(std::move(err), llvm::errs(), "prog-fuse: ");
-        fprintf(stderr, "prog-fuse: failed to add IR module to LLJIT\n");
-        abort();
-    }
-
-    auto sym = jit->lookup("__fused_wrapper");
-    if (!sym)
-    {
-        llvm::logAllUnhandledErrors(sym.takeError(), llvm::errs(), "prog-fuse: ");
-        fprintf(stderr, "prog-fuse: could not resolve '__fused_wrapper' after JIT\n");
-        abort();
-    }
-    void * fn_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(sym->getValue()));
-
-    /* keep the JIT (hence the compiled code) alive for the process lifetime */
-    jit.release();
+    /* The fused module is NOT compiled here: the `jit` pass
+     * (command_graph_jit_llvmir) compiles dst->source and installs the function
+     * pointer. mod_u/ctx are released at scope exit (the bitcode above is the
+     * canonical artifact). */
 
     /* ------------------------------------------------------------------ *
-     * 11. Fill the compacted args buffer with the deduplicated slots and   *
-     *     install the variadic launcher. dst may alias progs[0]; we read   *
-     *     all originals' slots in step 2, so writing dst now is safe.      *
+     * 10. Fill the compacted args buffer with the deduplicated slots and   *
+     *     install the variadic launcher (with a NULL fn, set by `jit`).    *
+     *     dst may alias progs[0]; we read all originals' slots in step 2,  *
+     *     so writing dst now is safe.                                      *
      * ------------------------------------------------------------------ */
     const size_t n_args = (size_t) total_args;
     void ** args_buf = static_cast<void **>(calloc(n_args ? n_args : 1, sizeof(void *)));
@@ -877,7 +857,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     if (dst->launcher.variadic._args_owned && dst->launcher.variadic.args)
         free(dst->launcher.variadic.args);
 
-    dst->launcher.variadic.fn          = fn_ptr;
+    dst->launcher.variadic.fn          = NULL;  /* compiled by the `jit` pass */
     dst->launcher.variadic.args        = args_buf;
     dst->launcher.variadic.args_size   = n_args * sizeof(void *);
     dst->launcher.variadic._args_owned = true;  /* heap (calloc) — the pass owns it */
@@ -941,5 +921,73 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         }
     }
 
+    # endif /* CGIR_SUPPORT_LLVM */
+}
+
+void
+CGIR_NAMESPACE::command_graph_jit_llvmir(
+    command_prog_t * prog
+) {
+    # if !CGIR_SUPPORT_LLVM
+    (void) prog;
+    fprintf(stderr, "jit: LLVM support not enabled (rebuild with -DUSE_LLVM=ON)\n");
+    abort();
+    # else
+    assert(prog);
+    assert(prog->source.type == COMMAND_PROG_SOURCE_TYPE_LLVMIR);
+    assert(prog->source.content.llvmir.raw != nullptr);
+
+    ensure_llvm_initialized();
+
+    /* parse the program's IR/bitcode into its own context */
+    auto ctx = std::make_unique<llvm::LLVMContext>();
+    std::unique_ptr<llvm::Module> mod = parse_llvmir(
+        static_cast<const char *>(prog->source.content.llvmir.raw),
+        prog->source.content.llvmir.size,
+        *ctx
+    );
+    if (!mod) { fprintf(stderr, "jit: failed to parse program IR\n"); abort(); }
+
+    /* resolve the entry: a fused program exposes __fused_wrapper(void**),
+     * otherwise fall back to the module's first void-returning definition. */
+    std::string entry_name;
+    if (llvm::Function * w = mod->getFunction("__fused_wrapper"); w && !w->isDeclaration())
+        entry_name = "__fused_wrapper";
+    else if (llvm::Function * k = find_kernel(*mod))
+        entry_name = k->getName().str();
+    else { fprintf(stderr, "jit: no entry function found in program\n"); abort(); }
+
+    /* JIT-compile in-process */
+    auto jit_exp = llvm::orc::LLJITBuilder().create();
+    if (!jit_exp)
+    {
+        llvm::logAllUnhandledErrors(jit_exp.takeError(), llvm::errs(), "jit: ");
+        fprintf(stderr, "jit: failed to create LLJIT\n");
+        abort();
+    }
+    std::unique_ptr<llvm::orc::LLJIT> jit = std::move(*jit_exp);
+
+    llvm::orc::ThreadSafeModule tsm(std::move(mod), std::move(ctx));
+    if (auto err = jit->addIRModule(std::move(tsm)))
+    {
+        llvm::logAllUnhandledErrors(std::move(err), llvm::errs(), "jit: ");
+        fprintf(stderr, "jit: failed to add IR module to LLJIT\n");
+        abort();
+    }
+
+    auto sym = jit->lookup(entry_name);
+    if (!sym)
+    {
+        llvm::logAllUnhandledErrors(sym.takeError(), llvm::errs(), "jit: ");
+        fprintf(stderr, "jit: could not resolve '%s' after JIT\n", entry_name.c_str());
+        abort();
+    }
+    void * fn_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(sym->getValue()));
+
+    /* keep the JIT (hence the compiled code) alive for the process lifetime */
+    jit.release();
+
+    /* install the compiled function, overwriting any previous value */
+    prog->launcher.variadic.fn = fn_ptr;
     # endif /* CGIR_SUPPORT_LLVM */
 }
