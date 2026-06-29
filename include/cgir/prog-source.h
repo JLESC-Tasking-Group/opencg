@@ -87,6 +87,13 @@ typedef struct  cgir_command_prog_source_t
              * before overwriting/discarding it. Defaults to false (see
              * command_t's constructor). */
             bool _owned;
+
+            /* optional name of the entry function within `raw` (non-owning). If
+             * NULL, the consumer falls back to a heuristic (`__fused_wrapper`,
+             * else the first void-returning definition). Needed when `raw`
+             * holds several definitions (e.g. a device kernel plus its outlined
+             * callees). */
+            const char * symbol;
         } llvmir;
     } content;
 

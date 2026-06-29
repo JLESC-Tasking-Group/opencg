@@ -429,15 +429,32 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         bool is_wrapper = false;
         unsigned arity = 0;
 
-        if (llvm::Function * w = M.getFunction("__fused_wrapper"))
+        /* prefer the explicit entry symbol if the source carries one (e.g. a
+         * device kernel sub-module that defines several functions) */
+        if (const char * sym = progs[i]->source.content.llvmir.symbol)
         {
-            if (!w->isDeclaration() &&
-                w->getReturnType()->isVoidTy() &&
-                w->getFunctionType()->getNumParams() == 1)
+            entry = M.getFunction(sym);
+            if (!entry || entry->isDeclaration())
             {
-                entry      = w;
-                is_wrapper = true;
-                arity      = (unsigned) (progs[i]->launcher.variadic.args_size / sizeof(void *));
+                fprintf(stderr, "prog-fuse: entry symbol '%s' not found in program %zu\n", sym, i);
+                abort();
+            }
+            is_wrapper = false;
+            arity      = entry->getFunctionType()->getNumParams();
+        }
+
+        if (entry == nullptr)
+        {
+            if (llvm::Function * w = M.getFunction("__fused_wrapper"))
+            {
+                if (!w->isDeclaration() &&
+                    w->getReturnType()->isVoidTy() &&
+                    w->getFunctionType()->getNumParams() == 1)
+                {
+                    entry      = w;
+                    is_wrapper = true;
+                    arity      = (unsigned) (progs[i]->launcher.variadic.args_size / sizeof(void *));
+                }
             }
         }
 
@@ -832,6 +849,9 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     dst->source.content.llvmir.raw    = bc_buf;
     dst->source.content.llvmir.size   = bitcode.size();
     dst->source.content.llvmir._owned = true;   /* heap (malloc) — the pass owns it */
+    /* the fused entry is `__fused_wrapper`; clear any per-input entry symbol
+     * (dst may alias progs[0], which could carry a device kernel symbol) */
+    dst->source.content.llvmir.symbol = nullptr;
 
     /* The fused module is NOT compiled here: the `jit` pass
      * (command_graph_jit_llvmir) compiles dst->source and installs the function
@@ -948,10 +968,13 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
     );
     if (!mod) { fprintf(stderr, "jit: failed to parse program IR\n"); abort(); }
 
-    /* resolve the entry: a fused program exposes __fused_wrapper(void**),
-     * otherwise fall back to the module's first void-returning definition. */
+    /* resolve the entry: prefer the explicit symbol (e.g. a device kernel
+     * sub-module with several definitions); else a fused program exposes
+     * __fused_wrapper(void**); else fall back to the first void definition. */
     std::string entry_name;
-    if (llvm::Function * w = mod->getFunction("__fused_wrapper"); w && !w->isDeclaration())
+    if (const char * sym = prog->source.content.llvmir.symbol)
+        entry_name = sym;
+    else if (llvm::Function * w = mod->getFunction("__fused_wrapper"); w && !w->isDeclaration())
         entry_name = "__fused_wrapper";
     else if (llvm::Function * k = find_kernel(*mod))
         entry_name = k->getName().str();

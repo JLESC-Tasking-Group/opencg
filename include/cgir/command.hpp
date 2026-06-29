@@ -208,6 +208,7 @@ struct command_t
         if (type == COMMAND_TYPE_PROG)
         {
             prog.source.content.llvmir._owned  = false;
+            prog.source.content.llvmir.symbol  = nullptr;
             prog.launcher.variadic._args_owned = false;
 
             /* Default launch parameters. Producers overwrite these; zeroing them
