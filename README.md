@@ -39,6 +39,14 @@ You may set the following environment variables
   (`merged.ll`) and the fused/optimized result (`fused.ll`). Set it to any
   non-empty value other than `0` to write under `~/.cgir/tmp/prog-fuse-<seq>/`,
   or to an absolute path to override the output directory.
+- `CGIR_OPTIMIZE_DUMP` to dump the command graph as Graphviz `.dot` before and
+  after every optimization pass (works for both the legacy and the `mlir`
+  optimizer). Each pass writes `optimize-<seq>-<pass>-before.dot` and
+  `optimize-<seq>-<pass>-after.dot`, where `<seq>` increments per pass so the
+  files form the timeline of an `optimize()` call. Set it to any non-empty value
+  other than `0` to write under `~/.cgir/tmp/`, or to an absolute path to
+  override the output directory. Render a dump with e.g.
+  `dot -Tpng optimize-0-copy-fuse-after.dot -o after.png`.
 
 
 # Example

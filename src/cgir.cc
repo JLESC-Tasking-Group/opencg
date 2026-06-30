@@ -41,8 +41,15 @@
 # include <cgir/command.hpp>
 # include <cgir/command-graph.hpp>
 
+# include <atomic>
+# include <string>
+
+# include <errno.h>
+# include <stdio.h>
 # include <stdlib.h>
 # include <string.h>
+# include <sys/stat.h>
+# include <sys/types.h>
 
 CGIR_NAMESPACE_USE;
 
@@ -74,19 +81,154 @@ command_graph_use_mlir_optimizer(void)
 }
 # endif /* CGIR_USE_MLIR */
 
+/* ------------------------------------------------------------------------- *
+ * Debug dump option (CGIR_OPTIMIZE_DUMP).                                    *
+ *                                                                           *
+ * Like CGIR_PROG_FUSE_DUMP (which dumps the LLVM IR of each prog-fusion),    *
+ * this is controlled by an environment variable read once and cached. When   *
+ * CGIR_OPTIMIZE_DUMP is set (to anything other than "" or "0"), every pass   *
+ * run through the dispatcher writes the command graph as a Graphviz .dot     *
+ * file both BEFORE and AFTER the transformation, so each pass can be         *
+ * visualized:                                                               *
+ *                                                                           *
+ *   <base>/optimize-<seq>-<pass>-before.dot   (graph before the pass)        *
+ *   <base>/optimize-<seq>-<pass>-after.dot    (graph after  the pass)        *
+ *                                                                           *
+ * <base> is ~/.cgir/tmp by default, or the value of CGIR_OPTIMIZE_DUMP when  *
+ * it is an absolute path (so the output location can be overridden). <seq>   *
+ * is a per-process counter (one per pass invocation) so concurrent / chained *
+ * optimizations do not clobber each other; because the dispatcher is invoked *
+ * once per pass in pipeline order, the <seq> values form the timeline of an  *
+ * optimize() call (the "after" of one pass is the "before" of the next).     *
+ * This works for both the legacy POD passes and the MLIR pipeline since both *
+ * route through command_graph_optimize() below.                             *
+ * ------------------------------------------------------------------------- */
+static bool
+optimize_dump_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled == -1)
+    {
+        const char * s = getenv("CGIR_OPTIMIZE_DUMP");
+        enabled = (s && s[0] != '\0' && strcmp(s, "0") != 0) ? 1 : 0;
+    }
+    return (bool) enabled;
+}
+
+/* Per-process counter handing out a fresh sequence number for each pass
+ * invocation, so concurrent / chained optimizations never share a filename. */
+static unsigned
+optimize_dump_make_seq(void)
+{
+    static std::atomic<unsigned> seq{0};
+    return seq.fetch_add(1);
+}
+
+/* Recursively create `path` (like `mkdir -p`). Returns true on success or if it
+ * already exists. */
+static bool
+optimize_dump_mkdir_p(const std::string & path)
+{
+    std::string partial;
+    size_t i = 0;
+    if (!path.empty() && path[0] == '/')
+    {
+        partial = "/";
+        i = 1;
+    }
+    while (i < path.size())
+    {
+        size_t slash = path.find('/', i);
+        if (slash == std::string::npos)
+            slash = path.size();
+        partial += path.substr(i, slash - i);
+        if (!partial.empty() && mkdir(partial.c_str(), 0755) != 0 && errno != EEXIST)
+            return false;
+        partial += "/";
+        i = slash + 1;
+    }
+    return true;
+}
+
+/* Resolve (and create once) the base dump directory: an absolute
+ * CGIR_OPTIMIZE_DUMP value, else ~/.cgir/tmp. Returns an empty string if the
+ * directory could not be created. Computed once and cached (thread-safe). */
+static const std::string &
+optimize_dump_base_dir(void)
+{
+    static const std::string base = []() -> std::string
+    {
+        std::string b;
+        const char * s = getenv("CGIR_OPTIMIZE_DUMP");
+        if (s && s[0] == '/')
+        {
+            b = s;
+        }
+        else
+        {
+            const char * home = getenv("HOME");
+            b  = home ? home : ".";
+            b += "/.cgir/tmp";
+        }
+
+        if (!optimize_dump_mkdir_p(b))
+        {
+            fprintf(stderr, "cgir: cannot create dump dir '%s': %s\n",
+                    b.c_str(), strerror(errno));
+            return std::string();
+        }
+        return b;
+    }();
+    return base;
+}
+
+/* Write `cg` as a Graphviz .dot file for the given pass and phase ("before" or
+ * "after"). No-op if the base dump directory is unavailable. */
+static void
+optimize_dump_graph(
+    command_graph_t * cg,
+    unsigned seq,
+    command_graph_pass_t pass,
+    const char * phase
+) {
+    const std::string & base = optimize_dump_base_dir();
+    if (base.empty())
+        return ;
+
+    std::string path = base + "/optimize-" + std::to_string(seq) + "-"
+                     + command_graph_pass_to_str(pass) + "-" + phase + ".dot";
+
+    FILE * f = fopen(path.c_str(), "w");
+    if (!f)
+    {
+        fprintf(stderr, "cgir: cannot write '%s': %s\n", path.c_str(), strerror(errno));
+        return ;
+    }
+    cg->dump(f);
+    fclose(f);
+}
+
 void
 CGIR_NAMESPACE::command_graph_optimize(
     command_graph_t * cg,
     command_graph_pass_t pass
 ) {
+    /* Optional command-graph dumping for debugging (CGIR_OPTIMIZE_DUMP). When
+     * enabled, the graph is written as .dot before and after the pass. A single
+     * per-pass sequence number ties the before/after pair together. */
+    const bool     dump = optimize_dump_enabled();
+    const unsigned seq  = dump ? optimize_dump_make_seq() : 0u;
+    if (dump)
+        optimize_dump_graph(cg, seq, pass, "before");
+
     # if CGIR_USE_MLIR
     if (command_graph_use_mlir_optimizer())
-    {
         command_graph_optimize_mlir(cg, pass);
-        return ;
-    }
+    else
     # endif /* CGIR_USE_MLIR */
+        /* legacy C++ passes */
+        cg->optimize_legacy(pass);
 
-    /* legacy C++ passes */
-    cg->optimize_legacy(pass);
+    if (dump)
+        optimize_dump_graph(cg, seq, pass, "after");
 }
