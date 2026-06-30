@@ -87,7 +87,7 @@ struct command_prog_t
 
         /* Fixed argument sizes */
         struct {
-            # define CGIR_CALLBACK_ARGS_MAX 3
+            # define CGIR_CALLBACK_ARGS_MAX 4
             void (*fn)(void * [CGIR_CALLBACK_ARGS_MAX]);
             void * args[CGIR_CALLBACK_ARGS_MAX];
         } fixed;
