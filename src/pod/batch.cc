@@ -54,7 +54,7 @@ struct pls_t
 
 using node_t = command_graph_t::node_iterator_t<pls_t>;
 
-# define COMMAND_IS_ATOMIC(CMD) (CMD->type != COMMAND_TYPE_BATCH || CMD->batch.cg == NULL)
+# define NODE_IS_ATOMIC(N) (N->type == COMMAND_GRAPH_NODE_TYPE_EMPTY || (N->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && N->command && (N->command->type != COMMAND_TYPE_BATCH || N->command->batch.cg == NULL)))
 
 /**
  *  Init a batch command
@@ -69,12 +69,12 @@ command_batch_init(
     assert(original_cg);
     assert(u);
     assert(v);
+    assert(NODE_IS_ATOMIC(u));
+    assert(NODE_IS_ATOMIC(v));
 
     /* retrieve original u/v commands */
-    command_t * cmd_u = u->command;
-    command_t * cmd_v = v->command;
-    assert(cmd_u);
-    assert(cmd_v);
+    command_t * cmd_u = u->command; // can be null if COMMAND_GRAPH_NODE_TYPE_EMPTY
+    command_t * cmd_v = v->command; // can be null if COMMAND_GRAPH_NODE_TYPE_EMPTY
 
     /* create a new batch command */
     assert(original_cg->command_new);
@@ -87,6 +87,7 @@ command_batch_init(
     assert(original_cg->command_graph_new);
     cmd->batch.cg = original_cg->command_graph_new(original_cg);
     assert(cmd->batch.cg);
+    u->type = COMMAND_GRAPH_NODE_TYPE_COMMAND;
     u->command = cmd;
 
     /* remove entry->exit edge in the new cg */
@@ -101,8 +102,8 @@ command_batch_init(
 
     /* create new nodes corresponding to u and v in the new batch cg */
     assert(cmd->batch.cg->command_graph_node_new);
-    command_graph_node_t * uu = cmd->batch.cg->command_graph_node_new(cmd->batch.cg, u->device_unique_id, COMMAND_GRAPH_NODE_TYPE_COMMAND);
-    command_graph_node_t * vv = cmd->batch.cg->command_graph_node_new(cmd->batch.cg, v->device_unique_id, COMMAND_GRAPH_NODE_TYPE_COMMAND);
+    command_graph_node_t * uu = cmd->batch.cg->command_graph_node_new(cmd->batch.cg, u->device_unique_id, u->type);
+    command_graph_node_t * vv = cmd->batch.cg->command_graph_node_new(cmd->batch.cg, v->device_unique_id, v->type);
     assert(uu);
     assert(vv);
     uu->command = cmd_u;
@@ -145,8 +146,7 @@ command_graph_pass_batch_contract_batch_single_node(
 ) {
     assert(u_graph);
     assert(v);
-    assert(v->type == COMMAND_GRAPH_NODE_TYPE_COMMAND);
-    assert(v->command);
+    assert(NODE_IS_ATOMIC(v));
 
     command_graph_node_t * u_entry = u_graph->node_get_entry();
     command_graph_node_t * u_exit  = u_graph->node_get_exit();
@@ -232,16 +232,9 @@ command_graph_pass_batch_contract_batch_merge(
     assert(u);
     assert(v);
     assert(u->device_unique_id == v->device_unique_id);
-    assert(u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND);
-    assert(v->type == COMMAND_GRAPH_NODE_TYPE_COMMAND);
-    assert(u->command);
-    assert(v->command);
-    assert(u->command->batch.cg);
-    assert(v->command->batch.cg);
+    assert(!NODE_IS_ATOMIC(u));
+    assert(!NODE_IS_ATOMIC(v));
 
-    # if 0
-    command_graph_pass_batch_contract_batch_single_node<hint>(&u->command->batch.cg, v);
-    # else
     command_graph_t * u_cg = u->command->batch.cg;
     command_graph_t * v_cg = v->command->batch.cg;
 
@@ -299,7 +292,6 @@ command_graph_pass_batch_contract_batch_merge(
             abort();
         }
     }
-    # endif
 }
 
 /* Contract u and v, whether being twins or with u->v sequence.
@@ -314,14 +306,17 @@ command_graph_pass_batch_contract(
     std::vector<node_t> & nodes
 ) {
     assert(u->device_unique_id == v->device_unique_id);
+    assert(u->type != COMMAND_GRAPH_NODE_TYPE_COMMAND_GRAPH);
+    assert(v->type != COMMAND_GRAPH_NODE_TYPE_COMMAND_GRAPH);
 
-    /* update commands */
-    if (u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && v->type == COMMAND_GRAPH_NODE_TYPE_COMMAND)
+    if (NODE_IS_ATOMIC(u))
     {
-        assert(u->command && v->command);
-        if (COMMAND_IS_ATOMIC(u->command) && !COMMAND_IS_ATOMIC(v->command))
+        if (NODE_IS_ATOMIC(v))
         {
-swap_u_v:
+            // nothing to do
+        }
+        else
+        {
             if constexpr(hint & COMMAND_GRAPH_CONTRACTION_HINT_U_V_SEQUENCE)
                 return command_graph_pass_batch_contract<COMMAND_GRAPH_CONTRACTION_HINT_V_U_SEQUENCE>(cg, v, u, nodes);
             else if constexpr(hint & COMMAND_GRAPH_CONTRACTION_HINT_V_U_SEQUENCE)
@@ -332,92 +327,42 @@ swap_u_v:
                 std::swap(u, v);
             }
         }
-        else
-        {
-            // nothing to do
-        }
-    }
-    else if (u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && v->type != COMMAND_GRAPH_NODE_TYPE_COMMAND)
-    {
-        // nothing to do
-        assert(u->command);
-    }
-    else if (u->type != COMMAND_GRAPH_NODE_TYPE_COMMAND && v->type == COMMAND_GRAPH_NODE_TYPE_COMMAND)
-    {
-        goto swap_u_v;
     }
     else
     {
+        // u is non-atomic, so it must be a batch
+        assert(u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && u->command && u->command->type == COMMAND_TYPE_BATCH && u->command->batch.cg);
         // nothing to do
-        assert(u->type != COMMAND_GRAPH_NODE_TYPE_COMMAND && v->type != COMMAND_GRAPH_NODE_TYPE_COMMAND);
     }
 
     /* always contract in place */
     cg->contract<hint | COMMAND_GRAPH_CONTRACTION_HINT_INPLACE>(u, v);
 
-    /**
-     *  A command is 'atomic' if it is either:
-     *      - a non-COMMAND_TYPE_BATCH command
-     *      - a non-COMMAND_TYPE_BATCH command with no cg (i.e., cg=NULL)
-     *
-     *  Once we reached that point, we:
-     *      - contracted v to u
-     *      - either have:
-     *          (a) u and v are controls            -> nothing to do
-     *          (b) u is a command, v is a control  -> nothing to do
-     *          (c) u and v are commands
-     *              (c1) u is non-atomic
-     *                  (c1a) v is non-atomic       -> merge two graphs (TODO: shall we fallbacks to c1b instead?)
-     *                  (c1b) v is atomic           -> append 'v' to 'u'
-     *              (c2) u is atomic, v is atomic   -> convert 'u' to a non-atomic COMMAND_TYPE_BATCH appended with 'v'
-     */
-
-
     /* mark 'v' as contracted to skip it from future contractions */
     nodes[v->iterator_index].data.contracted = true;
 
-    /* Initialize the command of 'w' */
-    if (u->type != COMMAND_GRAPH_NODE_TYPE_COMMAND)
+    /**
+     *  A node is atomic if it is empty, or a non-batch command, or a batch command with no CGIR attached
+     *
+     *  At this point, either
+     *      (a) u is atomic, v must be too      -> batch 'u' and 'v' to the new batch 'u'
+     *      (b) u is not atomic
+     *          (b.1) v is atomic               -> add 'v' to the graph of 'u'
+     *          (b.2) v is not atomic           -> merge the two graph 'u' and 'v'
+     */
+
+    if (NODE_IS_ATOMIC(u))
     {
-        // nothing to do - (a)
+        // (a)
+        assert(NODE_IS_ATOMIC(v));
+        command_batch_init<hint>(cg, u, v);
     }
     else
     {
-        if (v->type != COMMAND_GRAPH_NODE_TYPE_COMMAND)
-        {
-            // nothing to do - (b)
-        }
+        if (NODE_IS_ATOMIC(v))
+            command_graph_pass_batch_contract_batch_single_node<hint>(u->command->batch.cg, v);
         else
-        {
-            // (c)
-            assert(u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && u->command);
-            assert(v->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && v->command);
-
-            if (!COMMAND_IS_ATOMIC(u->command))
-            {
-                // (c1)
-                if (!COMMAND_IS_ATOMIC(v->command))
-                {
-                    // (c1a)
-                    command_graph_pass_batch_contract_batch_merge<hint>(u, v);
-                }
-                else
-                {
-                    // (c1b)
-                    assert(u->command->batch.cg);
-                    command_graph_pass_batch_contract_batch_single_node<hint>(u->command->batch.cg, v);
-                }
-            }
-            else
-            {
-                // (c2)
-
-                assert(COMMAND_IS_ATOMIC(u->command));
-                assert(COMMAND_IS_ATOMIC(v->command));
-
-                command_batch_init<hint>(cg, u, v);
-            }
-        }
+            command_graph_pass_batch_contract_batch_merge<hint>(u, v);
     }
 
     return u;
@@ -428,7 +373,7 @@ command_graph_pass_batch_can_batch(
     const command_graph_node_t * u,
     const command_graph_node_t * v
 ) {
-    return u != v && u->device_unique_id == v->device_unique_id;
+    return u != v && u->device_unique_id == v->device_unique_id && u->type != COMMAND_GRAPH_NODE_TYPE_COMMAND_GRAPH && v->type != COMMAND_GRAPH_NODE_TYPE_COMMAND_GRAPH;
 }
 
 void
@@ -438,6 +383,9 @@ command_graph_t::pass_batch(void)
      * New node can be safely pushed-back: they will be iterated on. */
     constexpr bool include_entry_exit = false;
     std::vector<node_t> nodes = this->create_node_iterators<pls_t, include_entry_exit>();
+
+    command_graph_node_t * exit = this->node_get_exit();
+    assert(exit);
 
     /* iterate through each original nodes */
     for (command_graph_node_index_t i = 0 ; i < nodes.size() ; ++i)
@@ -475,6 +423,9 @@ retry_node:
         /* 2. detect u->v sequence */
         for (command_graph_node_t * v : u->successors)
         {
+            if (v == exit)
+                continue ;
+
             assert(u != v);
             if (command_graph_pass_batch_can_batch(u, v))
             {
@@ -486,6 +437,7 @@ retry_node:
             }
         }
 
+        # if 0
         /* 3. detect v->u sequence */
         for (command_graph_node_t * v : u->predecessors)
         {
@@ -499,5 +451,6 @@ retry_node:
                 }
             }
         }
+        # endif
     }
 }

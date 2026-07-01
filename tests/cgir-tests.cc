@@ -50,7 +50,7 @@ command_graph_node_new(
     const device_unique_id_t device_unique_id,
     const command_graph_node_type_t type
 ) {
-    return new command_graph_node_t(type);
+    return new command_graph_node_t(device_unique_id, type);
 }
 
 static command_graph_t *
