@@ -87,6 +87,17 @@ command_batch_init(
     assert(original_cg->command_graph_new);
     cmd->batch.cg = original_cg->command_graph_new(original_cg);
     assert(cmd->batch.cg);
+
+    /* create new nodes corresponding to u and v in the new batch cg */
+    assert(cmd->batch.cg->command_graph_node_new);
+    command_graph_node_t * uu = cmd->batch.cg->command_graph_node_new(cmd->batch.cg, u->device_unique_id, u->type);
+    command_graph_node_t * vv = cmd->batch.cg->command_graph_node_new(cmd->batch.cg, v->device_unique_id, v->type);
+    assert(uu);
+    assert(vv);
+    uu->command = cmd_u;
+    vv->command = cmd_v;
+
+    /* update 'u' as it became a new batch command node */
     u->type = COMMAND_GRAPH_NODE_TYPE_COMMAND;
     u->command = cmd;
 
@@ -99,15 +110,6 @@ command_batch_init(
     exit->predecessors.clear();
     assert(entry->predecessors.size() == 0);
     assert(exit->successors.size() == 0);
-
-    /* create new nodes corresponding to u and v in the new batch cg */
-    assert(cmd->batch.cg->command_graph_node_new);
-    command_graph_node_t * uu = cmd->batch.cg->command_graph_node_new(cmd->batch.cg, u->device_unique_id, u->type);
-    command_graph_node_t * vv = cmd->batch.cg->command_graph_node_new(cmd->batch.cg, v->device_unique_id, v->type);
-    assert(uu);
-    assert(vv);
-    uu->command = cmd_u;
-    vv->command = cmd_v;
 
     if constexpr (hint == COMMAND_GRAPH_CONTRACTION_HINT_FALSE_TWINS)
     {

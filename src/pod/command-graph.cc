@@ -126,6 +126,14 @@ command_graph_t::dump(FILE * f)
 }
 
 void
+command_graph_t::dump(const char * fname)
+{
+    FILE * f = fopen(fname, "w");
+    this->dump(f);
+    fclose(f);
+}
+
+void
 command_graph_t::coherence_checks(void)
 {
     // Check that entry/exit are correct

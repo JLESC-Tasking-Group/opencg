@@ -729,14 +729,7 @@ struct command_graph_t
 
     /* Dump the command graph */
     void dump(FILE * file);
-
-    /* Dump the command graph to a dot file */
-    inline void dump(const char * fname)
-    {
-        FILE * f = fopen(fname, "w");
-        this->dump(f);
-        fclose(f);
-    }
+    void dump(const char * fname);
 
     /**************
      * Iterators *
