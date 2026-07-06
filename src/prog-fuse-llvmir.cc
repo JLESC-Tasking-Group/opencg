@@ -100,6 +100,10 @@
 /* In-process JIT (replaces the former Proteus dependency) */
 # include <llvm/ExecutionEngine/Orc/LLJIT.h>
 # include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
+# include <llvm/ExecutionEngine/Orc/Core.h>
+# include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
+# include <llvm/ExecutionEngine/Orc/Shared/ExecutorSymbolDef.h>
+# include <llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h>
 # include <llvm/Support/Error.h>
 
 # include <atomic>
@@ -371,6 +375,63 @@ prog_fuse_dump_module(const std::string & dir, const char * name, llvm::Module &
         return ;
     }
     M.print(os, /* AssemblyAnnotationWriter */ nullptr);
+}
+
+/* ------------------------------------------------------------------------- *
+ * Debug dump option (CGIR_JIT_DUMP), mirroring CGIR_PROG_FUSE_DUMP but for   *
+ * the `jit` pass. When set (to anything other than "" or "0"), each JIT of a *
+ * PROG writes its IR before and after the pass's own transforms (entry       *
+ * externalization / wrapper synthesis), so what is handed to the JIT can be  *
+ * inspected:                                                                 *
+ *                                                                           *
+ *   <base>/jit-<seq>/input.ll   (the program IR, as parsed)                  *
+ *   <base>/jit-<seq>/final.ll   (after wrapper synthesis, fed to the JIT)    *
+ *                                                                           *
+ * <base> is ~/.cgir/tmp by default, or the value of CGIR_JIT_DUMP when it is *
+ * an absolute path. <seq> is a per-process counter.                          *
+ * ------------------------------------------------------------------------- */
+static bool
+jit_dump_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled == -1)
+    {
+        const char * s = getenv("CGIR_JIT_DUMP");
+        enabled = (s && s[0] != '\0' && strcmp(s, "0") != 0) ? 1 : 0;
+    }
+    return (bool) enabled;
+}
+
+/* Create (mkdir -p) a fresh per-jit dump directory and return its path, or an
+ * empty string on failure. */
+static std::string
+jit_dump_make_dir(void)
+{
+    std::string base;
+    const char * s = getenv("CGIR_JIT_DUMP");
+    if (s && s[0] == '/')
+    {
+        base = s;
+    }
+    else
+    {
+        const char * home = getenv("HOME");
+        base  = home ? home : ".";
+        base += "/.cgir/tmp";
+    }
+
+    static std::atomic<unsigned> seq{0};
+    char sub[32];
+    snprintf(sub, sizeof(sub), "/jit-%u", seq.fetch_add(1));
+    std::string dir = base + sub;
+
+    if (std::error_code ec = llvm::sys::fs::create_directories(dir))
+    {
+        fprintf(stderr, "jit: cannot create dump dir '%s': %s\n",
+                dir.c_str(), ec.message().c_str());
+        return std::string();
+    }
+    return dir;
 }
 
 # endif /* CGIR_SUPPORT_LLVM */
@@ -903,6 +964,57 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      * (dst may alias progs[0], which could carry a device kernel symbol) */
     dst->source.content.llvmir.symbol = nullptr;
 
+    /* ------------------------------------------------------------------ *
+     * 9b. Merge the inputs' externalized-global resolution tables.        *
+     *                                                                     *
+     *  Each input externalizes the mutable globals it references; linking  *
+     *  the closures (step 4) merges same-named external declarations into  *
+     *  one, so the fused module needs the union of the inputs' tables      *
+     *  (deduplicated by symbol name) to resolve them at JIT. Entries are    *
+     *  shallow-copied: each `name` points to a stable (compile-time)       *
+     *  string and `addr` to a stable process object, so the merged buffer  *
+     *  outlives freeing any input table. We collect first (dst may alias   *
+     *  progs[0], whose table we read) then free dst's previous owned one.  *
+     * ------------------------------------------------------------------ */
+    std::vector<command_prog_extern_t> merged_externs;
+    for (size_t i = 0 ; i < n ; ++i)
+    {
+        if (progs[i]->source.type != COMMAND_PROG_SOURCE_TYPE_LLVMIR)
+            continue ;
+        const command_prog_extern_t * ex = progs[i]->source.content.llvmir.externs;
+        const size_t cnt = progs[i]->source.content.llvmir.externs_count;
+        for (size_t k = 0 ; k < cnt ; ++k)
+        {
+            if (ex[k].name == nullptr)
+                continue ;
+            bool dup = false;
+            for (const command_prog_extern_t & m : merged_externs)
+                if (m.name == ex[k].name || strcmp(m.name, ex[k].name) == 0) { dup = true; break ; }
+            if (!dup)
+                merged_externs.push_back(ex[k]);
+        }
+    }
+
+    if (dst->source.content.llvmir._externs_owned && dst->source.content.llvmir.externs)
+        free((void *) dst->source.content.llvmir.externs);
+
+    if (merged_externs.empty())
+    {
+        dst->source.content.llvmir.externs        = nullptr;
+        dst->source.content.llvmir.externs_count  = 0;
+        dst->source.content.llvmir._externs_owned = false;
+    }
+    else
+    {
+        const size_t bytes = merged_externs.size() * sizeof(command_prog_extern_t);
+        command_prog_extern_t * ebuf = static_cast<command_prog_extern_t *>(malloc(bytes));
+        if (!ebuf) { fprintf(stderr, "prog-fuse: malloc failed\n"); abort(); }
+        memcpy(ebuf, merged_externs.data(), bytes);
+        dst->source.content.llvmir.externs        = ebuf;
+        dst->source.content.llvmir.externs_count  = merged_externs.size();
+        dst->source.content.llvmir._externs_owned = true;
+    }
+
     /* The fused module is NOT compiled here: the `jit` pass
      * (command_graph_jit_llvmir) compiles dst->source and installs the function
      * pointer. mod_u/ctx are released at scope exit (the bitcode above is the
@@ -991,6 +1103,18 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             progs[i]->launcher.variadic.args_size   = 0;
             progs[i]->launcher.variadic._args_owned = false;
         }
+
+        /* release an owned externs table from a prior fusion (its entries were
+         * shallow-copied into dst's merged table in step 9b) */
+        if (progs[i]->source.type == COMMAND_PROG_SOURCE_TYPE_LLVMIR &&
+            progs[i]->source.content.llvmir._externs_owned &&
+            progs[i]->source.content.llvmir.externs)
+        {
+            free((void *) progs[i]->source.content.llvmir.externs);
+            progs[i]->source.content.llvmir.externs        = nullptr;
+            progs[i]->source.content.llvmir.externs_count  = 0;
+            progs[i]->source.content.llvmir._externs_owned = false;
+        }
     }
 
     # endif /* CGIR_SUPPORT_LLVM */
@@ -1011,6 +1135,10 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
 
     ensure_llvm_initialized();
 
+    /* Optional IR dumping for debugging (CGIR_JIT_DUMP). */
+    const bool  dump     = jit_dump_enabled();
+    std::string dump_dir = dump ? jit_dump_make_dir() : std::string();
+
     /* parse the program's IR/bitcode into its own context */
     auto ctx = std::make_unique<llvm::LLVMContext>();
     std::unique_ptr<llvm::Module> mod = parse_llvmir(
@@ -1019,6 +1147,10 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
         *ctx
     );
     if (!mod) { fprintf(stderr, "jit: failed to parse program IR\n"); abort(); }
+
+    /* dump the program IR as parsed, before any transform */
+    if (dump)
+        prog_fuse_dump_module(dump_dir, "input.ll", *mod);
 
     /* Resolve the entry function: prefer the explicit symbol (e.g. a device
      * kernel sub-module with several definitions); else a fused program exposes
@@ -1092,6 +1224,10 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
         lookup_name = "__cgir_jit_wrapper";
     }
 
+    /* dump the final IR handed to the JIT (with wrapper synthesis, if any) */
+    if (dump)
+        prog_fuse_dump_module(dump_dir, "final.ll", *mod);
+
     /* JIT-compile in-process */
     auto jit_exp = llvm::orc::LLJITBuilder().create();
     if (!jit_exp)
@@ -1101,6 +1237,55 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
         abort();
     }
     std::unique_ptr<llvm::orc::LLJIT> jit = std::move(*jit_exp);
+
+    /* Resolve symbols the program references but does not define:
+     *
+     *  1. Externalized globals — the producer turned the program's shared data
+     *     globals into external declarations and recorded their real runtime
+     *     addresses (source.content.llvmir.externs). Install them as absolute
+     *     symbols so the compiled code binds to the process's real objects
+     *     instead of module-local copies.
+     *
+     *  2. Everything else (e.g. libc `printf`, other exported process symbols)
+     *     via a generator over the current process's dynamic symbols. */
+    {
+        llvm::orc::JITDylib & jd = jit->getMainJITDylib();
+
+        const cgir_command_prog_extern_t * externs = prog->source.content.llvmir.externs;
+        const size_t n_externs = prog->source.content.llvmir.externs_count;
+        if (externs && n_externs)
+        {
+            llvm::orc::SymbolMap syms;
+            for (size_t i = 0 ; i < n_externs ; ++i)
+            {
+                if (externs[i].name == nullptr)
+                    continue ;
+                syms[jit->mangleAndIntern(externs[i].name)] =
+                    llvm::orc::ExecutorSymbolDef(
+                        llvm::orc::ExecutorAddr::fromPtr(externs[i].addr),
+                        llvm::JITSymbolFlags::Exported);
+            }
+            if (!syms.empty())
+            {
+                if (auto err = jd.define(llvm::orc::absoluteSymbols(std::move(syms))))
+                {
+                    llvm::logAllUnhandledErrors(std::move(err), llvm::errs(), "jit: ");
+                    fprintf(stderr, "jit: failed to install externalized-global symbols\n");
+                    abort();
+                }
+            }
+        }
+
+        auto gen = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+            jit->getDataLayout().getGlobalPrefix());
+        if (!gen)
+        {
+            llvm::logAllUnhandledErrors(gen.takeError(), llvm::errs(), "jit: ");
+            fprintf(stderr, "jit: failed to create process symbol generator\n");
+            abort();
+        }
+        jd.addGenerator(std::move(*gen));
+    }
 
     llvm::orc::ThreadSafeModule tsm(std::move(mod), std::move(ctx));
     if (auto err = jit->addIRModule(std::move(tsm)))

@@ -49,6 +49,7 @@ CGIR_NAMESPACE_BEGIN
 /* Alias the shared C source types (cgir/prog-source.h) into the cgir:: namespace. */
 typedef ::cgir_command_prog_source_t        command_prog_source_t;
 typedef ::cgir_command_prog_source_type_t   command_prog_source_type_t;
+typedef ::cgir_command_prog_extern_t        command_prog_extern_t;
 
 constexpr command_prog_source_type_t COMMAND_PROG_SOURCE_TYPE_LLVMIR = ::CGIR_COMMAND_PROG_SOURCE_TYPE_LLVMIR;
 constexpr command_prog_source_type_t COMMAND_PROG_SOURCE_TYPE_MLIR   = ::CGIR_COMMAND_PROG_SOURCE_TYPE_MLIR;
@@ -230,8 +231,11 @@ struct command_t
          * pass sets them true once it installs its own heap buffers. */
         if (type == COMMAND_TYPE_PROG)
         {
-            prog.source.content.llvmir._owned  = false;
-            prog.source.content.llvmir.symbol  = nullptr;
+            prog.source.content.llvmir._owned         = false;
+            prog.source.content.llvmir.symbol         = nullptr;
+            prog.source.content.llvmir.externs        = nullptr;
+            prog.source.content.llvmir.externs_count  = 0;
+            prog.source.content.llvmir._externs_owned = false;
             prog.launcher.variadic._args_owned = false;
 
             /* Default launch mode: the launcher is invoked directly. Producers

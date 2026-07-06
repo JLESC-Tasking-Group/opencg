@@ -70,6 +70,19 @@ typedef enum    cgir_command_prog_source_type_t
 
 }               cgir_command_prog_source_type_t;
 
+/* One entry of a program's externalized-global resolution table: a symbol that
+ * appears as an *external declaration* in the program's IR (`raw`) together with
+ * the real runtime address it must bind to. Producers (e.g. a compiler emitting
+ * a task body) externalize the globals a program reads/writes and record their
+ * process addresses here; the JIT installs them as absolute symbols so the
+ * compiled program operates on the real objects instead of module-local copies.
+ * C-compatible POD; addresses are resolved at load time by the producer. */
+typedef struct  cgir_command_prog_extern_t
+{
+    const char * name;   /* symbol name as it appears in the program IR */
+    void       * addr;   /* real runtime address to bind that symbol to */
+}               cgir_command_prog_extern_t;
+
 /* source code of a prog */
 typedef struct  cgir_command_prog_source_t
 {
@@ -94,6 +107,21 @@ typedef struct  cgir_command_prog_source_t
              * holds several definitions (e.g. a device kernel plus its outlined
              * callees). */
             const char * symbol;
+
+            /* externalized-global resolution table. For each global that `raw`
+             * references as an external declaration, its name and the real
+             * runtime address to bind it to (see cgir_command_prog_extern_t).
+             * The JIT installs these as absolute symbols so the program binds to
+             * the process's real objects rather than duplicating module-local
+             * globals. NULL/0 when the program is self-contained. */
+            const cgir_command_prog_extern_t * externs;
+            size_t externs_count;
+
+            /* true iff `externs` is a heap buffer owned by this source (e.g. the
+             * merged table produced by the prog-fuse pass). Compiler-provided
+             * tables are non-owning (compile-time constants); defaults to false
+             * (see command_t's constructor). */
+            bool _externs_owned;
         } llvmir;
     } content;
 
