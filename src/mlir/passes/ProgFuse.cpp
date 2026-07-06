@@ -142,7 +142,7 @@ struct ProgFusePass
                     wn->command->prog.source.content.llvmir.raw       == nullptr)
                     break;
                 /* only fuse programs with rigorously identical launch parameters
-                 * (grid/block); every chain member must match the head un */
+                 * (grid/block and launch mode); every chain member must match the head un */
                 if (!::cgir::command_prog_launch_params_equal(&un->command->prog, &wn->command->prog))
                     break;
 

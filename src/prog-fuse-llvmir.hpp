@@ -61,10 +61,13 @@ command_graph_jit_llvmir(
 
 /**
  *  True iff two programs have rigorously identical launch parameters, i.e. the
- *  same grid and block dimensions. The prog-fuse passes only fuse programs whose
- *  launch geometry is identical: the fused program is a single kernel launched
- *  over one grid/block, so fusing kernels launched over different iteration
- *  spaces would be unsound.
+ *  same grid and block dimensions AND the same launch mode. The prog-fuse passes
+ *  only fuse programs whose launch geometry is identical: the fused program is a
+ *  single kernel launched over one grid/block, so fusing kernels launched over
+ *  different iteration spaces would be unsound. Likewise, the launch mode
+ *  (see command_prog_launch_mode_t) must match: a fused program is replayed with
+ *  a single launch mode, so e.g. a directly-launched program cannot be fused
+ *  with one that must be re-spawned as a task.
  *
  *  TODO: support fusing programs with non-identical grids in the future, e.g. by
  *  launching over the bounding grid and predicating/padding each original
@@ -76,7 +79,8 @@ command_prog_launch_params_equal(
     const command_prog_t * a,
     const command_prog_t * b
 ) {
-    return a->grid.x  == b->grid.x  && a->grid.y  == b->grid.y  && a->grid.z  == b->grid.z
+    return a->launch_mode == b->launch_mode
+        && a->grid.x  == b->grid.x  && a->grid.y  == b->grid.y  && a->grid.z  == b->grid.z
         && a->block.x == b->block.x && a->block.y == b->block.y && a->block.z == b->block.z;
 }
 

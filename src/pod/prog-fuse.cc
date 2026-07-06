@@ -102,7 +102,7 @@ command_graph_t::pass_prog_fuse(void)
             if (!node_is_llvmir_prog(w) || !this->are_sequence(cur, w))
                 break ;
             /* only fuse programs with rigorously identical launch parameters
-             * (grid/block); every chain member must match the head u */
+             * (grid/block and launch mode); every chain member must match the head u */
             if (!command_prog_launch_params_equal(&u->command->prog, &w->command->prog))
                 break ;
             chain.push_back(w);

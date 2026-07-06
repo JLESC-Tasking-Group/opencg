@@ -175,6 +175,31 @@ find_kernel(llvm::Module & M)
     return nullptr;
 }
 
+/**
+ *  Return the first externally-linked `void(ptr)` definition in the module.
+ *  This is the packed-args entry of a program whose launcher consumes a single
+ *  void** args block (e.g. an OpenMP outlined task body,
+ *  `void .omp_task_entry.(void ** args)`). The IR closure serialised by the
+ *  producer externalises exactly that entry (its callees stay internal), so the
+ *  first external void(ptr) definition is the intended wrapper. Returns nullptr
+ *  if none.
+ */
+static llvm::Function *
+find_packed_wrapper(llvm::Module & M)
+{
+    for (llvm::Function & F : M)
+    {
+        if (F.isDeclaration() || !F.hasExternalLinkage())
+            continue;
+        llvm::FunctionType * fty = F.getFunctionType();
+        if (F.getReturnType()->isVoidTy() &&
+            fty->getNumParams() == 1 &&
+            fty->getParamType(0)->isPointerTy())
+            return &F;
+    }
+    return nullptr;
+}
+
 /* One-time LLVM target/codegen initialization, shared by the fuse and jit
  * passes (both build a host TargetMachine / JIT). */
 static void
@@ -429,10 +454,35 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         bool is_wrapper = false;
         unsigned arity = 0;
 
+        /* A task-spawn program uses the packed-args ABI: its entry is a
+         * `void(void**)` wrapper that consumes the whole recorded args block
+         * (e.g. an OpenMP outlined task body). Treat it as a wrapper so the
+         * fused wrapper hands it a void** slice (rather than dereferencing each
+         * slot as a leaf-kernel parameter). Its slot count comes from the
+         * recorded launcher.variadic.args_size. */
+        if (progs[i]->launch_mode == CGIR_COMMAND_PROG_LAUNCH_MODE_TASK_SPAWN)
+        {
+            if (const char * sym = progs[i]->source.content.llvmir.symbol)
+                entry = M.getFunction(sym);
+            if (entry == nullptr)
+                entry = M.getFunction("__fused_wrapper");
+            if (entry == nullptr)
+                entry = find_packed_wrapper(M);
+            if (!entry || entry->isDeclaration())
+            {
+                fprintf(stderr, "prog-fuse: no packed void(void**) entry found in "
+                                "task-spawn program %zu\n", i);
+                abort();
+            }
+            is_wrapper = true;
+            arity      = (unsigned) (progs[i]->launcher.variadic.args_size / sizeof(void *));
+        }
+
         /* prefer the explicit entry symbol if the source carries one (e.g. a
          * device kernel sub-module that defines several functions) */
-        if (const char * sym = progs[i]->source.content.llvmir.symbol)
+        if (entry == nullptr && progs[i]->source.content.llvmir.symbol)
         {
+            const char * sym = progs[i]->source.content.llvmir.symbol;
             entry = M.getFunction(sym);
             if (!entry || entry->isDeclaration())
             {
@@ -885,24 +935,26 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     /* ------------------------------------------------------------------ *
      * 11b. Propagate the launch parameters to the fused program.          *
      *                                                                     *
-     *  Every fused program shares identical grid/block dimensions: the    *
-     *  prog-fuse passes only chain programs for which                     *
+     *  Every fused program shares identical grid/block dimensions and     *
+     *  launch mode: the prog-fuse passes only chain programs for which    *
      *  command_prog_launch_params_equal() holds. The fused kernel is a    *
-     *  single launch over that common geometry, so it inherits progs[0]'s.*
-     *  We set this explicitly (rather than relying on dst aliasing        *
-     *  progs[0]) so a distinct dst is correct too. progs[0]'s grid/block  *
-     *  are never freed/modified above, so reading them here is safe even   *
-     *  when dst == progs[0].                                              *
+     *  single launch over that common geometry and launch mode, so it     *
+     *  inherits progs[0]'s. We set this explicitly (rather than relying   *
+     *  on dst aliasing progs[0]) so a distinct dst is correct too.        *
+     *  progs[0]'s grid/block/launch_mode are never freed/modified above,  *
+     *  so reading them here is safe even when dst == progs[0].            *
      * ------------------------------------------------------------------ */
     if (dst != progs[0])
     {
-        dst->grid  = progs[0]->grid;
-        dst->block = progs[0]->block;
+        dst->grid        = progs[0]->grid;
+        dst->block       = progs[0]->block;
+        dst->launch_mode = progs[0]->launch_mode;
     }
     else
     {
         assert(memcmp(&dst->grid,  &progs[0]->grid,  sizeof(dst->grid))  == 0);
         assert(memcmp(&dst->block, &progs[0]->block, sizeof(dst->block)) == 0);
+        assert(dst->launch_mode == progs[0]->launch_mode);
     }
 
     /* ------------------------------------------------------------------ *
@@ -968,17 +1020,77 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
     );
     if (!mod) { fprintf(stderr, "jit: failed to parse program IR\n"); abort(); }
 
-    /* resolve the entry: prefer the explicit symbol (e.g. a device kernel
-     * sub-module with several definitions); else a fused program exposes
-     * __fused_wrapper(void**); else fall back to the first void definition. */
-    std::string entry_name;
+    /* Resolve the entry function: prefer the explicit symbol (e.g. a device
+     * kernel sub-module with several definitions); else a fused program exposes
+     * __fused_wrapper(void**); else the first externally-linked definition (the
+     * task/kernel entry externalized for JIT); else the first void definition. */
+    llvm::Function * entry = nullptr;
     if (const char * sym = prog->source.content.llvmir.symbol)
-        entry_name = sym;
+        entry = mod->getFunction(sym);
     else if (llvm::Function * w = mod->getFunction("__fused_wrapper"); w && !w->isDeclaration())
-        entry_name = "__fused_wrapper";
-    else if (llvm::Function * k = find_kernel(*mod))
-        entry_name = k->getName().str();
-    else { fprintf(stderr, "jit: no entry function found in program\n"); abort(); }
+        entry = w;
+    else
+    {
+        for (llvm::Function & F : *mod)
+            if (!F.isDeclaration() && F.hasExternalLinkage())
+            {
+                entry = &F;
+                break ;
+            }
+        if (entry == nullptr)
+            entry = find_kernel(*mod);
+    }
+
+    /* Skip (do not abort) commands whose entry is not externally JIT-resolvable
+     * - e.g. a not-yet-externalized internal task body, or a fixed-launcher
+     * command that carries a source but is not a JIT target. Leaves the
+     * launcher untouched. */
+    if (entry == nullptr || entry->isDeclaration() || entry->hasLocalLinkage())
+        return ;
+
+    /* The runtime launches a fused/JIT'd PROG uniformly as `void(void**)`. If
+     * the entry already has that shape (a fused wrapper), use it directly;
+     * otherwise synthesize a wrapper that unpacks the argument slots and calls
+     * the entry (ignoring any return value). */
+    llvm::FunctionType * efty = entry->getFunctionType();
+    const bool is_void_voidptr =
+        efty->getReturnType()->isVoidTy() &&
+        efty->getNumParams() == 1 &&
+        efty->getParamType(0)->isPointerTy();
+
+    std::string lookup_name;
+    if (is_void_voidptr)
+    {
+        lookup_name = entry->getName().str();
+    }
+    else
+    {
+        llvm::LLVMContext & C = mod->getContext();
+        llvm::Type * void_ty = llvm::Type::getVoidTy(C);
+        llvm::Type * ptr_ty  = llvm::PointerType::getUnqual(C);
+        llvm::Type * i64_ty  = llvm::Type::getInt64Ty(C);
+
+        llvm::FunctionType * wfty = llvm::FunctionType::get(void_ty, { ptr_ty }, false);
+        llvm::Function * wrapper = llvm::Function::Create(
+            wfty, llvm::GlobalValue::ExternalLinkage, "__cgir_jit_wrapper", mod.get());
+
+        llvm::BasicBlock * bb = llvm::BasicBlock::Create(C, "entry", wrapper);
+        llvm::IRBuilder<> b(bb);
+        llvm::Value * args_ptr = wrapper->getArg(0);
+
+        std::vector<llvm::Value *> call_args;
+        call_args.reserve(efty->getNumParams());
+        for (unsigned k = 0 ; k < efty->getNumParams() ; ++k)
+        {
+            llvm::Value * slot  = b.CreateGEP(ptr_ty, args_ptr, llvm::ConstantInt::get(i64_ty, k), "slot");
+            llvm::Value * voidp = b.CreateLoad(ptr_ty, slot, "voidp");
+            call_args.push_back(b.CreateLoad(efty->getParamType(k), voidp, "argval"));
+        }
+        b.CreateCall(efty, entry, call_args);
+        b.CreateRetVoid();
+
+        lookup_name = "__cgir_jit_wrapper";
+    }
 
     /* JIT-compile in-process */
     auto jit_exp = llvm::orc::LLJITBuilder().create();
@@ -998,11 +1110,11 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
         abort();
     }
 
-    auto sym = jit->lookup(entry_name);
+    auto sym = jit->lookup(lookup_name);
     if (!sym)
     {
         llvm::logAllUnhandledErrors(sym.takeError(), llvm::errs(), "jit: ");
-        fprintf(stderr, "jit: could not resolve '%s' after JIT\n", entry_name.c_str());
+        fprintf(stderr, "jit: could not resolve '%s' after JIT\n", lookup_name.c_str());
         abort();
     }
     void * fn_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(sym->getValue()));

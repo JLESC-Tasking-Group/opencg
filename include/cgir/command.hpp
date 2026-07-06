@@ -56,6 +56,26 @@ constexpr command_prog_source_type_t COMMAND_PROG_SOURCE_TYPE_PTX    = ::CGIR_CO
 constexpr command_prog_source_type_t COMMAND_PROG_SOURCE_TYPE_CL     = ::CGIR_COMMAND_PROG_SOURCE_TYPE_CL;
 constexpr command_prog_source_type_t COMMAND_PROG_SOURCE_TYPE_SPIRV  = ::CGIR_COMMAND_PROG_SOURCE_TYPE_SPIRV;
 
+/* How the runtime must invoke a PROG's launcher on execution/replay. This is an
+ * attribute of the command (not of its source code), decoupling the *way* a
+ * program is launched from the launcher function itself. Keeping it separate is
+ * what lets prog-fuse merge programs that must be launched identically (e.g. a
+ * chain of OpenMP outlined task bodies): the launcher stays a plain
+ * `void(void**)` that fusion can link/inline, while the runtime replays the
+ * fused program with the shared launch mode. */
+typedef enum   command_prog_launch_mode_t
+{
+    /* The launcher is invoked directly by the executing thread; the command
+     * completes when the launcher returns. */
+    CGIR_COMMAND_PROG_LAUNCH_MODE_DIRECT = 0,
+
+    /* The runtime must spawn a task (in the current thread's team) that runs the
+     * launcher; the command completes when that task completes. Used for OpenMP
+     * outlined task bodies, whose replay must re-spawn a task. */
+    CGIR_COMMAND_PROG_LAUNCH_MODE_TASK_SPAWN
+
+}              command_prog_launch_mode_t;
+
 /* Move data between devices */
 struct command_copy_1D_t
 {
@@ -113,6 +133,9 @@ struct command_prog_t
     /* source of the prog - shared (C-compatible) structure, see
      * cgir/prog-source.h */
     command_prog_source_t source;
+
+    /* how the runtime must launch this program (see command_prog_launch_mode_t) */
+    command_prog_launch_mode_t launch_mode;
 
     /* grid parameters */
     struct {
@@ -210,6 +233,11 @@ struct command_t
             prog.source.content.llvmir._owned  = false;
             prog.source.content.llvmir.symbol  = nullptr;
             prog.launcher.variadic._args_owned = false;
+
+            /* Default launch mode: the launcher is invoked directly. Producers
+             * (e.g. XKOMP's task recorder) overwrite this with TASK_SPAWN when
+             * the program must be replayed as a spawned task. */
+            prog.launch_mode = CGIR_COMMAND_PROG_LAUNCH_MODE_DIRECT;
 
             /* Default launch parameters. Producers overwrite these; zeroing them
              * makes the value deterministic so the prog-fuse launch-parameter
