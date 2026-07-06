@@ -102,8 +102,10 @@
 # include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 # include <llvm/ExecutionEngine/Orc/Core.h>
 # include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
+# include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
 # include <llvm/ExecutionEngine/Orc/Shared/ExecutorSymbolDef.h>
 # include <llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h>
+# include <llvm/Support/CodeGen.h>
 # include <llvm/Support/Error.h>
 
 # include <atomic>
@@ -1224,12 +1226,32 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
         lookup_name = "__cgir_jit_wrapper";
     }
 
+    /* Compile with the LARGE code model. The JIT places compiled code in a fresh
+     * mapping that can be >2GB away from the process objects this program binds
+     * to (externalized globals installed as absolute symbols, libc functions,
+     * ...). Small/medium models reference those via 32-bit PC-relative
+     * relocations (R_X86_64_PC32) that cannot span that distance; the large
+     * model uses 64-bit absolute addressing, reachable anywhere. Set it on both
+     * the module (flag) and the JIT target machine so codegen honors it. */
+    mod->setCodeModel(llvm::CodeModel::Large);
+
     /* dump the final IR handed to the JIT (with wrapper synthesis, if any) */
     if (dump)
         prog_fuse_dump_module(dump_dir, "final.ll", *mod);
 
-    /* JIT-compile in-process */
-    auto jit_exp = llvm::orc::LLJITBuilder().create();
+    /* JIT-compile in-process (large code model, see above) */
+    auto jtmb = llvm::orc::JITTargetMachineBuilder::detectHost();
+    if (!jtmb)
+    {
+        llvm::logAllUnhandledErrors(jtmb.takeError(), llvm::errs(), "jit: ");
+        fprintf(stderr, "jit: failed to detect host JIT target machine\n");
+        abort();
+    }
+    jtmb->setCodeModel(llvm::CodeModel::Large);
+
+    auto jit_exp = llvm::orc::LLJITBuilder()
+        .setJITTargetMachineBuilder(std::move(*jtmb))
+        .create();
     if (!jit_exp)
     {
         llvm::logAllUnhandledErrors(jit_exp.takeError(), llvm::errs(), "jit: ");
