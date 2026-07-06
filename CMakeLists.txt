@@ -191,6 +191,18 @@ if (USE_LLVM)
     # Add LLVM's own include directories (source tree + build tree headers).
     target_include_directories(${CGIR} PRIVATE ${LLVM_INCLUDE_DIRS})
 
+    # prog-fuse-llvmir.cc is the LLVM-consuming translation unit. Match LLVM's
+    # own build (typically -fno-rtti): consuming LLVM APIs (e.g. the ORC JIT's
+    # error/typeinfo machinery) from an RTTI-enabled TU emits references to LLVM
+    # RTTI symbols (e.g. `typeinfo for llvm::ErrorInfoBase`) that a no-RTTI LLVM
+    # does not provide, yielding an undefined-reference link error. It only uses
+    # LLVM's own isa<>/dyn_cast<> (not C++ RTTI), so -fno-rtti is safe here.
+    if (NOT LLVM_ENABLE_RTTI)
+        set_source_files_properties(
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/prog-fuse-llvmir.cc
+            PROPERTIES COMPILE_OPTIONS "-fno-rtti")
+    endif()
+
     # Link the LLVM component libraries used by prog-fuse: IR manipulation /
     # linking / bitcode plus the in-process ORC JIT (LLJIT) that compiles the
     # fused module (this replaces the former Proteus dependency).
