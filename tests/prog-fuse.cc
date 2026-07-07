@@ -190,7 +190,7 @@ test_distinct_grid_not_fused(void)
     cmd_u->prog.source.content.llvmir.size  = sizeof(scale_llvm_ir);
     cmd_u->prog.launcher.variadic.fn        = nullptr;
     cmd_u->prog.launcher.variadic.args      = scale_args;
-    cmd_u->prog.launcher.variadic.args_size = sizeof(scale_args);
+    cmd_u->prog.launcher.variadic.n_args    = sizeof(scale_args) / sizeof(void *);
     cmd_u->prog.grid.x  = 1; cmd_u->prog.grid.y  = 1; cmd_u->prog.grid.z  = 1;
     cmd_u->prog.block.x = 1; cmd_u->prog.block.y = 1; cmd_u->prog.block.z = 1;
 
@@ -206,7 +206,7 @@ test_distinct_grid_not_fused(void)
     cmd_v->prog.source.content.llvmir.size  = sizeof(axpy_llvm_ir);
     cmd_v->prog.launcher.variadic.fn        = nullptr;
     cmd_v->prog.launcher.variadic.args      = axpy_args;
-    cmd_v->prog.launcher.variadic.args_size = sizeof(axpy_args);
+    cmd_v->prog.launcher.variadic.n_args    = sizeof(axpy_args)  / sizeof(void *);
     cmd_v->prog.grid.x  = 2; cmd_v->prog.grid.y  = 1; cmd_v->prog.grid.z  = 1;
     cmd_v->prog.block.x = 1; cmd_v->prog.block.y = 1; cmd_v->prog.block.z = 1;
 
@@ -298,7 +298,7 @@ main(void)
     cmd_u->prog.source.content.llvmir.size  = sizeof(scale_llvm_ir);
     cmd_u->prog.launcher.variadic.fn        = nullptr;
     cmd_u->prog.launcher.variadic.args      = scale_args;
-    cmd_u->prog.launcher.variadic.args_size = sizeof(scale_args);
+    cmd_u->prog.launcher.variadic.n_args    = sizeof(scale_args) / sizeof(void *);
     /* Identical launch params on both progs (required for fusion); the fused
      * node must inherit these exact grid/block dimensions. */
     cmd_u->prog.grid.x  = 4;  cmd_u->prog.grid.y  = 2; cmd_u->prog.grid.z  = 1;
@@ -317,7 +317,7 @@ main(void)
     cmd_v->prog.source.content.llvmir.size  = sizeof(axpy_llvm_ir);
     cmd_v->prog.launcher.variadic.fn        = nullptr;
     cmd_v->prog.launcher.variadic.args      = axpy_args;
-    cmd_v->prog.launcher.variadic.args_size = sizeof(axpy_args);
+    cmd_v->prog.launcher.variadic.n_args    = sizeof(axpy_args)  / sizeof(void *);
     /* same launch params as cmd_u */
     cmd_v->prog.grid.x  = 4;  cmd_v->prog.grid.y  = 2; cmd_v->prog.grid.z  = 1;
     cmd_v->prog.block.x = 32; cmd_v->prog.block.y = 1; cmd_v->prog.block.z = 1;
@@ -419,10 +419,10 @@ main(void)
      * ------------------------------------------------------------------ */
 
     /* The variadic launcher stores fn, the args buffer (already filled by the
-     * pass), and its byte size.  args_size / sizeof(void*) gives the slots.  */
-    void *   fn        = fused->command->prog.launcher.variadic.fn;
-    void **  args_buf  = static_cast<void **>(fused->command->prog.launcher.variadic.args);
-    size_t   args_size = fused->command->prog.launcher.variadic.args_size;
+     * pass), and its slot count n_args.  */
+    auto     fn       = fused->command->prog.launcher.variadic.fn;
+    void **  args_buf = fused->command->prog.launcher.variadic.args;
+    size_t   n_args   = fused->command->prog.launcher.variadic.n_args;
 
     if (!fn)
     {
@@ -430,7 +430,6 @@ main(void)
         return 1;
     }
 
-    size_t n_args = args_size / sizeof(void *);
     if (n_args != 5)
     {
         fprintf(stderr, "FAIL: expected 5 deduplicated arg slots "
@@ -440,8 +439,7 @@ main(void)
 
     /* The pass already filled args_buf with the deduplicated slots (pointing at
      * s_val / yp / nn / a_val / xp declared above), so just invoke the wrapper. */
-    typedef void (*fused_fn_t)(void **);
-    reinterpret_cast<fused_fn_t>(fn)(args_buf);
+    fn(args_buf);
 
     /* Check results: the fused kernel performed scale then axpy, so:
      *   y[i]  = a * x[i] + s * y_init[i]

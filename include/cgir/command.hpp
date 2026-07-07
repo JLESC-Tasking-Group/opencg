@@ -113,11 +113,16 @@ struct command_prog_t
             void * args[CGIR_CALLBACK_ARGS_MAX];
         } fixed;
 
-        /* variadic argument sizes */
+        /* Program launched over an argument array.  `args` is an array of
+         * `n_args` pointers, one per program parameter, each pointing to the
+         * parameter's value (args[k] == &value) This is the uniform launch
+         * form for host/JIT'd programs (the fused `__fused_wrapper`) and for
+         * device kernels (the pointer array is the CUDA/HIP `kernelParams`).
+         * */
         struct {
-            void * fn;
-            void * args;
-            size_t args_size;
+            void (*fn)(void ** args);   /* program entry: fn(args) */
+            void ** args;               /* array of pointers, one per parameter */
+            size_t  n_args;             /* number of pointers in `args` */
 
             /* true iff `args` is a heap buffer owned by this prog (e.g. the
              * compacted argument buffer produced by the prog-fuse pass). The

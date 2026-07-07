@@ -498,7 +498,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      *  An entry is the program's kernel (first void definition). A program *
      *  that is itself a previously-fused module instead exposes a          *
      *  `void __fused_wrapper(void**)` entry; its arity comes from the      *
-     *  recorded launcher.variadic.args_size and it is invoked on a slice.  *
+     *  recorded launcher.variadic.n_args and it is invoked on a slice.     *
      * ------------------------------------------------------------------ */
     struct fuse_input_t
     {
@@ -521,8 +521,19 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
          * `void(void**)` wrapper that consumes the whole recorded args block
          * (e.g. an OpenMP outlined task body). Treat it as a wrapper so the
          * fused wrapper hands it a void** slice (rather than dereferencing each
-         * slot as a leaf-kernel parameter). Its slot count comes from the
-         * recorded launcher.variadic.args_size. */
+         * slot as a leaf-kernel parameter). Its slot count is n_args.
+         *
+         * NOTE (loop fusion): a task-spawn wrapper's args block is NOT
+         * deduplicated across fused programs — the outlined body reaches its
+         * captured data indirectly (e.g. via args[0] == kmp_task_t*, see XKOMP),
+         * not through distinct per-value slots. So consecutive wrappers fuse at
+         * the PROGRAM level (one __fused_wrapper calling each body), but their
+         * loops stay separate: the bodies keep distinct base pointers / index
+         * offsets, so LLVM cannot align/merge the loops. Leaf kernels (below),
+         * whose parameters ARE deduplicated by shared &value slot, are what
+         * enables cross-program loop fusion.
+         * TODO: to loop-fuse task bodies, expose their captured arrays/offsets as
+         * deduplicable leaf-kernel parameters instead of the args[0]==tt slice. */
         if (progs[i]->launch_mode == CGIR_COMMAND_PROG_LAUNCH_MODE_TASK_SPAWN)
         {
             if (const char * sym = progs[i]->source.content.llvmir.symbol)
@@ -538,7 +549,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
                 abort();
             }
             is_wrapper = true;
-            arity      = (unsigned) (progs[i]->launcher.variadic.args_size / sizeof(void *));
+            arity      = (unsigned) progs[i]->launcher.variadic.n_args;
         }
 
         /* prefer the explicit entry symbol if the source carries one (e.g. a
@@ -566,7 +577,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
                 {
                     entry      = w;
                     is_wrapper = true;
-                    arity      = (unsigned) (progs[i]->launcher.variadic.args_size / sizeof(void *));
+                    arity      = (unsigned) progs[i]->launcher.variadic.n_args;
                 }
             }
         }
@@ -580,7 +591,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         }
 
         /* snapshot the originals' argument slots (each is a void* = &value) */
-        void ** av = static_cast<void **>(progs[i]->launcher.variadic.args);
+        void ** av = progs[i]->launcher.variadic.args;
         if (av == nullptr && arity > 0)
         {
             fprintf(stderr, "prog-fuse: program %zu has no variadic args populated "
@@ -1041,9 +1052,9 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     if (dst->launcher.variadic._args_owned && dst->launcher.variadic.args)
         free(dst->launcher.variadic.args);
 
-    dst->launcher.variadic.fn          = NULL;  /* compiled by the `jit` pass */
+    dst->launcher.variadic.fn          = nullptr;  /* compiled by the `jit` pass */
     dst->launcher.variadic.args        = args_buf;
-    dst->launcher.variadic.args_size   = n_args * sizeof(void *);
+    dst->launcher.variadic.n_args      = n_args;
     dst->launcher.variadic._args_owned = true;  /* heap (calloc) — the pass owns it */
 
     /* ------------------------------------------------------------------ *
@@ -1102,7 +1113,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         {
             free(progs[i]->launcher.variadic.args);
             progs[i]->launcher.variadic.args        = nullptr;
-            progs[i]->launcher.variadic.args_size   = 0;
+            progs[i]->launcher.variadic.n_args      = 0;
             progs[i]->launcher.variadic._args_owned = false;
         }
 
@@ -1324,7 +1335,9 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
         fprintf(stderr, "jit: could not resolve '%s' after JIT\n", lookup_name.c_str());
         abort();
     }
-    void * fn_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(sym->getValue()));
+    /* the compiled entry has the program launch shape `void(void**)` */
+    auto fn_ptr = reinterpret_cast<void (*)(void **)>(
+        static_cast<uintptr_t>(sym->getValue()));
 
     /* keep the JIT (hence the compiled code) alive for the process lifetime */
     jit.release();
