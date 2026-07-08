@@ -44,11 +44,16 @@
 //
 //   1. Argument deduplication. Each input program carries its argument pointers
 //      in `launcher.variadic.args` (one void* slot per kernel parameter, each
-//      the address of the actual value). Two parameters that receive the SAME
-//      slot (same void* address-of-value) are merged into a single slot in the
-//      fused args buffer; the wrapper routes both to that slot. The pass itself
-//      fills the (compacted) fused buffer at fusion time from the originals'
-//      slots, so the args are known/stable for every replay.
+//      the address of the actual value). Parameters with the same identity are
+//      merged into a single slot in the fused args buffer; the wrapper routes
+//      them all to that slot. Identity is by slot ADDRESS (device/host leaf
+//      kernels whose params already alias the same &value storage) or, for
+//      programs flagged value_dedup (OpenMP leaf task bodies), by the
+//      dereferenced VALUE+type: each task has its own storage for a firstprivate
+//      but the values are equal across the fused bodies, so merging them into a
+//      single hoisted load lets the fused loops share their trip counts/offsets
+//      and fuse. The pass fills the (compacted) fused buffer at fusion time from
+//      the originals' slots, so the args are known/stable for every replay.
 //
 //   2. noalias marking (restrict-like). For a kernel's pointer parameters, if
 //      the actual pointer value (deref of the slot) is distinct from the kernel's
@@ -203,6 +208,23 @@ find_packed_wrapper(llvm::Module & M)
             fty->getParamType(0)->isPointerTy())
             return &F;
     }
+    return nullptr;
+}
+
+/**
+ *  Return the first externally-linked, non-declaration function in the module.
+ *  serializeClosureToBitcode() externalizes exactly the closure's entry (its
+ *  callees stay internal), so for a task body serialized in leaf form this is
+ *  the leaf kernel `void .omp_task_kernel.(<captured values...>)` — a
+ *  void-returning function whose parameters are the individual captured values
+ *  (NOT the void** packed form). Returns nullptr if none.
+ */
+static llvm::Function *
+find_external_def(llvm::Module & M)
+{
+    for (llvm::Function & F : M)
+        if (!F.isDeclaration() && F.hasExternalLinkage())
+            return &F;
     return nullptr;
 }
 
@@ -502,10 +524,21 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      * ------------------------------------------------------------------ */
     struct fuse_input_t
     {
-        std::string         fused_name; /* entry name after prefixing */
-        bool                is_wrapper; /* true if entry is void(void**) */
-        unsigned            arity;      /* number of arg slots consumed */
-        std::vector<void *> slots;      /* the originals' arg slots (&value) */
+        std::string          fused_name;  /* entry name after prefixing */
+        bool                 is_wrapper;  /* true if entry is void(void**) */
+        unsigned             arity;       /* number of arg slots consumed */
+        std::vector<void *>  slots;       /* the originals' arg slots (&value) */
+        /* Deduplicate leaf slots by the DEREFERENCED value (not by slot address)
+         * for programs whose arg slots are per-task copies of a shared value
+         * (OpenMP leaf task bodies: each task has its own storage for a
+         * firstprivate, but the values are equal across the fused bodies). This
+         * merges them into one hoisted load so the fused loops share their trip
+         * count / offsets and LoopFuse can fire. Safe under the same frozen-
+         * taskgraph assumption replay already relies on (the recorded slots'
+         * values do not change between replays). Address dedup (false) is kept
+         * for device/host leaf kernels whose slots already alias by identity. */
+        bool                 value_dedup; /* dedup leaf slots by value, not addr */
+        std::vector<llvm::Type *> ptypes; /* leaf param types (for width/type key) */
     };
     std::vector<fuse_input_t> inputs(n);
 
@@ -516,24 +549,26 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         llvm::Function * entry = nullptr;
         bool is_wrapper = false;
         unsigned arity = 0;
+        bool value_dedup = false;
 
-        /* A task-spawn program uses the packed-args ABI: its entry is a
-         * `void(void**)` wrapper that consumes the whole recorded args block
-         * (e.g. an OpenMP outlined task body). Treat it as a wrapper so the
-         * fused wrapper hands it a void** slice (rather than dereferencing each
-         * slot as a leaf-kernel parameter). Its slot count is n_args.
+        /* A task-spawn program's outlined body comes in one of two forms:
          *
-         * NOTE (loop fusion): a task-spawn wrapper's args block is NOT
-         * deduplicated across fused programs — the outlined body reaches its
-         * captured data indirectly (e.g. via args[0] == kmp_task_t*, see XKOMP),
-         * not through distinct per-value slots. So consecutive wrappers fuse at
-         * the PROGRAM level (one __fused_wrapper calling each body), but their
-         * loops stay separate: the bodies keep distinct base pointers / index
-         * offsets, so LLVM cannot align/merge the loops. Leaf kernels (below),
-         * whose parameters ARE deduplicated by shared &value slot, are what
-         * enables cross-program loop fusion.
-         * TODO: to loop-fuse task bodies, expose their captured arrays/offsets as
-         * deduplicable leaf-kernel parameters instead of the args[0]==tt slice. */
+         *  - Leaf form (fusable): the serialized entry is the leaf kernel
+         *    `void .omp_task_kernel.(<captured values...>)` — a void function
+         *    with one parameter per captured (firstprivate) value, exposed so
+         *    its loops can be fused. Treat it like any other leaf kernel
+         *    (dereference each slot as a parameter, deduplicate), but dedup by
+         *    VALUE: each task has its OWN storage for the captured values, so
+         *    the slot addresses differ across bodies even when the values are
+         *    equal (see fuse_input_t::value_dedup).
+         *
+         *  - Classic (wrapper) form: the entry is the `void(void**)` proxy that
+         *    consumes the whole args block (args[0] == kmp_task_t*, captures
+         *    reached indirectly). Treat it as a wrapper handed a void** slice;
+         *    such bodies fuse only at the PROGRAM level (no loop fusion).
+         *
+         * We distinguish by the entry's signature: a `void(void**)` entry is the
+         * classic proxy; anything else is the leaf. */
         if (progs[i]->launch_mode == CGIR_COMMAND_PROG_LAUNCH_MODE_TASK_SPAWN)
         {
             if (const char * sym = progs[i]->source.content.llvmir.symbol)
@@ -541,15 +576,32 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             if (entry == nullptr)
                 entry = M.getFunction("__fused_wrapper");
             if (entry == nullptr)
-                entry = find_packed_wrapper(M);
+                entry = find_packed_wrapper(M);   /* classic void(void**) proxy */
+            if (entry == nullptr)
+                entry = find_external_def(M);      /* leaf .omp_task_kernel. */
             if (!entry || entry->isDeclaration())
             {
-                fprintf(stderr, "prog-fuse: no packed void(void**) entry found in "
-                                "task-spawn program %zu\n", i);
+                fprintf(stderr, "prog-fuse: no entry found in task-spawn program %zu\n", i);
                 abort();
             }
-            is_wrapper = true;
-            arity      = (unsigned) progs[i]->launcher.variadic.n_args;
+
+            llvm::FunctionType * fty = entry->getFunctionType();
+            const bool is_void_voidptr =
+                fty->getReturnType()->isVoidTy() &&
+                fty->getNumParams() == 1 &&
+                fty->getParamType(0)->isPointerTy();
+            if (is_void_voidptr)
+            {
+                is_wrapper = true;
+                arity      = (unsigned) progs[i]->launcher.variadic.n_args;
+            }
+            else
+            {
+                /* leaf form: one slot per captured value, deduplicated by value */
+                is_wrapper  = false;
+                arity       = fty->getNumParams();
+                value_dedup = true;
+            }
         }
 
         /* prefer the explicit entry symbol if the source carries one (e.g. a
@@ -607,24 +659,72 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         snprintf(prefix, sizeof(prefix), "__fz%zu_", i);
         prefix_functions(M, prefix);
 
-        inputs[i].fused_name = std::string(prefix) + name;
-        inputs[i].is_wrapper = is_wrapper;
-        inputs[i].arity      = arity;
+        inputs[i].fused_name  = std::string(prefix) + name;
+        inputs[i].is_wrapper  = is_wrapper;
+        inputs[i].arity       = arity;
+        inputs[i].value_dedup = value_dedup;
+
+        /* for value-deduplicated leaf inputs, snapshot the parameter types so the
+         * dedup key can read exactly the value bytes (and distinguish types) */
+        if (value_dedup && !is_wrapper)
+        {
+            llvm::FunctionType * fty = entry->getFunctionType();
+            inputs[i].ptypes.resize(arity);
+            for (unsigned k = 0 ; k < arity ; ++k)
+                inputs[i].ptypes[k] = fty->getParamType(k);
+        }
     }
 
     /* ------------------------------------------------------------------ *
      * 3b. Deduplicate argument slots across all leaf kernels.             *
      *                                                                     *
-     *  Two parameters that receive the SAME slot (same void* address) map  *
-     *  to a single compacted index. `unique_slots` becomes the fused args  *
-     *  buffer contents (in first-occurrence order). A wrapper input keeps  *
-     *  a contiguous (non-deduplicated) block, since it expects a void**    *
-     *  slice.                                                              *
+     *  Two parameters that map to the SAME identity collapse to a single   *
+     *  compacted index; `unique_slots` becomes the fused args buffer       *
+     *  contents (in first-occurrence order, storing the FIRST slot address *
+     *  seen). A wrapper input keeps a contiguous (non-deduplicated) block, *
+     *  since it expects a void** slice.                                    *
+     *                                                                      *
+     *  Identity is either:                                                 *
+     *   - by ADDRESS (default): two params sharing the same &value slot     *
+     *     are the same variable (device/host leaf kernels).                *
+     *   - by VALUE (value_dedup inputs): two params whose dereferenced      *
+     *     value (and type) are equal collapse even when their slot          *
+     *     addresses differ. OpenMP leaf task bodies need this: each task    *
+     *     has its own storage for a firstprivate, but the value is equal    *
+     *     across the fused bodies, and merging them into one hoisted load   *
+     *     is what lets the fused loops share trip counts/offsets and fuse.  *
      * ------------------------------------------------------------------ */
-    std::vector<void *>                  unique_slots;
-    std::unordered_map<void *, unsigned> slot_to_index;
-    std::vector<std::vector<unsigned>>   index_map(n);
-    std::vector<unsigned>                wrapper_block_start(n, 0);
+    std::vector<void *>                    unique_slots;
+    std::unordered_map<std::string, unsigned> slot_to_index;
+    std::vector<std::vector<unsigned>>     index_map(n);
+    std::vector<unsigned>                  wrapper_block_start(n, 0);
+
+    /* identity key for a leaf slot: "A" + slot address, or (value_dedup) "V" +
+     * param type + the value bytes read from the slot (exact type store width) */
+    auto slot_key = [&] (size_t i, unsigned j) -> std::string
+    {
+        void * s = inputs[i].slots[j];
+        if (inputs[i].value_dedup && s != nullptr && j < inputs[i].ptypes.size())
+        {
+            llvm::Type * Ty = inputs[i].ptypes[j];
+            uint64_t width = (mods[i] && Ty)
+                ? mods[i]->getDataLayout().getTypeStoreSize(Ty).getFixedValue()
+                : 0;
+            if (width > 0 && width <= 64)
+            {
+                std::string key;
+                key.push_back('V');
+                void * typ = (void *) Ty; /* types are uniqued in the shared ctx */
+                key.append(reinterpret_cast<const char *>(&typ), sizeof(typ));
+                key.append(reinterpret_cast<const char *>(s), (size_t) width);
+                return key;
+            }
+        }
+        std::string key;
+        key.push_back('A');
+        key.append(reinterpret_cast<const char *>(&s), sizeof(s));
+        return key;
+    };
 
     for (size_t i = 0 ; i < n ; ++i)
     {
@@ -639,14 +739,14 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             index_map[i].resize(inputs[i].arity);
             for (unsigned j = 0 ; j < inputs[i].arity ; ++j)
             {
-                void * s = inputs[i].slots[j];
-                auto it = slot_to_index.find(s);
+                std::string key = slot_key(i, j);
+                auto it = slot_to_index.find(key);
                 unsigned idx;
                 if (it == slot_to_index.end())
                 {
                     idx = (unsigned) unique_slots.size();
-                    unique_slots.push_back(s);
-                    slot_to_index[s] = idx;
+                    unique_slots.push_back(inputs[i].slots[j]);
+                    slot_to_index[key] = idx;
                 }
                 else
                 {
