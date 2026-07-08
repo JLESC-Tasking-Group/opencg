@@ -100,10 +100,37 @@ struct command_copy_2D_t
     size_t sizeof_type;
 };
 
+/* Which launcher variant of a PROG command is active, i.e. how the runtime must
+ * call its function pointer. Selects the `launcher` union member of
+ * command_prog_t. A recorded OpenMP task starts as KMP (its ahead-of-time
+ * routine) and the `jit` pass flips it to VARIADIC once it compiles the body. */
+typedef enum   command_prog_function_prototype_t
+{
+    /* launcher.fixed.fn(args[CGIR_CALLBACK_ARGS_MAX]) — a host callback with a
+     * fixed-size inline argument array (the C-API launcher path). */
+    CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_FIXED = 0,
+
+    /* launcher.variadic.fn(args) — the uniform program entry `void(void**)` used
+     * by JIT'd/fused host programs (the `__fused_wrapper`) and by device kernels
+     * (`args` is the CUDA/HIP kernelParams). The argument buffer lives in
+     * command_prog_t::args / ::n_args (not in the union). */
+    CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC,
+
+    /* launcher.kmp.fn(gtid, task) — an ahead-of-time-compiled OpenMP task body on
+     * the standard libomp routine ABI (kmp_int32 (*)(kmp_int32 gtid,
+     * kmp_task_t *)). Used to run a recorded task body directly when it has not
+     * been JIT-compiled into a VARIADIC program. */
+    CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_KMP
+
+}              command_prog_function_prototype_t;
+
 /* a prog to be submitted via (cuKernelLaunch, ...) */
 struct command_prog_t
 {
-    /* Program function and arguments */
+    /* which `launcher` member is active / how the runtime must call it */
+    command_prog_function_prototype_t prototype;
+
+    /* Program function pointer, in one of the prototypes above. */
     union {
 
         /* Fixed argument sizes */
@@ -113,26 +140,41 @@ struct command_prog_t
             void * args[CGIR_CALLBACK_ARGS_MAX];
         } fixed;
 
-        /* Program launched over an argument array.  `args` is an array of
-         * `n_args` pointers, one per program parameter, each pointing to the
-         * parameter's value (args[k] == &value) This is the uniform launch
-         * form for host/JIT'd programs (the fused `__fused_wrapper`) and for
-         * device kernels (the pointer array is the CUDA/HIP `kernelParams`).
-         * */
+        /* Uniform program entry `void(void**)`. The argument array lives in
+         * command_prog_t::args (below), NOT here, so it can coexist with a `kmp`
+         * ahead-of-time routine on the same command: prog-fuse reads the args to
+         * value-deduplicate leaf task bodies while an un-JIT'd command still
+         * carries its KMP routine as a direct-run fallback. */
         struct {
             void (*fn)(void ** args);   /* program entry: fn(args) */
-            void ** args;               /* array of pointers, one per parameter */
-            size_t  n_args;             /* number of pointers in `args` */
-
-            /* true iff `args` is a heap buffer owned by this prog (e.g. the
-             * compacted argument buffer produced by the prog-fuse pass). The
-             * owner frees `args` before overwriting/discarding it. Defaults to
-             * false (see command_t's constructor) so a caller-owned static or
-             * stack buffer is never freed on the first fusion. */
-            bool _args_owned;
         } variadic;
 
+        /* Ahead-of-time OpenMP task body on the standard libomp routine ABI:
+         * fn(gtid, task). `int` mirrors kmp_int32 and `task` the kmp_task_t*;
+         * kept generic so CGIR does not depend on the OpenMP headers. */
+        struct {
+            int   (*fn)(int gtid, void * task);
+            void  * task;
+        } kmp;
+
     } launcher;
+
+    /* Argument array for the VARIADIC launcher: `n_args` pointers, one per
+     * program parameter, each pointing to the parameter's value (args[k]==&value).
+     * This is the uniform launch buffer for host/JIT'd programs (the fused
+     * `__fused_wrapper`) and device kernels (the CUDA/HIP kernelParams). It is
+     * kept outside the launcher union so a recorded OpenMP task can hold both
+     * these args (for a later JIT and for prog-fuse value-dedup) and its KMP
+     * ahead-of-time routine at the same time. */
+    void ** args;               /* array of pointers, one per parameter */
+    size_t  n_args;             /* number of pointers in `args` */
+
+    /* true iff `args` is a heap buffer owned by this prog (e.g. the compacted
+     * argument buffer produced by the prog-fuse pass). The owner frees `args`
+     * before overwriting/discarding it. Defaults to false (see command_t's
+     * constructor) so a caller-owned static or stack buffer is never freed on the
+     * first fusion. */
+    bool _args_owned;
 
     // TODO: shouldnt this bellow be user-defined instead ?
 
@@ -241,7 +283,12 @@ struct command_t
             prog.source.content.llvmir.externs        = nullptr;
             prog.source.content.llvmir.externs_count  = 0;
             prog.source.content.llvmir._externs_owned = false;
-            prog.launcher.variadic._args_owned = false;
+            prog._args_owned = false;
+
+            /* Default function prototype: the uniform `void(void**)` variadic
+             * launcher. Producers override it (XKOMP's task recorder sets KMP,
+             * the C-API launcher path sets FIXED). */
+            prog.prototype = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC;
 
             /* Default launch mode: the launcher is invoked directly. Producers
              * (e.g. XKOMP's task recorder) overwrite this with TASK_SPAWN when

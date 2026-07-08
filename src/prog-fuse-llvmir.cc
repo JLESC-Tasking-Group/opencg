@@ -593,7 +593,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             if (is_void_voidptr)
             {
                 is_wrapper = true;
-                arity      = (unsigned) progs[i]->launcher.variadic.n_args;
+                arity      = (unsigned) progs[i]->n_args;
             }
             else
             {
@@ -629,7 +629,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
                 {
                     entry      = w;
                     is_wrapper = true;
-                    arity      = (unsigned) progs[i]->launcher.variadic.n_args;
+                    arity      = (unsigned) progs[i]->n_args;
                 }
             }
         }
@@ -643,7 +643,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         }
 
         /* snapshot the originals' argument slots (each is a void* = &value) */
-        void ** av = progs[i]->launcher.variadic.args;
+        void ** av = progs[i]->args;
         if (av == nullptr && arity > 0)
         {
             fprintf(stderr, "prog-fuse: program %zu has no variadic args populated "
@@ -1149,13 +1149,17 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      * may alias progs[0], whose arg slot VALUES were copied into unique_slots
      * in step 2/3b, so the old buffer is no longer referenced and is safe to
      * release here. */
-    if (dst->launcher.variadic._args_owned && dst->launcher.variadic.args)
-        free(dst->launcher.variadic.args);
+    if (dst->_args_owned && dst->args)
+        free(dst->args);
 
-    dst->launcher.variadic.fn          = nullptr;  /* compiled by the `jit` pass */
-    dst->launcher.variadic.args        = args_buf;
-    dst->launcher.variadic.n_args      = n_args;
-    dst->launcher.variadic._args_owned = true;  /* heap (calloc) — the pass owns it */
+    /* The fused program is a uniform void(void**) launcher; a fused chain has no
+     * single ahead-of-time KMP routine, so it MUST be JIT-compiled (the `jit`
+     * pass fills launcher.variadic.fn and keeps the VARIADIC prototype). */
+    dst->prototype             = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC;
+    dst->launcher.variadic.fn  = nullptr;  /* compiled by the `jit` pass */
+    dst->args                  = args_buf;
+    dst->n_args                = n_args;
+    dst->_args_owned           = true;  /* heap (calloc) — the pass owns it */
 
     /* ------------------------------------------------------------------ *
      * 11b. Propagate the launch parameters to the fused program.          *
@@ -1209,12 +1213,12 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             progs[i]->source.content.llvmir._owned = false;
         }
 
-        if (progs[i]->launcher.variadic._args_owned && progs[i]->launcher.variadic.args)
+        if (progs[i]->_args_owned && progs[i]->args)
         {
-            free(progs[i]->launcher.variadic.args);
-            progs[i]->launcher.variadic.args        = nullptr;
-            progs[i]->launcher.variadic.n_args      = 0;
-            progs[i]->launcher.variadic._args_owned = false;
+            free(progs[i]->args);
+            progs[i]->args        = nullptr;
+            progs[i]->n_args      = 0;
+            progs[i]->_args_owned = false;
         }
 
         /* release an owned externs table from a prior fusion (its entries were
@@ -1442,7 +1446,10 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
     /* keep the JIT (hence the compiled code) alive for the process lifetime */
     jit.release();
 
-    /* install the compiled function, overwriting any previous value */
+    /* install the compiled function, overwriting any previous value. The prog is
+     * now a uniform void(void**) program invoked over prog->args (a recorded
+     * OpenMP task was KMP before this; its recorded kargs stay in prog->args). */
+    prog->prototype            = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC;
     prog->launcher.variadic.fn = fn_ptr;
     # endif /* CGIR_SUPPORT_LLVM */
 }
