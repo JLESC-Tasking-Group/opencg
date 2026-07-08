@@ -140,11 +140,8 @@ struct command_prog_t
             void * args[CGIR_CALLBACK_ARGS_MAX];
         } fixed;
 
-        /* Uniform program entry `void(void**)`. The argument array lives in
-         * command_prog_t::args (below), NOT here, so it can coexist with a `kmp`
-         * ahead-of-time routine on the same command: prog-fuse reads the args to
-         * value-deduplicate leaf task bodies while an un-JIT'd command still
-         * carries its KMP routine as a direct-run fallback. */
+        /* Uniform program entry `void(void**)`. Its argument array lives in
+         * command_prog_t::args (below), not here. */
         struct {
             void (*fn)(void ** args);   /* program entry: fn(args) */
         } variadic;

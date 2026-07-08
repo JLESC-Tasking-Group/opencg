@@ -43,7 +43,7 @@
 // JIT-compiles it. Two optimizations are applied while building the wrapper:
 //
 //   1. Argument deduplication. Each input program carries its argument pointers
-//      in `launcher.variadic.args` (one void* slot per kernel parameter, each
+//      in `command_prog_t::args` (one void* slot per kernel parameter, each
 //      the address of the actual value). Parameters with the same identity are
 //      merged into a single slot in the fused args buffer; the wrapper routes
 //      them all to that slot. Identity is by slot ADDRESS (device/host leaf
@@ -186,6 +186,18 @@ find_kernel(llvm::Module & M)
     return nullptr;
 }
 
+/* True iff `fty` is the uniform program-launch shape `void(void**)`: a
+ * void-returning function taking a single pointer argument. This distinguishes a
+ * "packed" wrapper (the args[0]==tt kernel / the fused `__fused_wrapper`) from an
+ * "unpacked" leaf kernel that takes one parameter per captured value. */
+static bool
+is_void_voidptr(const llvm::FunctionType * fty)
+{
+    return fty->getReturnType()->isVoidTy() &&
+           fty->getNumParams() == 1 &&
+           fty->getParamType(0)->isPointerTy();
+}
+
 /**
  *  Return the first externally-linked `void(ptr)` definition in the module.
  *  This is the packed-args entry of a program whose launcher consumes a single
@@ -202,10 +214,7 @@ find_packed_wrapper(llvm::Module & M)
     {
         if (F.isDeclaration() || !F.hasExternalLinkage())
             continue;
-        llvm::FunctionType * fty = F.getFunctionType();
-        if (F.getReturnType()->isVoidTy() &&
-            fty->getNumParams() == 1 &&
-            fty->getParamType(0)->isPointerTy())
+        if (is_void_voidptr(F.getFunctionType()))
             return &F;
     }
     return nullptr;
@@ -226,6 +235,23 @@ find_external_def(llvm::Module & M)
         if (!F.isDeclaration() && F.hasExternalLinkage())
             return &F;
     return nullptr;
+}
+
+/* Unpack args[idx] (a void* == &value) to a value of type T:
+ *   %slot  = getelementptr ptr, %args_ptr, idx
+ *   %voidp = load ptr, %slot
+ *   %val   = load T, %voidp
+ * Shared by the fused `__fused_wrapper` and the JIT fallback wrapper, both of
+ * which consume the uniform void** args buffer. */
+static llvm::Value *
+emit_load_arg(llvm::IRBuilder<> & b, llvm::Value * args_ptr, unsigned idx,
+              llvm::Type * T)
+{
+    llvm::Type * ptr_ty = llvm::PointerType::getUnqual(b.getContext());
+    llvm::Value * slot  = b.CreateGEP(
+        ptr_ty, args_ptr, llvm::ConstantInt::get(b.getInt64Ty(), idx), "slot");
+    llvm::Value * voidp = b.CreateLoad(ptr_ty, slot, "voidp");
+    return b.CreateLoad(T, voidp, "argval");
 }
 
 /* One-time LLVM target/codegen initialization, shared by the fuse and jit
@@ -322,42 +348,35 @@ optimize_module(llvm::Module & M, llvm::TargetMachine * tm)
 }
 
 /* ------------------------------------------------------------------------- *
- * Debug dump option (CGIR_PROG_FUSE_DUMP).                                   *
+ * Debug dump options, shared by the fuse and jit passes.                     *
  *                                                                           *
- * Like CGIR_OPTIMIZER, this is controlled by an environment variable that is *
- * read once and cached. When CGIR_PROG_FUSE_DUMP is set (to anything other  *
- * than "" or "0"), each fusion writes the input IR modules and their fused/  *
- * optimized result as textual .ll files, so the transformation can be        *
- * visualized:                                                                *
+ * Controlled by an environment variable (read on each pass). When set (to    *
+ * anything other than "" or "0"), each fusion / JIT writes its IR as textual  *
+ * .ll files under <base>/<prefix>-<seq>/, so the transformation can be        *
+ * visualized. <base> is ~/.cgir/tmp by default, or the env var's value when  *
+ * it is an absolute path (so the output location can be overridden). <seq> is *
+ * a per-process counter so concurrent runs do not clobber each other.        *
  *                                                                           *
- *   <base>/prog-fuse-<seq>/input-<i>.ll   (each original program, as parsed) *
- *   <base>/prog-fuse-<seq>/merged.ll      (linked + wrapper, before O3)      *
- *   <base>/prog-fuse-<seq>/fused.ll       (after the O3 fusion pipeline)     *
- *                                                                           *
- * <base> is ~/.cgir/tmp by default, or the value of CGIR_PROG_FUSE_DUMP when *
- * it is an absolute path (so the output location can be overridden). <seq>   *
- * is a per-process counter so concurrent fusions do not clobber each other.  *
+ *   CGIR_PROG_FUSE_DUMP -> <base>/prog-fuse-<seq>/{input-<i>,merged,fused}.ll *
+ *   CGIR_JIT_DUMP       -> <base>/jit-<seq>/{input,final}.ll                  *
  * ------------------------------------------------------------------------- */
+
+/* True iff the dump env var `var` is set to a non-empty, non-"0" value. */
 static bool
-prog_fuse_dump_enabled(void)
+dump_enabled(const char * var)
 {
-    static int enabled = -1;
-    if (enabled == -1)
-    {
-        const char * s = getenv("CGIR_PROG_FUSE_DUMP");
-        enabled = (s && s[0] != '\0' && strcmp(s, "0") != 0) ? 1 : 0;
-    }
-    return (bool) enabled;
+    const char * s = getenv(var);
+    return s && s[0] != '\0' && strcmp(s, "0") != 0;
 }
 
-/* Create (mkdir -p) a fresh per-fusion dump directory and return its path, or
- * an empty string on failure. */
+/* Create (mkdir -p) a fresh dump directory <base>/<prefix>-<seq> and return its
+ * path, or an empty string on failure (see the block comment above). */
 static std::string
-prog_fuse_dump_make_dir(void)
+dump_make_dir(const char * var, const char * prefix)
 {
-    /* base directory: an absolute CGIR_PROG_FUSE_DUMP value, else ~/.cgir/tmp */
+    /* base directory: an absolute `var` value, else ~/.cgir/tmp */
     std::string base;
-    const char * s = getenv("CGIR_PROG_FUSE_DUMP");
+    const char * s = getenv(var);
     if (s && s[0] == '/')
     {
         base = s;
@@ -370,13 +389,13 @@ prog_fuse_dump_make_dir(void)
     }
 
     static std::atomic<unsigned> seq{0};
-    char sub[32];
-    snprintf(sub, sizeof(sub), "/prog-fuse-%u", seq.fetch_add(1));
+    char sub[48];
+    snprintf(sub, sizeof(sub), "/%s-%u", prefix, seq.fetch_add(1));
     std::string dir = base + sub;
 
     if (std::error_code ec = llvm::sys::fs::create_directories(dir))
     {
-        fprintf(stderr, "prog-fuse: cannot create dump dir '%s': %s\n",
+        fprintf(stderr, "cgir: cannot create dump dir '%s': %s\n",
                 dir.c_str(), ec.message().c_str());
         return std::string();
     }
@@ -385,7 +404,7 @@ prog_fuse_dump_make_dir(void)
 
 /* Write `M` as textual IR to <dir>/<name>. No-op if `dir` is empty. */
 static void
-prog_fuse_dump_module(const std::string & dir, const char * name, llvm::Module & M)
+dump_module(const std::string & dir, const char * name, llvm::Module & M)
 {
     if (dir.empty())
         return ;
@@ -395,67 +414,10 @@ prog_fuse_dump_module(const std::string & dir, const char * name, llvm::Module &
     llvm::raw_fd_ostream os(path, ec, llvm::sys::fs::OF_Text);
     if (ec)
     {
-        fprintf(stderr, "prog-fuse: cannot write '%s': %s\n", path.c_str(), ec.message().c_str());
+        fprintf(stderr, "cgir: cannot write '%s': %s\n", path.c_str(), ec.message().c_str());
         return ;
     }
     M.print(os, /* AssemblyAnnotationWriter */ nullptr);
-}
-
-/* ------------------------------------------------------------------------- *
- * Debug dump option (CGIR_JIT_DUMP), mirroring CGIR_PROG_FUSE_DUMP but for   *
- * the `jit` pass. When set (to anything other than "" or "0"), each JIT of a *
- * PROG writes its IR before and after the pass's own transforms (entry       *
- * externalization / wrapper synthesis), so what is handed to the JIT can be  *
- * inspected:                                                                 *
- *                                                                           *
- *   <base>/jit-<seq>/input.ll   (the program IR, as parsed)                  *
- *   <base>/jit-<seq>/final.ll   (after wrapper synthesis, fed to the JIT)    *
- *                                                                           *
- * <base> is ~/.cgir/tmp by default, or the value of CGIR_JIT_DUMP when it is *
- * an absolute path. <seq> is a per-process counter.                          *
- * ------------------------------------------------------------------------- */
-static bool
-jit_dump_enabled(void)
-{
-    static int enabled = -1;
-    if (enabled == -1)
-    {
-        const char * s = getenv("CGIR_JIT_DUMP");
-        enabled = (s && s[0] != '\0' && strcmp(s, "0") != 0) ? 1 : 0;
-    }
-    return (bool) enabled;
-}
-
-/* Create (mkdir -p) a fresh per-jit dump directory and return its path, or an
- * empty string on failure. */
-static std::string
-jit_dump_make_dir(void)
-{
-    std::string base;
-    const char * s = getenv("CGIR_JIT_DUMP");
-    if (s && s[0] == '/')
-    {
-        base = s;
-    }
-    else
-    {
-        const char * home = getenv("HOME");
-        base  = home ? home : ".";
-        base += "/.cgir/tmp";
-    }
-
-    static std::atomic<unsigned> seq{0};
-    char sub[32];
-    snprintf(sub, sizeof(sub), "/jit-%u", seq.fetch_add(1));
-    std::string dir = base + sub;
-
-    if (std::error_code ec = llvm::sys::fs::create_directories(dir))
-    {
-        fprintf(stderr, "jit: cannot create dump dir '%s': %s\n",
-                dir.c_str(), ec.message().c_str());
-        return std::string();
-    }
-    return dir;
 }
 
 # endif /* CGIR_SUPPORT_LLVM */
@@ -480,8 +442,8 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
 
     /* Optional IR dumping for debugging (CGIR_PROG_FUSE_DUMP). When enabled, a
      * fresh per-fusion directory receives the input, merged and fused IR. */
-    const bool  dump     = prog_fuse_dump_enabled();
-    std::string dump_dir = dump ? prog_fuse_dump_make_dir() : std::string();
+    const bool  dump     = dump_enabled("CGIR_PROG_FUSE_DUMP");
+    std::string dump_dir = dump ? dump_make_dir("CGIR_PROG_FUSE_DUMP", "prog-fuse") : std::string();
 
     /* ------------------------------------------------------------------ *
      * 1. Parse all N IR modules into the SAME LLVMContext                 *
@@ -508,19 +470,19 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         {
             char name[32];
             snprintf(name, sizeof(name), "input-%zu.ll", i);
-            prog_fuse_dump_module(dump_dir, name, *mods[i]);
+            dump_module(dump_dir, name, *mods[i]);
         }
     }
 
     /* ------------------------------------------------------------------ *
      * 2/3. Per input: identify the entry function and arity, snapshot its *
-     *      argument slots (from launcher.variadic.args), then prefix-rename*
+     *      argument slots (from command_prog_t::args), then prefix-rename  *
      *      its definitions so they do not clash on link.                  *
      *                                                                     *
      *  An entry is the program's kernel (first void definition). A program *
      *  that is itself a previously-fused module instead exposes a          *
      *  `void __fused_wrapper(void**)` entry; its arity comes from the      *
-     *  recorded launcher.variadic.n_args and it is invoked on a slice.     *
+     *  recorded command_prog_t::n_args and it is invoked on a slice.       *
      * ------------------------------------------------------------------ */
     struct fuse_input_t
     {
@@ -551,24 +513,14 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         unsigned arity = 0;
         bool value_dedup = false;
 
-        /* A task-spawn program's outlined body comes in one of two forms:
-         *
-         *  - Leaf form (fusable): the serialized entry is the leaf kernel
-         *    `void .omp_task_kernel.(<captured values...>)` — a void function
-         *    with one parameter per captured (firstprivate) value, exposed so
-         *    its loops can be fused. Treat it like any other leaf kernel
-         *    (dereference each slot as a parameter, deduplicate), but dedup by
-         *    VALUE: each task has its OWN storage for the captured values, so
-         *    the slot addresses differ across bodies even when the values are
-         *    equal (see fuse_input_t::value_dedup).
-         *
-         *  - Classic (wrapper) form: the entry is the `void(void**)` proxy that
-         *    consumes the whole args block (args[0] == kmp_task_t*, captures
-         *    reached indirectly). Treat it as a wrapper handed a void** slice;
-         *    such bodies fuse only at the PROGRAM level (no loop fusion).
-         *
-         * We distinguish by the entry's signature: a `void(void**)` entry is the
-         * classic proxy; anything else is the leaf. */
+        /* A task-spawn body comes in one of two forms, distinguished by the
+         * entry signature:
+         *  - unpacked (fusable): `void .omp_task_kernel.(<captured values...>)`,
+         *    one parameter per captured value, so its loops can be fused. Deduped
+         *    by VALUE (each task has its own storage, so slot addresses differ
+         *    across bodies even when values are equal; see value_dedup).
+         *  - packed: the `void(void**)` kernel consuming the whole args block
+         *    (args[0] == kmp_task_t*); fuses only at the PROGRAM level. */
         if (progs[i]->launch_mode == CGIR_COMMAND_PROG_LAUNCH_MODE_TASK_SPAWN)
         {
             if (const char * sym = progs[i]->source.content.llvmir.symbol)
@@ -576,9 +528,9 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             if (entry == nullptr)
                 entry = M.getFunction("__fused_wrapper");
             if (entry == nullptr)
-                entry = find_packed_wrapper(M);   /* classic void(void**) proxy */
+                entry = find_packed_wrapper(M);   /* packed void(void**) kernel */
             if (entry == nullptr)
-                entry = find_external_def(M);      /* leaf .omp_task_kernel. */
+                entry = find_external_def(M);      /* unpacked .omp_task_kernel. */
             if (!entry || entry->isDeclaration())
             {
                 fprintf(stderr, "prog-fuse: no entry found in task-spawn program %zu\n", i);
@@ -586,11 +538,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             }
 
             llvm::FunctionType * fty = entry->getFunctionType();
-            const bool is_void_voidptr =
-                fty->getReturnType()->isVoidTy() &&
-                fty->getNumParams() == 1 &&
-                fty->getParamType(0)->isPointerTy();
-            if (is_void_voidptr)
+            if (is_void_voidptr(fty))
             {
                 is_wrapper = true;
                 arity      = (unsigned) progs[i]->n_args;
@@ -623,9 +571,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         {
             if (llvm::Function * w = M.getFunction("__fused_wrapper"))
             {
-                if (!w->isDeclaration() &&
-                    w->getReturnType()->isVoidTy() &&
-                    w->getFunctionType()->getNumParams() == 1)
+                if (!w->isDeclaration() && is_void_voidptr(w->getFunctionType()))
                 {
                     entry      = w;
                     is_wrapper = true;
@@ -828,10 +774,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     /* load args[idx] (a void* = &value) and dereference to a value of type T */
     auto load_arg = [&] (unsigned idx, llvm::Type * T) -> llvm::Value *
     {
-        llvm::Value * slot  = builder.CreateGEP(ptr_ty, args_ptr,
-                                  llvm::ConstantInt::get(i64_ty, idx), "slot");
-        llvm::Value * voidp = builder.CreateLoad(ptr_ty, slot, "voidp");
-        return builder.CreateLoad(T, voidp, "argval");
+        return emit_load_arg(builder, args_ptr, idx, T);
     };
 
     /* &args[off] : a void** slice, for a sub-wrapper call */
@@ -1030,7 +973,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
 
     /* dump the merged module (wrapper + constituents) before optimization */
     if (dump)
-        prog_fuse_dump_module(dump_dir, "merged.ll", *mod_u);
+        dump_module(dump_dir, "merged.ll", *mod_u);
 
     /* ------------------------------------------------------------------ *
      * 8. Optimize (inline the kernels into the wrapper, vectorize, fuse).  *
@@ -1041,7 +984,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     /* dump the final fused/optimized module */
     if (dump)
     {
-        prog_fuse_dump_module(dump_dir, "fused.ll", *mod_u);
+        dump_module(dump_dir, "fused.ll", *mod_u);
         fprintf(stderr, "prog-fuse: dumped %zu input(s) + merged + fused IR to %s\n",
                 n, dump_dir.c_str());
     }
@@ -1253,8 +1196,8 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
     ensure_llvm_initialized();
 
     /* Optional IR dumping for debugging (CGIR_JIT_DUMP). */
-    const bool  dump     = jit_dump_enabled();
-    std::string dump_dir = dump ? jit_dump_make_dir() : std::string();
+    const bool  dump     = dump_enabled("CGIR_JIT_DUMP");
+    std::string dump_dir = dump ? dump_make_dir("CGIR_JIT_DUMP", "jit") : std::string();
 
     /* parse the program's IR/bitcode into its own context */
     auto ctx = std::make_unique<llvm::LLVMContext>();
@@ -1267,7 +1210,7 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
 
     /* dump the program IR as parsed, before any transform */
     if (dump)
-        prog_fuse_dump_module(dump_dir, "input.ll", *mod);
+        dump_module(dump_dir, "input.ll", *mod);
 
     /* Resolve the entry function: prefer the explicit symbol (e.g. a device
      * kernel sub-module with several definitions); else a fused program exposes
@@ -1302,13 +1245,8 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
      * otherwise synthesize a wrapper that unpacks the argument slots and calls
      * the entry (ignoring any return value). */
     llvm::FunctionType * efty = entry->getFunctionType();
-    const bool is_void_voidptr =
-        efty->getReturnType()->isVoidTy() &&
-        efty->getNumParams() == 1 &&
-        efty->getParamType(0)->isPointerTy();
-
     std::string lookup_name;
-    if (is_void_voidptr)
+    if (is_void_voidptr(efty))
     {
         lookup_name = entry->getName().str();
     }
@@ -1317,7 +1255,6 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
         llvm::LLVMContext & C = mod->getContext();
         llvm::Type * void_ty = llvm::Type::getVoidTy(C);
         llvm::Type * ptr_ty  = llvm::PointerType::getUnqual(C);
-        llvm::Type * i64_ty  = llvm::Type::getInt64Ty(C);
 
         llvm::FunctionType * wfty = llvm::FunctionType::get(void_ty, { ptr_ty }, false);
         llvm::Function * wrapper = llvm::Function::Create(
@@ -1330,11 +1267,7 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
         std::vector<llvm::Value *> call_args;
         call_args.reserve(efty->getNumParams());
         for (unsigned k = 0 ; k < efty->getNumParams() ; ++k)
-        {
-            llvm::Value * slot  = b.CreateGEP(ptr_ty, args_ptr, llvm::ConstantInt::get(i64_ty, k), "slot");
-            llvm::Value * voidp = b.CreateLoad(ptr_ty, slot, "voidp");
-            call_args.push_back(b.CreateLoad(efty->getParamType(k), voidp, "argval"));
-        }
+            call_args.push_back(emit_load_arg(b, args_ptr, k, efty->getParamType(k)));
         b.CreateCall(efty, entry, call_args);
         b.CreateRetVoid();
 
@@ -1352,7 +1285,7 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
 
     /* dump the final IR handed to the JIT (with wrapper synthesis, if any) */
     if (dump)
-        prog_fuse_dump_module(dump_dir, "final.ll", *mod);
+        dump_module(dump_dir, "final.ll", *mod);
 
     /* JIT-compile in-process (large code model, see above) */
     auto jtmb = llvm::orc::JITTargetMachineBuilder::detectHost();
