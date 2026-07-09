@@ -50,6 +50,9 @@ CGIR_NAMESPACE_BEGIN
 typedef ::cgir_command_prog_source_t        command_prog_source_t;
 typedef ::cgir_command_prog_source_type_t   command_prog_source_type_t;
 typedef ::cgir_command_prog_extern_t        command_prog_extern_t;
+typedef ::cgir_command_prog_source_proto_t  command_prog_source_proto_t;
+typedef ::cgir_command_prog_param_t         command_prog_param_t;
+typedef ::cgir_command_prog_param_kind_t    command_prog_param_kind_t;
 
 constexpr command_prog_source_type_t COMMAND_PROG_SOURCE_TYPE_LLVMIR = ::CGIR_COMMAND_PROG_SOURCE_TYPE_LLVMIR;
 constexpr command_prog_source_type_t COMMAND_PROG_SOURCE_TYPE_MLIR   = ::CGIR_COMMAND_PROG_SOURCE_TYPE_MLIR;
@@ -120,7 +123,14 @@ typedef enum   command_prog_function_prototype_t
      * the standard libomp routine ABI (kmp_int32 (*)(kmp_int32 gtid,
      * kmp_task_t *)). Used to run a recorded task body directly when it has not
      * been JIT-compiled into a VARIADIC program. */
-    CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_KMP
+    CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_KMP,
+
+    /* launcher.packed.fn(args, args_size) — a program over a single packed byte
+     * buffer (leading by-reference pointers, then inline by-value copies). The
+     * buffer is command_prog_t::args and its size command_prog_t::args_size. Used
+     * by JIT'd/fused programs compiled in the packed ABI and by device kernels
+     * launched via the CUDA/HIP parameter-buffer form. */
+    CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED
 
 }              command_prog_function_prototype_t;
 
@@ -154,6 +164,13 @@ struct command_prog_t
             void  * task;
         } kmp;
 
+        /* Program over a packed byte buffer: fn(args, args_size). The buffer is
+         * command_prog_t::args (reinterpreted as bytes) and its length
+         * command_prog_t::args_size. */
+        struct {
+            void (*fn)(void * args, size_t args_size);
+        } packed;
+
     } launcher;
 
     /* Argument array for the VARIADIC launcher: `n_args` pointers, one per
@@ -165,6 +182,10 @@ struct command_prog_t
      * ahead-of-time routine at the same time. */
     void ** args;               /* array of pointers, one per parameter */
     size_t  n_args;             /* number of pointers in `args` */
+
+    /* For the PACKED launcher: byte size of the `args` buffer (which is then a
+     * single packed byte block, not a pointer array). Unused by VARIADIC. */
+    size_t  args_size;
 
     /* true iff `args` is a heap buffer owned by this prog (e.g. the compacted
      * argument buffer produced by the prog-fuse pass). The owner frees `args`
@@ -280,12 +301,17 @@ struct command_t
             prog.source.content.llvmir.externs        = nullptr;
             prog.source.content.llvmir.externs_count  = 0;
             prog.source.content.llvmir._externs_owned = false;
+            prog.source.content.llvmir.proto          = CGIR_COMMAND_PROG_SOURCE_PROTO_UNPACKED_PARAMS;
+            prog.source.content.llvmir.params         = nullptr;
+            prog.source.content.llvmir.param_count    = 0;
+            prog.source.content.llvmir._params_owned  = false;
             prog._args_owned = false;
 
             /* Default function prototype: the uniform `void(void**)` variadic
              * launcher. Producers override it (XKOMP's task recorder sets KMP,
              * the C-API launcher path sets FIXED). */
             prog.prototype = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC;
+            prog.args_size = 0;
 
             /* Default launch mode: the launcher is invoked directly. Producers
              * (e.g. XKOMP's task recorder) overwrite this with TASK_SPAWN when

@@ -70,6 +70,40 @@ typedef enum    cgir_command_prog_source_type_t
 
 }               cgir_command_prog_source_type_t;
 
+/* Prototype (ABI) of a program's entry function within `raw`, so the fuse/jit
+ * passes know how it consumes its arguments. */
+typedef enum    cgir_command_prog_source_proto_t
+{
+    /* void kernel(v0, v1, ...): one value parameter per capture (the fusion
+     * unit; each parameter is described by cgir_command_prog_param_t below). */
+    CGIR_COMMAND_PROG_SOURCE_PROTO_UNPACKED_PARAMS = 0,
+
+    /* void kernel(void ** args): a single args block (args[0] == the task, or a
+     * previously-fused __fused_wrapper). */
+    CGIR_COMMAND_PROG_SOURCE_PROTO_VOID_PTRPTR,
+
+    /* void kernel(void * args, size_t args_size): a packed byte buffer (leading
+     * by-reference pointers, then inline by-value copies). */
+    CGIR_COMMAND_PROG_SOURCE_PROTO_PACKED_BUFFER
+
+}               cgir_command_prog_source_proto_t;
+
+/* Whether an entry parameter is passed by reference or by value/copy. */
+typedef enum    cgir_command_prog_param_kind_t
+{
+    CGIR_COMMAND_PROG_PARAM_REFERENCE = 0,  /* shared: the arg slot holds a pointer */
+    CGIR_COMMAND_PROG_PARAM_COPY            /* firstprivate: the arg slot holds a copy */
+}               cgir_command_prog_param_kind_t;
+
+/* Descriptor of one entry parameter: its passing kind and byte size. Lets the
+ * fuse pass deduplicate references by pointer and copies by memcmp over `size`
+ * bytes. C-compatible POD. */
+typedef struct  cgir_command_prog_param_t
+{
+    cgir_command_prog_param_kind_t kind;
+    size_t                         size;   /* byte size of the value */
+}               cgir_command_prog_param_t;
+
 /* One entry of a program's externalized-global resolution table: a symbol that
  * appears as an *external declaration* in the program's IR (`raw`) together with
  * the real runtime address it must bind to. Producers (e.g. a compiler emitting
@@ -122,6 +156,17 @@ typedef struct  cgir_command_prog_source_t
              * tables are non-owning (compile-time constants); defaults to false
              * (see command_t's constructor). */
             bool _externs_owned;
+
+            /* prototype (ABI) of the entry function within `raw` (see enum). */
+            cgir_command_prog_source_proto_t proto;
+
+            /* per-parameter descriptors of the entry function, in order (see
+             * cgir_command_prog_param_t): whether each argument is by reference
+             * (shared) or by copy (firstprivate) and its byte size. NULL/0 when
+             * unknown (the fuse pass then falls back to a size heuristic). */
+            const cgir_command_prog_param_t * params;
+            size_t param_count;
+            bool   _params_owned;   /* true iff `params` is a heap buffer this source owns */
         } llvmir;
     } content;
 

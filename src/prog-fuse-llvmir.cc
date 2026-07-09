@@ -198,6 +198,17 @@ is_void_voidptr(const llvm::FunctionType * fty)
            fty->getParamType(0)->isPointerTy();
 }
 
+/* True iff `fty` is the packed-buffer launch shape `void(void*, size_t)`: a
+ * void-returning function taking a byte-buffer pointer and its size. */
+static bool
+is_void_ptr_size(const llvm::FunctionType * fty)
+{
+    return fty->getReturnType()->isVoidTy() &&
+           fty->getNumParams() == 2 &&
+           fty->getParamType(0)->isPointerTy() &&
+           fty->getParamType(1)->isIntegerTy();
+}
+
 /**
  *  Return the first externally-linked `void(ptr)` definition in the module.
  *  This is the packed-args entry of a program whose launcher consumes a single
@@ -501,6 +512,12 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
          * for device/host leaf kernels whose slots already alias by identity. */
         bool                 value_dedup; /* dedup leaf slots by value, not addr */
         std::vector<llvm::Type *> ptypes; /* leaf param types (for width/type key) */
+        /* Per-parameter kind+size from the source (cgir_command_prog_param_t), when
+         * the compiler forwarded them. When present, dedup is EXPLICIT: a REFERENCE
+         * (shared) slot dedups by its pointer value, a COPY (firstprivate) slot by
+         * memcmp over `size` bytes (any size). NULL => fall back to `ptypes`/width. */
+        const command_prog_param_t * params;
+        size_t                       param_count;
     };
     std::vector<fuse_input_t> inputs(n);
 
@@ -609,6 +626,8 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         inputs[i].is_wrapper  = is_wrapper;
         inputs[i].arity       = arity;
         inputs[i].value_dedup = value_dedup;
+        inputs[i].params      = progs[i]->source.content.llvmir.params;
+        inputs[i].param_count = progs[i]->source.content.llvmir.param_count;
 
         /* for value-deduplicated leaf inputs, snapshot the parameter types so the
          * dedup key can read exactly the value bytes (and distinguish types) */
@@ -645,11 +664,28 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     std::vector<std::vector<unsigned>>     index_map(n);
     std::vector<unsigned>                  wrapper_block_start(n, 0);
 
-    /* identity key for a leaf slot: "A" + slot address, or (value_dedup) "V" +
-     * param type + the value bytes read from the slot (exact type store width) */
+    /* Identity key for a leaf slot. When the compiler forwarded per-parameter
+     * descriptors (kind+size), dedup is EXPLICIT: a REFERENCE (shared) slot by
+     * its pointer value, a COPY (firstprivate) slot by memcmp over `size` bytes
+     * (any size). Otherwise fall back to the value_dedup width heuristic ("V" +
+     * type + bytes, scalars <=64b) and finally to "A" + slot address. */
     auto slot_key = [&] (size_t i, unsigned j) -> std::string
     {
         void * s = inputs[i].slots[j];
+        if (s != nullptr && inputs[i].params != nullptr && j < inputs[i].param_count)
+        {
+            const command_prog_param_t & p = inputs[i].params[j];
+            const size_t K = (p.kind == CGIR_COMMAND_PROG_PARAM_COPY)
+                ? p.size : sizeof(void *);
+            if (K > 0)
+            {
+                std::string key;
+                key.push_back(p.kind == CGIR_COMMAND_PROG_PARAM_COPY ? 'C' : 'R');
+                key.append(reinterpret_cast<const char *>(&K), sizeof(K));
+                key.append(reinterpret_cast<const char *>(s), K);
+                return key;
+            }
+        }
         if (inputs[i].value_dedup && s != nullptr && j < inputs[i].ptypes.size())
         {
             llvm::Type * Ty = inputs[i].ptypes[j];
@@ -754,35 +790,9 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     llvm::LLVMContext & llvmctx = mod_u->getContext();
     llvm::Type * void_ty = llvm::Type::getVoidTy(llvmctx);
     llvm::Type * ptr_ty  = llvm::PointerType::getUnqual(llvmctx);
+    llvm::Type * i8_ty   = llvm::Type::getInt8Ty(llvmctx);
     llvm::Type * i64_ty  = llvm::Type::getInt64Ty(llvmctx);
-
-    llvm::FunctionType * wrapper_fty = llvm::FunctionType::get(void_ty, { ptr_ty }, false);
-    llvm::Function * wrapper = llvm::Function::Create(
-        wrapper_fty, llvm::GlobalValue::ExternalLinkage, "__fused_wrapper", mod_u.get());
-
-    /* The args buffer is a distinct allocation from the data the kernels read
-     * and write, so mark it noalias: this frees the slot-table loads from being
-     * clobbered by the kernels' stores, so they can be hoisted/CSE'd. (The data
-     * arrays are kept independent of each other by the shared-domain scoped
-     * noalias metadata attached in step 6b.) Both help loop-fusion/vectorization. */
-    wrapper->addParamAttr(0, llvm::Attribute::NoAlias);
-
-    llvm::BasicBlock * bb = llvm::BasicBlock::Create(llvmctx, "entry", wrapper);
-    llvm::IRBuilder<> builder(bb);
-    llvm::Value * args_ptr = wrapper->getArg(0);
-
-    /* load args[idx] (a void* = &value) and dereference to a value of type T */
-    auto load_arg = [&] (unsigned idx, llvm::Type * T) -> llvm::Value *
-    {
-        return emit_load_arg(builder, args_ptr, idx, T);
-    };
-
-    /* &args[off] : a void** slice, for a sub-wrapper call */
-    auto slice_ptr = [&] (unsigned off) -> llvm::Value *
-    {
-        return builder.CreateGEP(ptr_ty, args_ptr,
-                                 llvm::ConstantInt::get(i64_ty, off), "slice");
-    };
+    const llvm::DataLayout & DL = mod_u->getDataLayout();
 
     /* Determine the value type of each deduplicated leaf slot from its first
      * use. Every kernel sharing a slot must read it as the same type (the slot
@@ -804,6 +814,72 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
                 assert(slot_type[idx] == T && "deduplicated arg slot used with inconsistent types");
         }
     }
+
+    /* Optional packed output ABI (CGIR_PROG_FUSE_PACKED): emit the fused entry as
+     * `void(void*, size_t)` over a single packed byte buffer -- each deduplicated
+     * slot inlined at a fixed (naturally-aligned) offset -- instead of
+     * `void(void**)` over a pointer array. Enabled only when every input is a leaf
+     * (a nested void** sub-wrapper needs a pointer slice the buffer cannot give).
+     * The dedup/inline/noalias logic is identical; only the arg access shape and
+     * the recorded args buffer differ. */
+    bool packed_output = dump_enabled("CGIR_PROG_FUSE_PACKED");
+    for (size_t i = 0 ; packed_output && i < n ; ++i)
+        if (inputs[i].is_wrapper)
+            packed_output = false;
+
+    std::vector<size_t> slot_offset(total_args, 0);
+    size_t packed_size = 0;
+    if (packed_output)
+    {
+        for (unsigned k = 0 ; k < total_args ; ++k)
+        {
+            llvm::Type * T = slot_type[k] ? slot_type[k] : ptr_ty;
+            const size_t sz = (size_t) DL.getTypeStoreSize(T).getFixedValue();
+            const size_t al = (size_t) DL.getABITypeAlign(T).value();
+            packed_size = (packed_size + al - 1) & ~(al - 1);
+            slot_offset[k] = packed_size;
+            packed_size += sz;
+        }
+        if (packed_size == 0)
+            packed_size = 1;
+    }
+
+    llvm::FunctionType * wrapper_fty = packed_output
+        ? llvm::FunctionType::get(void_ty, { ptr_ty, i64_ty }, false)
+        : llvm::FunctionType::get(void_ty, { ptr_ty }, false);
+    llvm::Function * wrapper = llvm::Function::Create(
+        wrapper_fty, llvm::GlobalValue::ExternalLinkage, "__fused_wrapper", mod_u.get());
+
+    /* The args buffer is a distinct allocation from the data the kernels read
+     * and write, so mark it noalias: this frees the slot-table loads from being
+     * clobbered by the kernels' stores, so they can be hoisted/CSE'd. (The data
+     * arrays are kept independent of each other by the shared-domain scoped
+     * noalias metadata attached in step 6b.) Both help loop-fusion/vectorization. */
+    wrapper->addParamAttr(0, llvm::Attribute::NoAlias);
+
+    llvm::BasicBlock * bb = llvm::BasicBlock::Create(llvmctx, "entry", wrapper);
+    llvm::IRBuilder<> builder(bb);
+    llvm::Value * args_ptr = wrapper->getArg(0);
+
+    /* Load slot `idx` as type T. void** form: args[idx] is a &value (double load).
+     * packed form: the value is inline at args_ptr + slot_offset[idx] (one load). */
+    auto load_arg = [&] (unsigned idx, llvm::Type * T) -> llvm::Value *
+    {
+        if (packed_output)
+        {
+            llvm::Value * p = builder.CreateGEP(
+                i8_ty, args_ptr, llvm::ConstantInt::get(i64_ty, slot_offset[idx]), "slot");
+            return builder.CreateLoad(T, p, "argval");
+        }
+        return emit_load_arg(builder, args_ptr, idx, T);
+    };
+
+    /* &args[off] : a void** slice, for a sub-wrapper call (void** form only) */
+    auto slice_ptr = [&] (unsigned off) -> llvm::Value *
+    {
+        return builder.CreateGEP(ptr_ty, args_ptr,
+                                 llvm::ConstantInt::get(i64_ty, off), "slice");
+    };
 
     /* Load each used leaf slot ONCE, here at the wrapper entry, and reuse the
      * resulting SSA value for every kernel that shares it. Re-loading per kernel
@@ -1019,6 +1095,14 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     /* the fused entry is `__fused_wrapper`; clear any per-input entry symbol
      * (dst may alias progs[0], which could carry a device kernel symbol) */
     dst->source.content.llvmir.symbol = nullptr;
+    /* the fused entry is void(void**) (or void(void*,size_t) when packed); it
+     * carries no per-parameter table (a re-fusion detects its shape by signature). */
+    dst->source.content.llvmir.proto        = packed_output
+        ? CGIR_COMMAND_PROG_SOURCE_PROTO_PACKED_BUFFER
+        : CGIR_COMMAND_PROG_SOURCE_PROTO_VOID_PTRPTR;
+    dst->source.content.llvmir.params       = nullptr;
+    dst->source.content.llvmir.param_count  = 0;
+    dst->source.content.llvmir._params_owned = false;
 
     /* ------------------------------------------------------------------ *
      * 9b. Merge the inputs' externalized-global resolution tables.        *
@@ -1083,26 +1167,50 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      *     so writing dst now is safe.                                      *
      * ------------------------------------------------------------------ */
     const size_t n_args = (size_t) total_args;
-    void ** args_buf = static_cast<void **>(calloc(n_args ? n_args : 1, sizeof(void *)));
-    if (!args_buf) { fprintf(stderr, "prog-fuse: calloc failed\n"); abort(); }
-    for (unsigned k = 0 ; k < total_args ; ++k)
-        args_buf[k] = unique_slots[k];
+    void ** args_buf = nullptr;
+    if (packed_output)
+    {
+        /* Packed byte buffer: each deduplicated slot's VALUE inlined at its
+         * offset (matching the fused kernel's fixed-offset loads). unique_slots[k]
+         * points at the value (a &value slot), so we copy its store-size bytes. */
+        char * buf = static_cast<char *>(calloc(packed_size ? packed_size : 1, 1));
+        if (!buf) { fprintf(stderr, "prog-fuse: calloc failed\n"); abort(); }
+        for (unsigned k = 0 ; k < total_args ; ++k)
+        {
+            if (unique_slots[k] == nullptr || slot_type[k] == nullptr)
+                continue;
+            const size_t sz = (size_t) DL.getTypeStoreSize(slot_type[k]).getFixedValue();
+            memcpy(buf + slot_offset[k], unique_slots[k], sz);
+        }
+        args_buf = reinterpret_cast<void **>(buf);
+    }
+    else
+    {
+        args_buf = static_cast<void **>(calloc(n_args ? n_args : 1, sizeof(void *)));
+        if (!args_buf) { fprintf(stderr, "prog-fuse: calloc failed\n"); abort(); }
+        for (unsigned k = 0 ; k < total_args ; ++k)
+            args_buf[k] = unique_slots[k];
+    }
 
     /* Free the previous args buffer iff a prior fusion produced (owns) it. dst
      * may alias progs[0], whose arg slot VALUES were copied into unique_slots
-     * in step 2/3b, so the old buffer is no longer referenced and is safe to
-     * release here. */
+     * (and into the packed buffer above) already, so the old buffer is no longer
+     * referenced and is safe to release here. */
     if (dst->_args_owned && dst->args)
         free(dst->args);
 
-    /* The fused program is a uniform void(void**) launcher; a fused chain has no
-     * single ahead-of-time KMP routine, so it MUST be JIT-compiled (the `jit`
-     * pass fills launcher.variadic.fn and keeps the VARIADIC prototype). */
-    dst->prototype             = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC;
+    /* A fused chain has no single ahead-of-time KMP routine, so it MUST be
+     * JIT-compiled (the `jit` pass fills the launcher fn). It is either a uniform
+     * void(void**) VARIADIC program or, under CGIR_PROG_FUSE_PACKED, a
+     * void(void*, size_t) PACKED program over the packed byte buffer. */
+    dst->prototype             = packed_output
+        ? CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED
+        : CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC;
     dst->launcher.variadic.fn  = nullptr;  /* compiled by the `jit` pass */
     dst->args                  = args_buf;
     dst->n_args                = n_args;
-    dst->_args_owned           = true;  /* heap (calloc) — the pass owns it */
+    dst->args_size             = packed_output ? packed_size : 0;
+    dst->_args_owned           = true;  /* heap (calloc/malloc) — the pass owns it */
 
     /* ------------------------------------------------------------------ *
      * 11b. Propagate the launch parameters to the fused program.          *
@@ -1240,13 +1348,14 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
     if (entry == nullptr || entry->isDeclaration() || entry->hasLocalLinkage())
         return ;
 
-    /* The runtime launches a fused/JIT'd PROG uniformly as `void(void**)`. If
-     * the entry already has that shape (a fused wrapper), use it directly;
-     * otherwise synthesize a wrapper that unpacks the argument slots and calls
-     * the entry (ignoring any return value). */
+    /* The runtime launches a JIT'd PROG as `void(void**)` (VARIADIC) or, for a
+     * packed body, `void(void*, size_t)` (PACKED). If the entry already has one
+     * of those shapes, use it directly; otherwise synthesize a void(void**)
+     * wrapper that unpacks the argument slots and calls the entry. */
     llvm::FunctionType * efty = entry->getFunctionType();
     std::string lookup_name;
-    if (is_void_voidptr(efty))
+    const bool entry_is_packed = is_void_ptr_size(efty);
+    if (is_void_voidptr(efty) || entry_is_packed)
     {
         lookup_name = entry->getName().str();
     }
@@ -1372,17 +1481,23 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
         fprintf(stderr, "jit: could not resolve '%s' after JIT\n", lookup_name.c_str());
         abort();
     }
-    /* the compiled entry has the program launch shape `void(void**)` */
-    auto fn_ptr = reinterpret_cast<void (*)(void **)>(
-        static_cast<uintptr_t>(sym->getValue()));
-
     /* keep the JIT (hence the compiled code) alive for the process lifetime */
+    void * fn_addr = reinterpret_cast<void *>(static_cast<uintptr_t>(sym->getValue()));
     jit.release();
 
-    /* install the compiled function, overwriting any previous value. The prog is
-     * now a uniform void(void**) program invoked over prog->args (a recorded
-     * OpenMP task was KMP before this; its recorded kargs stay in prog->args). */
-    prog->prototype            = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC;
-    prog->launcher.variadic.fn = fn_ptr;
+    /* Install the compiled function, overwriting any previous value. A packed
+     * entry keeps the PACKED prototype (launched as fn(args, args_size)); anything
+     * else becomes a uniform void(void**) VARIADIC program over prog->args (a
+     * recorded OpenMP task was KMP before this; its kargs stay in prog->args). */
+    if (entry_is_packed)
+    {
+        prog->prototype          = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED;
+        prog->launcher.packed.fn = reinterpret_cast<void (*)(void *, size_t)>(fn_addr);
+    }
+    else
+    {
+        prog->prototype            = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC;
+        prog->launcher.variadic.fn = reinterpret_cast<void (*)(void **)>(fn_addr);
+    }
     # endif /* CGIR_SUPPORT_LLVM */
 }
