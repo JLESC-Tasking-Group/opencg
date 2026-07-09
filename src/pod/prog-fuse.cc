@@ -1,0 +1,130 @@
+/*
+** Copyright 2024,2025 INRIA
+**
+** Contributors :
+** Romain PEREIRA, rpereira@anl.gov
+**
+** This software is a computer program whose purpose is to execute
+** blas subroutines on multi-GPUs system.
+**
+** This software is governed by the CeCILL-C license under French law and
+** abiding by the rules of distribution of free software.  You can  use,
+** modify and/ or redistribute the software under the terms of the CeCILL-C
+** license as circulated by CEA, CNRS and INRIA at the following URL
+** "http://www.cecill.info".
+
+** As a counterpart to the access to the source code and  rights to copy,
+** modify and redistribute granted by the license, users are provided only
+** with a limited warranty  and the software's author,  the holder of the
+** economic rights,  and the successive licensors  have only  limited
+** liability.
+
+** In this respect, the user's attention is drawn to the risks associated
+** with loading,  using,  modifying and/or developing or reproducing the
+** software by the user in light of its specific status of free software,
+** that may mean  that it is complicated to manipulate,  and  that  also
+** therefore means  that it is reserved for developers  and  experienced
+** professionals having in-depth computer knowledge. Users are therefore
+** encouraged to load and test the software's suitability as regards their
+** requirements in conditions enabling the security of their systems and/or
+** data to be ensured and,  more generally, to use and operate it in the
+** same conditions as regards security.
+
+** The fact that you are presently reading this means that you have had
+** knowledge of the CeCILL-C license and that you accept its terms.
+**/
+
+// Legacy (POD) prog-fuse pass. It detects maximal chains of LLVM-IR programs in
+// series and delegates the actual kernel fusion to the shared core
+// command_graph_prog_fuse_llvmir() (see ../prog-fuse-llvmir.cc), which is also
+// used by the MLIR pass.
+
+# include <cgir/namespace.hpp>
+# include <cgir/command.hpp>
+# include <cgir/command-graph.hpp>
+
+# include "prog-fuse-llvmir.hpp"
+
+# include <vector>
+
+CGIR_NAMESPACE_USE;
+
+/* pass local storage */
+struct pls_t
+{
+    bool contracted;
+
+    pls_t(void) : contracted(false) {}
+    ~pls_t(void) {}
+};
+
+using node_t = command_graph_t::node_iterator_t<pls_t>;
+
+/* true iff `u` is a command node holding a non-null LLVM-IR program source */
+static inline bool
+node_is_llvmir_prog(const command_graph_node_t * u)
+{
+    return u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND
+        && u->command != nullptr
+        && u->command->type == COMMAND_TYPE_PROG
+        && u->command->prog.source.type == COMMAND_PROG_SOURCE_TYPE_LLVMIR
+        && u->command->prog.source.content.llvmir.raw != nullptr;
+}
+
+void
+command_graph_t::pass_prog_fuse(void)
+{
+    constexpr bool include_entry_exit = false;
+    std::vector<node_t> nodes = this->create_node_iterators<pls_t, include_entry_exit>();
+
+    /* iterate through each original node */
+    for (command_graph_node_index_t i = 0 ; i < nodes.size() ; ++i)
+    {
+        node_t & node = nodes[i];
+        command_graph_node_t * u = node.node;
+        assert(u);
+
+        /* if the node was already contracted, ignore it */
+        if (node.data.contracted)
+            continue ;
+
+        if (!node_is_llvmir_prog(u))
+            continue ;
+
+        /* Collect the maximal chain u -> v -> w -> ... of fusable LLVM-IR
+         * programs in series (each link: single successor / single predecessor). */
+        std::vector<command_graph_node_t *> chain;
+        chain.push_back(u);
+        command_graph_node_t * cur = u;
+        while (cur->successors.size() == 1)
+        {
+            command_graph_node_t * w = cur->successors.front();
+            if (!node_is_llvmir_prog(w) || !this->are_sequence(cur, w))
+                break ;
+            /* only fuse programs with rigorously identical launch parameters
+             * (grid/block and launch mode); every chain member must match the head u */
+            if (!command_prog_launch_params_equal(&u->command->prog, &w->command->prog))
+                break ;
+            chain.push_back(w);
+            cur = w;
+        }
+
+        if (chain.size() < 2)
+            continue ;
+
+        /* Fuse the whole chain into u's command in a single N-ary fusion. */
+        std::vector<command_prog_t *> progs;
+        progs.reserve(chain.size());
+        for (command_graph_node_t * c : chain)
+            progs.push_back(&c->command->prog);
+
+        command_graph_prog_fuse_llvmir(progs.data(), progs.size(), &u->command->prog);
+
+        /* Contract the chain into u (each successive node absorbed in series). */
+        for (size_t k = 1 ; k < chain.size() ; ++k)
+        {
+            this->contract<COMMAND_GRAPH_CONTRACTION_HINT_U_V_SEQUENCE | COMMAND_GRAPH_CONTRACTION_HINT_INPLACE>(u, chain[k]);
+            nodes[chain[k]->iterator_index].data.contracted = true;
+        }
+    }
+}

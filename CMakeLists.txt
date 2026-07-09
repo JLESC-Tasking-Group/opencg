@@ -2,10 +2,10 @@
 cmake_minimum_required(VERSION 3.17)
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_LIST_DIR}/cmake)
 
-SET(OpenCG opencg)
+SET(CGIR cgir)
 
 # Project name
-project(${OpenCG})
+project(${CGIR})
 
 #########
 # RPATH #
@@ -28,40 +28,140 @@ set(CMAKE_CXX_EXTENSIONS OFF)  # Optional: disables compiler-specific extensions
 ###########
 
 include(BooleanUtils)
-ocgoption(BUILD_C_API "Build the C API." ON)
-ocgoption(USE_LLVM    "Use LLVM for IR manipulation (required by prog-fuse)." OFF)
-ocgoption(USE_PROTEUS "Use Proteus for JIT (implies USE_LLVM)." OFF)
+cgiroption(BUILD_C_API "Build the C API." ON)
 
-# Proteus requires LLVM; force USE_LLVM ON if USE_PROTEUS is requested.
-if (USE_PROTEUS)
-    set(USE_LLVM 1)
-endif()
+# USE_LLVM / USE_MLIR default OFF, but auto-enable when the caller points cmake
+# at an install — the trailing variable names are checked by cgiroption (see
+# cmake/BooleanUtils.cmake): if any is defined, the option turns ON so the
+# variable is consumed (no "Manually-specified variables were not used" warning).
+cgiroption(USE_LLVM "Use LLVM for IR manipulation and JIT (required by prog-fuse)." OFF LLVM_DIR LLVM_INSTALL_DIR)
+cgiroption(USE_MLIR "Use MLIR for the command-graph IR and optimization passes." OFF MLIR_DIR)
 
 ##########
-# OpenCG #
+# CGIR #
 ##########
 
 SET(SOURCE_FILES
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/passes/batch.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/passes/copy-fuse.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/passes/copy-normalize.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/passes/prog-fuse.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/passes/reduce-edge.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/passes/reduce-node.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/command-graph.cc
+    # common (POD + MLIR)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/cgir.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/prog-fuse-llvmir.cc
+    # POD interface implementation
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/command-graph.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/batch.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/copy-fuse.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/copy-normalize.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/prog-fuse.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/jit.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/reduce-edge.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/reduce-node.cc
 )
 
 if (BUILD_C_API)
-    list(APPEND SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/api/c/src/opencg.cc)
+    list(APPEND SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/api/c/src/cgir.cc)
     include_directories(${CMAKE_CURRENT_SOURCE_DIR}/api/c/src)
     include_directories(${CMAKE_CURRENT_SOURCE_DIR}/api/c/include)
     install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/api/c/include/ DESTINATION include FILES_MATCHING PATTERN "*.h")
 endif()
 
-# OpenCG Lib
-add_library(${OpenCG} SHARED ${SOURCE_FILES})
-set_target_properties(${OpenCG} PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_SOURCE_DIR}/lib")
-set_target_properties(${OpenCG} PROPERTIES INSTALL_RPATH "$ORIGIN/../lib")
+###################################
+# MLIR `cg` dialect + IR pipeline #
+###################################
+#
+# The MLIR implementation lives in src/mlir/ and is folded into libcgir.so.
+# The `cg` dialect headers (include/cgir/mlir/) ARE public: another runtime
+# can build cg ops, run the passes, and convert to/from the POD command graph.
+# Using them requires MLIR, but the POD headers (cgir/command*.hpp) do not,
+# so a runtime that only wants the POD path (e.g. XKRT) never needs MLIR.
+#
+# Requires an MLIR install matching your LLVM. Point CMake at it with:
+#   -DUSE_MLIR=ON -DMLIR_DIR=/path/to/llvm-project/<build>/lib/cmake/mlir
+#
+if (USE_MLIR)
+    find_package(MLIR REQUIRED CONFIG)
+    message(STATUS "Found MLIR ${MLIR_PACKAGE_VERSION} in: ${MLIR_DIR}")
+    message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION} (for MLIR) in: ${LLVM_DIR}")
+
+    list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
+    list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
+    include(TableGen)
+    include(AddLLVM)
+    include(AddMLIR)
+
+    set(CGIR_MLIR_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/mlir)
+    set(CGIR_MLIR_TD  ${CMAKE_CURRENT_SOURCE_DIR}/include/cgir/mlir/CG)
+
+    # TableGen needs the dialect .td directory and MLIR's own .td on its
+    # include path (for `include "CGDialect.td"` and `include "mlir/IR/..."`).
+    include_directories(${MLIR_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${CGIR_MLIR_TD})
+
+    # Generate the `cg` dialect from TableGen. The *.inc files land in
+    # ${CMAKE_CURRENT_BINARY_DIR}; the public dialect headers include them with
+    # quote-includes, so on install we place the decl *.inc next to the headers.
+    set(LLVM_TARGET_DEFINITIONS ${CGIR_MLIR_TD}/CGOps.td)
+    mlir_tablegen(CGDialect.h.inc   -gen-dialect-decls -dialect=cg)
+    mlir_tablegen(CGDialect.cpp.inc -gen-dialect-defs  -dialect=cg)
+    mlir_tablegen(CGTypes.h.inc     -gen-typedef-decls -typedefs-dialect=cg)
+    mlir_tablegen(CGTypes.cpp.inc   -gen-typedef-defs  -typedefs-dialect=cg)
+    mlir_tablegen(CGOps.h.inc       -gen-op-decls)
+    mlir_tablegen(CGOps.cpp.inc     -gen-op-defs)
+    add_public_tablegen_target(CGIRMLIRIncGen)
+
+    # The MLIR translation units, isolated in an OBJECT library so MLIR/LLVM
+    # build flags (notably -fno-rtti) do not leak onto the rest of CGIR.
+    add_library(cgirmlir OBJECT
+        ${CGIR_MLIR_SRC}/CG/CGDialect.cpp
+        ${CGIR_MLIR_SRC}/import.cpp
+        ${CGIR_MLIR_SRC}/export.cpp
+        ${CGIR_MLIR_SRC}/optimize.cpp
+        ${CGIR_MLIR_SRC}/passes/ReduceNode.cpp
+        ${CGIR_MLIR_SRC}/passes/ReduceEdge.cpp
+        ${CGIR_MLIR_SRC}/passes/CopyNormalize.cpp
+        ${CGIR_MLIR_SRC}/passes/CopyFuse.cpp
+        ${CGIR_MLIR_SRC}/passes/Batch.cpp
+        ${CGIR_MLIR_SRC}/passes/ProgFuse.cpp
+    )
+    add_dependencies(cgirmlir CGIRMLIRIncGen)
+    set_target_properties(cgirmlir PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(cgirmlir PRIVATE
+        ${CMAKE_CURRENT_BINARY_DIR}                 # generated CG*.inc (quote-include)
+        ${CMAKE_CURRENT_SOURCE_DIR}/include         # public cgir/ + cgir/mlir/ headers
+        ${CMAKE_CURRENT_BINARY_DIR}/include         # generated cgir/support.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/src             # internal shared headers (prog-fuse-llvmir.hpp)
+        ${LLVM_INCLUDE_DIRS}
+        ${MLIR_INCLUDE_DIRS}
+    )
+    target_compile_definitions(cgirmlir PRIVATE ${LLVM_DEFINITIONS})
+    if (NOT LLVM_ENABLE_RTTI)
+        target_compile_options(cgirmlir PRIVATE -fno-rtti)
+    endif()
+
+    # MLIR component libraries needed by the dialect, bridge and passes.
+    set(CGIR_MLIR_LIBS
+        MLIRIR
+        MLIRSupport
+        MLIRParser
+        MLIRPass
+        MLIRTransformUtils
+    )
+    target_link_libraries(cgirmlir PRIVATE ${CGIR_MLIR_LIBS})
+
+    # Fold the MLIR objects into libcgir and resolve MLIR symbols there.
+    list(APPEND SOURCE_FILES $<TARGET_OBJECTS:cgirmlir>)
+endif()
+
+# CGIR Lib
+add_library(${CGIR} SHARED ${SOURCE_FILES})
+
+# Internal include path so POD/shared translation units can include the shared
+# core header (src/prog-fuse-llvmir.hpp) regardless of their subdirectory.
+target_include_directories(${CGIR} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+if (USE_MLIR)
+    add_dependencies(${CGIR} CGIRMLIRIncGen)
+    target_link_libraries(${CGIR} PRIVATE ${CGIR_MLIR_LIBS})
+endif()
+set_target_properties(${CGIR} PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_SOURCE_DIR}/lib")
+set_target_properties(${CGIR} PROPERTIES INSTALL_RPATH "$ORIGIN/../lib")
 
 # Include directory
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include/)
@@ -69,28 +169,15 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR}/include/)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src/)
 
 # targets to install (lib)
-set(OpenCG_TARGETS ${OpenCG})
+set(CGIR_TARGETS ${CGIR})
 
 ###############
 # DEPENDENCES #
 ###############
 
-if (USE_PROTEUS)
-    # Find Proteus first so that its find_package(LLVM) call populates
-    # LLVM_DIR, LLVM_INCLUDE_DIRS, LLVM_DEFINITIONS, LLVM_LINK_LLVM_DYLIB,
-    # etc. before our own find_package(LLVM) runs.  This guarantees that both
-    # OpenCG and Proteus resolve LLVM from the exact same installation.
-    find_package(proteus CONFIG REQUIRED)
-    find_package(Threads REQUIRED)
-    target_link_libraries(opencg PRIVATE proteusFrontend)
-endif()
-
 if (USE_LLVM)
     # Allow the user to point at a specific LLVM installation via
-    # -DLLVM_DIR=<path/to/lib/cmake/llvm> or the legacy
-    # -DLLVM_INSTALL_DIR=<prefix>.  When USE_PROTEUS is also set,
-    # find_package(proteus) above has already set LLVM_DIR to the
-    # installation Proteus was built against, so both use the same LLVM.
+    # -DLLVM_DIR=<path/to/lib/cmake/llvm> or the legacy -DLLVM_INSTALL_DIR=<prefix>.
     if (DEFINED LLVM_INSTALL_DIR AND NOT DEFINED LLVM_DIR)
         set(LLVM_DIR "${LLVM_INSTALL_DIR}/lib/cmake/llvm")
     endif()
@@ -99,58 +186,45 @@ if (USE_LLVM)
     message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION} in: ${LLVM_DIR}")
 
     # Propagate LLVM preprocessor definitions (e.g. -D__STDC_CONSTANT_MACROS).
-    target_compile_definitions(${OpenCG} PRIVATE ${LLVM_DEFINITIONS})
+    target_compile_definitions(${CGIR} PRIVATE ${LLVM_DEFINITIONS})
 
     # Add LLVM's own include directories (source tree + build tree headers).
-    target_include_directories(${OpenCG} PRIVATE ${LLVM_INCLUDE_DIRS})
+    target_include_directories(${CGIR} PRIVATE ${LLVM_INCLUDE_DIRS})
 
-    # Link LLVM.
-    #
-    # When USE_PROTEUS is also enabled, Proteus already links LLVM (either the
-    # monolithic libLLVM.so dylib or individual static archives).  Linking a
-    # *second* set of LLVM libraries — even from the same installation — causes
-    # two copies of LLVM's global state (StringMap, LLVMContext registry, …) to
-    # be initialised in the same process, which triggers assertion failures such
-    # as the StringMap "NumItems + NumTombstones <= NumBuckets" abort.
-    #
-    # The safe strategy is:
-    #
-    #   USE_LLVM only (no Proteus):
-    #     Link per-component static libraries normally; they are the only LLVM
-    #     copy in the process so there is no duplication.
-    #
-    #   USE_LLVM + USE_PROTEUS + LLVM_LINK_LLVM_DYLIB:
-    #     Both OpenCG and Proteus link the monolithic libLLVM.so.  The dynamic
-    #     linker loads it once; a single global state is shared.
-    #
-    #   USE_LLVM + USE_PROTEUS + static LLVM (no dylib):
-    #     Proteus hides its LLVM archives via --exclude-libs on its INTERFACE
-    #     link flags, so the symbols are not exported from libproteus into
-    #     libopencg.so.  OpenCG must link the same archives directly.
-    #     Because find_package(proteus) ran first and fixed LLVM_DIR, both pick
-    #     the same .a files, so the static linker sees only one copy of each
-    #     translation unit and there is no duplicate global state at runtime.
-
-    if (USE_PROTEUS AND LLVM_LINK_LLVM_DYLIB)
-        # Single libLLVM.so — one global state, no duplication.
-        message(STATUS "LLVM: linking monolithic dylib (LLVM_LINK_LLVM_DYLIB=ON)")
-        target_link_libraries(${OpenCG} PRIVATE LLVM)
-    else()
-        # Static component libs (standalone or Proteus-static path).
-        llvm_map_components_to_libnames(LLVM_LIBS
-            core            # LLVMCore      – IRBuilder, Module, Function, …
-            irreader        # LLVMIRReader  – parseIR()
-            bitwriter       # LLVMBitWriter – WriteBitcodeToFile()
-            linker          # LLVMLinker    – Linker::linkInModule()
-            support         # LLVMSupport   – raw_ostream, MemoryBuffer, SourceMgr
-            analysis        # LLVMAnalysis  – verifyModule()
-            mc              # LLVMMC        – TargetRegistry::lookupTarget()
-            target          # LLVMTarget    – TargetMachine, InitializeAllTargets()
-            ${LLVM_TARGETS_TO_BUILD}  # architecture-specific codegen/MC/asm libs
-        )
-        message(STATUS "LLVM: linking component libs: ${LLVM_LIBS}")
-        target_link_libraries(${OpenCG} PRIVATE ${LLVM_LIBS})
+    # prog-fuse-llvmir.cc is the LLVM-consuming translation unit. Match LLVM's
+    # own build (typically -fno-rtti): consuming LLVM APIs (e.g. the ORC JIT's
+    # error/typeinfo machinery) from an RTTI-enabled TU emits references to LLVM
+    # RTTI symbols (e.g. `typeinfo for llvm::ErrorInfoBase`) that a no-RTTI LLVM
+    # does not provide, yielding an undefined-reference link error. It only uses
+    # LLVM's own isa<>/dyn_cast<> (not C++ RTTI), so -fno-rtti is safe here.
+    if (NOT LLVM_ENABLE_RTTI)
+        set_source_files_properties(
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/prog-fuse-llvmir.cc
+            PROPERTIES COMPILE_OPTIONS "-fno-rtti")
     endif()
+
+    # Link the LLVM component libraries used by prog-fuse: IR manipulation /
+    # linking / bitcode plus the in-process ORC JIT (LLJIT) that compiles the
+    # fused module (this replaces the former Proteus dependency).
+    llvm_map_components_to_libnames(LLVM_LIBS
+        core            # LLVMCore         - IRBuilder, Module, Function, ...
+        irreader        # LLVMIRReader     - parseIR()
+        bitwriter       # LLVMBitWriter    - WriteBitcodeToFile()
+        linker          # LLVMLinker       - Linker::linkInModule()
+        support         # LLVMSupport      - raw_ostream, MemoryBuffer, SourceMgr
+        analysis        # LLVMAnalysis     - verifyModule()
+        mc              # LLVMMC           - TargetRegistry::lookupTarget()
+        target          # LLVMTarget       - TargetMachine, InitializeAllTargets()
+        orcjit          # LLVMOrcJIT       - LLJIT
+        executionengine # LLVMExecutionEngine
+        jitlink         # LLVMJITLink      - LLJIT object linking
+        passes          # LLVMPasses       - PassBuilder O3 pipeline, LoopFuse, vectorizers
+        native          # host target codegen/asm (CodeGen, AsmPrinter, ...)
+        nativecodegen   # host target codegen registration
+        ${LLVM_TARGETS_TO_BUILD}  # architecture-specific codegen/MC/asm libs
+    )
+    message(STATUS "LLVM: linking component libs: ${LLVM_LIBS}")
+    target_link_libraries(${CGIR} PRIVATE ${LLVM_LIBS})
 endif()
 
 ################
@@ -158,48 +232,71 @@ endif()
 ################
 
 # Header file generated
-file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/include/opencg")
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/include/cgir")
 configure_file(
-    ${CMAKE_SOURCE_DIR}/include/opencg/support.h.in
-    ${CMAKE_BINARY_DIR}/include/opencg/support.h
+    ${CMAKE_SOURCE_DIR}/include/cgir/support.h.in
+    ${CMAKE_BINARY_DIR}/include/cgir/support.h
 )
 install(
-    FILES "${CMAKE_BINARY_DIR}/include/opencg/support.h"
-    DESTINATION include/opencg
+    FILES "${CMAKE_BINARY_DIR}/include/cgir/support.h"
+    DESTINATION include/cgir
 )
 
 # Installation - lib and include files
-install(TARGETS ${OpenCG_TARGETS} LIBRARY DESTINATION lib ARCHIVE DESTINATION lib)
+install(TARGETS ${CGIR_TARGETS} LIBRARY DESTINATION lib ARCHIVE DESTINATION lib)
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ DESTINATION include FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp")
 
+# Installation - public MLIR `cg` dialect: its TableGen sources and the generated
+# declaration .inc files (placed next to the dialect headers so their
+# quote-includes resolve against the install tree).
+if (USE_MLIR)
+    install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/cgir/mlir/
+            DESTINATION include/cgir/mlir
+            FILES_MATCHING PATTERN "*.td")
+    install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/CGDialect.h.inc
+        ${CMAKE_CURRENT_BINARY_DIR}/CGTypes.h.inc
+        ${CMAKE_CURRENT_BINARY_DIR}/CGOps.h.inc
+        DESTINATION include/cgir/mlir/CG
+    )
+endif()
+
 # Installation - cmake files
-target_include_directories(${OpenCG} PUBLIC
+target_include_directories(${CGIR} PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
-message(STATUS "Targets are ${OpenCG_TARGETS}")
-install(TARGETS ${OpenCG_TARGETS}
-        EXPORT OpenCGTargets
+message(STATUS "Targets are ${CGIR_TARGETS}")
+install(TARGETS ${CGIR_TARGETS}
+        EXPORT CGIRTargets
         ARCHIVE DESTINATION lib
         LIBRARY DESTINATION lib
         RUNTIME DESTINATION bin
         INCLUDES DESTINATION include)
 install(DIRECTORY include/ DESTINATION include)
-install(EXPORT OpenCGTargets
-        FILE OpenCGTargets.cmake
-        NAMESPACE OpenCG::
-        DESTINATION lib/cmake/OpenCG)
+install(EXPORT CGIRTargets
+        FILE CGIRTargets.cmake
+        NAMESPACE CGIR::
+        DESTINATION lib/cmake/CGIR)
 
 include(CMakePackageConfigHelpers)
 configure_package_config_file(
-    cmake/OpenCGConfig.cmake.in
-    "${CMAKE_CURRENT_BINARY_DIR}/OpenCGConfig.cmake"
-    INSTALL_DESTINATION lib/cmake/OpenCG
+    cmake/CGIRConfig.cmake.in
+    "${CMAKE_CURRENT_BINARY_DIR}/CGIRConfig.cmake"
+    INSTALL_DESTINATION lib/cmake/CGIR
 )
 install(FILES
-    "${CMAKE_CURRENT_BINARY_DIR}/OpenCGConfig.cmake"
-    DESTINATION lib/cmake/OpenCG
+    "${CMAKE_CURRENT_BINARY_DIR}/CGIRConfig.cmake"
+    DESTINATION lib/cmake/CGIR
 )
+
+##################
+# UTILITY BINARY #
+##################
+
+add_executable(cgir_info ${CMAKE_SOURCE_DIR}/src/cgir_info.cc)
+target_link_libraries(cgir_info PRIVATE ${CGIR})
+install(TARGETS cgir_info RUNTIME DESTINATION bin)
 
 ################
 # Sub projects #

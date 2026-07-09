@@ -1,8 +1,8 @@
 # Optimization Passes {#optimization_passes}
 
-OpenCG includes several optimization passes that transform command graphs to reduce overhead and improve execution efficiency.
+CGIR includes several optimization passes that transform command graphs to reduce overhead and improve execution efficiency.
 
-All passes are enumerated by `OCG_FORALL_COMMAND_GRAPH_PASS` and can be invoked via:
+All passes are enumerated by `CGIR_FORALL_COMMAND_GRAPH_PASS` and can be invoked via:
 
 ```cpp
 cg.optimize(COMMAND_GRAPH_PASS_BATCH);
@@ -16,7 +16,7 @@ cg.pass_batch();
 
 Removes redundant edges from the graph. If node `v` is reachable from `u` through an intermediate path via `w`, the direct edge `u -> v` is redundant and can be removed.
 
-The implementation builds a reachability matrix using `ocg::bitset2d_t` via backward BFS, then prunes edges where the reachability test succeeds through alternative paths. This minimizes the graph complexity while preserving the execution order.
+The implementation builds a reachability matrix using `cgir::bitset2d_t` via backward BFS, then prunes edges where the reachability test succeeds through alternative paths. This minimizes the graph complexity while preserving the execution order.
 
 ### Node Reduction (reduce-node)
 
@@ -35,7 +35,7 @@ The pass detects two patterns:
 - **False twins**: nodes with identical predecessor and successor sets
 - **Sequential pairs**: `u -> v` where `u` has a single successor and `v` has a single predecessor
 
-Contracted nodes become a `ocg::command_batch_t` containing a sub-command-graph.
+Contracted nodes become a `cgir::command_batch_t` containing a sub-command-graph.
 This enables mapping to vendor-specific batching mechanisms (e.g. CUDA Graphs, HIP Graphs, Level Zero command lists).
 
 ### Copy Fusion (copy-fuse)
@@ -57,12 +57,19 @@ Planned but not yet implemented. Will merge compatible kernel launches.
 
 ## Running Multiple Passes
 
-Passes can be composed by calling them sequentially:
+Multiple passes are applied in a single call by combining their `COMMAND_GRAPH_PASS_*_BIT` constants into a `command_graph_pass_set_t`:
+
+```cpp
+cg.optimize(
+      COMMAND_GRAPH_PASS_REDUCE_NODE_BIT
+    | COMMAND_GRAPH_PASS_REDUCE_EDGE_BIT
+    | COMMAND_GRAPH_PASS_BATCH_BIT);
+```
+
+Enabled passes always run in a fixed *canonical order* — the order in which they are declared in `CGIR_FORALL_COMMAND_GRAPH_PASS` (`copy-normalize`, `copy-fuse`, `reduce-node`, `reduce-edge`, `prog-fuse`, `batch`) — regardless of the order of the bits. This guarantees the reduction passes run before batching, so the graph is simplified before it is contracted.
+
+A single pass can still be run on its own with the `command_graph_pass_t` overload:
 
 ```cpp
 cg.optimize(COMMAND_GRAPH_PASS_REDUCE_NODE);
-cg.optimize(COMMAND_GRAPH_PASS_REDUCE_EDGE);
-cg.optimize(COMMAND_GRAPH_PASS_BATCH);
 ```
-
-The order matters: typically, reduction passes should run before batching to simplify the graph first.

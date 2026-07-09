@@ -1,9 +1,9 @@
-# Doxyfile for OpenCG documentation
+# Doxyfile for CGIR documentation
 
 #---------------------------------------------------------------------------
 # Project
 #---------------------------------------------------------------------------
-PROJECT_NAME           = "OpenCG"
+PROJECT_NAME           = "CGIR"
 PROJECT_BRIEF          = "Open Command Graphs - Vendor-agnostic DAG command graph library"
 PROJECT_NUMBER         =
 OUTPUT_DIRECTORY       = build
@@ -13,7 +13,7 @@ CREATE_SUBDIRS         = NO
 # Input
 #---------------------------------------------------------------------------
 INPUT                  = ../README.md \
-                         ../include/opencg \
+                         ../include/cgir \
                          ../src \
                          concepts/commands.md \
                          concepts/command-graphs.md \
@@ -38,9 +38,9 @@ BUILTIN_STL_SUPPORT    = YES
 ENABLE_PREPROCESSING   = YES
 MACRO_EXPANSION        = YES
 EXPAND_ONLY_PREDEF     = NO
-PREDEFINED             = OCG_NAMESPACE_BEGIN="namespace ocg {" \
-                         OCG_NAMESPACE_END="}" \
-                         OCG_NAMESPACE=ocg
+PREDEFINED             = CGIR_NAMESPACE_BEGIN="namespace cgir {" \
+                         CGIR_NAMESPACE_END="}" \
+                         CGIR_NAMESPACE=cgir
 
 #---------------------------------------------------------------------------
 # Output format

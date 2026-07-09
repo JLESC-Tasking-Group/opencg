@@ -40,7 +40,7 @@
 #  define assert(X) X
 # endif
 
-# include "opencg-tests.cc"
+# include "cgir-tests.cc"
 
 int
 main(void)
@@ -76,7 +76,7 @@ main(void)
         command_t * command = (command_t *) malloc(sizeof(command_t));
         assert(command);
         new (command) command_t(type);
-        command->copy_1D.src_device_unique_id   = OCG_UNSPECIFIED_DEVICE_UNIQUE_ID;
+        command->copy_1D.src_device_unique_id   = CGIR_UNSPECIFIED_DEVICE_UNIQUE_ID;
         command->copy_1D.dst_device_unique_id   = device_unique_id;
         command->copy_1D.src_device_addr        = src + i * bs;
         command->copy_1D.dst_device_addr        = (uintptr_t) dst;
@@ -90,10 +90,11 @@ main(void)
         node->precedes(exit);
     }
 
-    /* optimize the cg->*/
-    cg->optimize(COMMAND_GRAPH_PASS_REDUCE_NODE);
-    cg->optimize(COMMAND_GRAPH_PASS_REDUCE_EDGE);
-    cg->optimize(COMMAND_GRAPH_PASS_BATCH);
+    /* optimize the cg */
+    cg->optimize(
+          COMMAND_GRAPH_PASS_REDUCE_NODE_BIT
+        | COMMAND_GRAPH_PASS_REDUCE_EDGE_BIT
+        | COMMAND_GRAPH_PASS_BATCH_BIT);
 
     return 0;
 }

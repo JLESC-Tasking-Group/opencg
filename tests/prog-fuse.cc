@@ -44,7 +44,30 @@
 #  define assert(X) X
 # endif
 
-# include "opencg-tests.cc"
+# include "cgir-tests.cc"
+
+/*
+ *  IMPORTANT — why these kernels use `getelementptr inbounds` and `add nsw`:
+ *
+ *  For the prog-fuse pass to actually FUSE the two loops (scale ; axpy) into a
+ *  single one, LLVM's LoopFuse must prove the cross-loop memory dependences are
+ *  legal. On LLVM >= 23 its DependenceAnalysis only reasons about a sibling-loop
+ *  ("SameSD") subscript when the address recurrence is known not to wrap, i.e.
+ *  the access GEP is `inbounds` (checkSubscript -> hasNoSignedWrap in
+ *  DependenceAnalysis.cpp). Without `inbounds`, the subscript is classified as
+ *  NonLinear, the SameSD level is revoked, and fusion is (conservatively)
+ *  rejected — even though it is legal. Real compiler-emitted kernels (e.g.
+ *  clang/libomptarget) always emit `inbounds` array GEPs, so they fuse; this
+ *  hand-written IR must do the same to be representative.
+ *
+ *  cgir therefore RELIES on `inbounds` as the no-wrap/legality witness (present
+ *  => provably safe => fuse; absent => DA stays conservative => skip). This is
+ *  option (i): sound and zero-risk. A future option (ii) could have the pass
+ *  defensively stamp `inbounds`/`nsw` onto kernel GEPs/IVs under cgir's
+ *  well-formedness (in-bounds, elementwise) contract to fuse un-annotated IR
+ *  more aggressively; it never causes an illegal fusion (LoopFuse still checks
+ *  legality) but does assert memory-safety, so it is left for later.
+ */
 
 /**
  *  LLVM-IR source for scale: y[i] = s * y[i]
@@ -54,11 +77,11 @@
  *    br label %loop
  *  loop:
  *    %i = phi i64 [ 0, %entry ], [ %i.next, %loop ]
- *    %ptr = getelementptr double, double* %y, i64 %i
+ *    %ptr = getelementptr inbounds double, double* %y, i64 %i
  *    %val = load double, double* %ptr
  *    %res = fmul double %s, %val
  *    store double %res, double* %ptr
- *    %i.next = add i64 %i, 1
+ *    %i.next = add nsw i64 %i, 1
  *    %cond = icmp slt i64 %i.next, %n
  *    br i1 %cond, label %loop, label %exit
  *  exit:
@@ -71,11 +94,11 @@ static const char scale_llvm_ir[] =
     "  br label %loop\n"
     "loop:\n"
     "  %i = phi i64 [ 0, %entry ], [ %i.next, %loop ]\n"
-    "  %ptr = getelementptr double, double* %y, i64 %i\n"
+    "  %ptr = getelementptr inbounds double, double* %y, i64 %i\n"
     "  %val = load double, double* %ptr\n"
     "  %res = fmul double %s, %val\n"
     "  store double %res, double* %ptr\n"
-    "  %i.next = add i64 %i, 1\n"
+    "  %i.next = add nsw i64 %i, 1\n"
     "  %cond = icmp slt i64 %i.next, %n\n"
     "  br i1 %cond, label %loop, label %exit\n"
     "exit:\n"
@@ -90,14 +113,14 @@ static const char scale_llvm_ir[] =
  *    br label %loop
  *  loop:
  *    %i = phi i64 [ 0, %entry ], [ %i.next, %loop ]
- *    %xptr = getelementptr double, double* %x, i64 %i
- *    %yptr = getelementptr double, double* %y, i64 %i
+ *    %xptr = getelementptr inbounds double, double* %x, i64 %i
+ *    %yptr = getelementptr inbounds double, double* %y, i64 %i
  *    %xval = load double, double* %xptr
  *    %yval = load double, double* %yptr
  *    %prod = fmul double %a, %xval
  *    %sum  = fadd double %prod, %yval
  *    store double %sum, double* %yptr
- *    %i.next = add i64 %i, 1
+ *    %i.next = add nsw i64 %i, 1
  *    %cond = icmp slt i64 %i.next, %n
  *    br i1 %cond, label %loop, label %exit
  *  exit:
@@ -110,19 +133,115 @@ static const char axpy_llvm_ir[] =
     "  br label %loop\n"
     "loop:\n"
     "  %i = phi i64 [ 0, %entry ], [ %i.next, %loop ]\n"
-    "  %xptr = getelementptr double, double* %x, i64 %i\n"
-    "  %yptr = getelementptr double, double* %y, i64 %i\n"
+    "  %xptr = getelementptr inbounds double, double* %x, i64 %i\n"
+    "  %yptr = getelementptr inbounds double, double* %y, i64 %i\n"
     "  %xval = load double, double* %xptr\n"
     "  %yval = load double, double* %yptr\n"
     "  %prod = fmul double %a, %xval\n"
     "  %sum  = fadd double %prod, %yval\n"
     "  store double %sum, double* %yptr\n"
-    "  %i.next = add i64 %i, 1\n"
+    "  %i.next = add nsw i64 %i, 1\n"
     "  %cond = icmp slt i64 %i.next, %n\n"
     "  br i1 %cond, label %loop, label %exit\n"
     "exit:\n"
     "  ret void\n"
     "}\n";
+
+/*
+ *  Negative test: two otherwise-fusable LLVM-IR programs in series, but with
+ *  DIFFERENT launch parameters (here, distinct grid.x while everything else is
+ *  identical), must NOT be fused. The prog-fuse legality gate
+ *  (command_prog_launch_params_equal) should reject the chain, leaving both
+ *  nodes in the graph. Returns 0 on success, 1 on failure.
+ */
+static int
+test_distinct_grid_not_fused(void)
+{
+    /* Argument slots: only needed so the nodes are well-formed PROG commands.
+     * The pass never reads them here because the chain is rejected before any
+     * fusion is attempted. */
+    double   s_val = 2.0;
+    double   a_val = 3.0;
+    double   xbuf  = 1.0;
+    double   ybuf  = 1.0;
+    double * xp    = &xbuf;
+    double * yp    = &ybuf;
+    int64_t  nn    = 8;
+
+    void * scale_args[3] = { &s_val, &yp, &nn };       /* scale(s, y, n)   */
+    void * axpy_args[4]  = { &a_val, &xp, &yp, &nn };  /* axpy(a, x, y, n) */
+
+    command_graph_t * cg = command_graph_new();
+    assert(cg);
+    cg->init(command_new, command_graph_node_new, command_graph_new);
+
+    command_graph_node_t * entry = cg->node_get_entry();
+    command_graph_node_t * exit  = cg->node_get_exit();
+    entry->successors.clear();
+    exit->predecessors.clear();
+
+    constexpr device_unique_id_t host_device = 0;
+
+    /* Node u: scale, grid = (1,1,1), block = (1,1,1) */
+    command_t * cmd_u = command_new(cg, COMMAND_TYPE_PROG);
+    assert(cmd_u);
+    cmd_u->prog.source.type                 = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
+    cmd_u->prog.source.content.llvmir.raw   = (void *) scale_llvm_ir;
+    cmd_u->prog.source.content.llvmir.size  = sizeof(scale_llvm_ir);
+    cmd_u->prog.launcher.variadic.fn        = nullptr;
+    cmd_u->prog.args      = scale_args;
+    cmd_u->prog.n_args    = sizeof(scale_args) / sizeof(void *);
+    cmd_u->prog.grid.x  = 1; cmd_u->prog.grid.y  = 1; cmd_u->prog.grid.z  = 1;
+    cmd_u->prog.block.x = 1; cmd_u->prog.block.y = 1; cmd_u->prog.block.z = 1;
+
+    command_graph_node_t * u = command_graph_node_new(cg, host_device, COMMAND_GRAPH_NODE_TYPE_COMMAND);
+    assert(u);
+    u->command = cmd_u;
+
+    /* Node v: axpy, same block but grid.x = 2 (DIFFERENT from u) */
+    command_t * cmd_v = command_new(cg, COMMAND_TYPE_PROG);
+    assert(cmd_v);
+    cmd_v->prog.source.type                 = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
+    cmd_v->prog.source.content.llvmir.raw   = (void *) axpy_llvm_ir;
+    cmd_v->prog.source.content.llvmir.size  = sizeof(axpy_llvm_ir);
+    cmd_v->prog.launcher.variadic.fn        = nullptr;
+    cmd_v->prog.args      = axpy_args;
+    cmd_v->prog.n_args    = sizeof(axpy_args)  / sizeof(void *);
+    cmd_v->prog.grid.x  = 2; cmd_v->prog.grid.y  = 1; cmd_v->prog.grid.z  = 1;
+    cmd_v->prog.block.x = 1; cmd_v->prog.block.y = 1; cmd_v->prog.block.z = 1;
+
+    command_graph_node_t * v = command_graph_node_new(cg, host_device, COMMAND_GRAPH_NODE_TYPE_COMMAND);
+    assert(v);
+    v->command = cmd_v;
+
+    /* Build graph: entry -> u -> v -> exit */
+    entry->precedes(u);
+    u->precedes(v);
+    v->precedes(exit);
+
+    cg->dump("cg-pre-prog-fuse-distinct-grid.dot");
+
+    /* Run the prog-fuse pass: must be a no-op because the launch params differ */
+    cg->optimize(COMMAND_GRAPH_PASS_PROG_FUSE);
+
+    cg->dump("cg-post-prog-fuse-distinct-grid.dot");
+
+    /* Verify: both nodes remain (NOT fused) */
+    size_t node_count = 0;
+    cg->walk([&](command_graph_node_t * node) {
+        if (node != cg->node_get_entry() && node != cg->node_get_exit())
+            node_count++;
+    });
+
+    if (node_count != 2)
+    {
+        fprintf(stderr, "FAIL: expected 2 nodes (no fusion across distinct grids), got %zu\n", node_count);
+        return 1;
+    }
+
+    fprintf(stdout, "PASS: prog-fuse left programs with distinct grids unfused (2 nodes)\n");
+    return 0;
+}
 
 int
 main(void)
@@ -144,6 +263,21 @@ main(void)
     for (size_t i = 0 ; i < n ; ++i)
         y_expected[i] = a * x[i] + s * y[i];
 
+    /* Typed argument values; their addresses are the launcher arg slots.
+     * y and n are shared by both kernels (scale's y == axpy's y, same n), so
+     * argument deduplication should compact 7 slots -> 5. These must outlive the
+     * fused-wrapper call (their addresses are stored in the fused args buffer). */
+    double   s_val = s;
+    double   a_val = a;
+    double * xp    = x;
+    double * yp    = y;
+    int64_t  nn    = static_cast<int64_t>(n);
+
+    /* Per-program argument slot arrays (each slot = &value), populated BEFORE
+     * fusion so the pass can read them, deduplicate, and fill the fused buffer. */
+    void * scale_args[3] = { &s_val, &yp, &nn };       /* scale(s, y, n)   */
+    void * axpy_args[4]  = { &a_val, &xp, &yp, &nn };  /* axpy(a, x, y, n) */
+
     /* Create a command graph */
     command_graph_t * cg = command_graph_new();
     assert(cg);
@@ -162,6 +296,13 @@ main(void)
     cmd_u->prog.source.type                 = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
     cmd_u->prog.source.content.llvmir.raw   = (void *) scale_llvm_ir;
     cmd_u->prog.source.content.llvmir.size  = sizeof(scale_llvm_ir);
+    cmd_u->prog.launcher.variadic.fn        = nullptr;
+    cmd_u->prog.args      = scale_args;
+    cmd_u->prog.n_args    = sizeof(scale_args) / sizeof(void *);
+    /* Identical launch params on both progs (required for fusion); the fused
+     * node must inherit these exact grid/block dimensions. */
+    cmd_u->prog.grid.x  = 4;  cmd_u->prog.grid.y  = 2; cmd_u->prog.grid.z  = 1;
+    cmd_u->prog.block.x = 32; cmd_u->prog.block.y = 1; cmd_u->prog.block.z = 1;
 
     constexpr device_unique_id_t host_device = 0;
     command_graph_node_t * u = command_graph_node_new(cg, host_device, COMMAND_GRAPH_NODE_TYPE_COMMAND);
@@ -174,6 +315,12 @@ main(void)
     cmd_v->prog.source.type                 = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
     cmd_v->prog.source.content.llvmir.raw   = (void *) axpy_llvm_ir;
     cmd_v->prog.source.content.llvmir.size  = sizeof(axpy_llvm_ir);
+    cmd_v->prog.launcher.variadic.fn        = nullptr;
+    cmd_v->prog.args      = axpy_args;
+    cmd_v->prog.n_args    = sizeof(axpy_args)  / sizeof(void *);
+    /* same launch params as cmd_u */
+    cmd_v->prog.grid.x  = 4;  cmd_v->prog.grid.y  = 2; cmd_v->prog.grid.z  = 1;
+    cmd_v->prog.block.x = 32; cmd_v->prog.block.y = 1; cmd_v->prog.block.z = 1;
 
     command_graph_node_t * v = command_graph_node_new(cg, host_device, COMMAND_GRAPH_NODE_TYPE_COMMAND);
     assert(v);
@@ -187,8 +334,10 @@ main(void)
     /* Dump graph before optimization */
     cg->dump("cg-pre-prog-fuse.dot");
 
-    /* Run the prog-fuse pass */
+    /* Run the prog-fuse pass (fuses IR, leaves the launcher fn NULL) followed by
+     * the jit pass (compiles the fused program and installs the fn) */
     cg->optimize(COMMAND_GRAPH_PASS_PROG_FUSE);
+    cg->optimize(COMMAND_GRAPH_PASS_JIT);
 
     /* Dump graph after optimization */
     cg->dump("cg-post-prog-fuse.dot");
@@ -236,7 +385,20 @@ main(void)
         return 1;
     }
 
+    /* The fused node must inherit the (identical) launch parameters of the
+     * programs it fused (grid=(4,2,1), block=(32,1,1) set above). */
+    if (fused->command->prog.grid.x  != 4  || fused->command->prog.grid.y  != 2 || fused->command->prog.grid.z  != 1 ||
+        fused->command->prog.block.x != 32 || fused->command->prog.block.y != 1 || fused->command->prog.block.z != 1)
+    {
+        fprintf(stderr,
+                "FAIL: fused node launch params not propagated: grid=(%u,%u,%u) block=(%u,%u,%u)\n",
+                fused->command->prog.grid.x, fused->command->prog.grid.y, fused->command->prog.grid.z,
+                fused->command->prog.block.x, fused->command->prog.block.y, fused->command->prog.block.z);
+        return 1;
+    }
+
     fprintf(stdout, "PASS: prog-fuse produced 1 fused PROG node with LLVM-IR source\n");
+    fprintf(stdout, "PASS: fused node inherited the programs' launch parameters\n");
 
     /* ------------------------------------------------------------------ *
      *  Numerical correctness test                                         *
@@ -244,24 +406,23 @@ main(void)
      *  The fused wrapper has signature:                                   *
      *    void __fused_wrapper(void ** args)                               *
      *                                                                     *
-     *  args[] layout (set by the pass, filled here by the caller):       *
-     *    args[0] = &s       (double   — scale factor for scale())        *
-     *    args[1] = &yp      (double * — array pointer  for scale())      *
-     *    args[2] = &nn      (int64_t  — length         for scale())      *
-     *    args[3] = &a       (double   — scale factor for axpy())         *
-     *    args[4] = &xp      (double * — x array pointer for axpy())      *
-     *    args[5] = &yp      (double * — y array pointer for axpy())      *
-     *    args[6] = &nn      (int64_t  — length         for axpy())       *
-     *                                                                     *
-     *  Each slot holds a void* that points to the actual value, matching *
-     *  the double-dereference in load_arg() inside the wrapper.          *
+     *  The pass read the originals' args (scale_args / axpy_args), merged  *
+     *  the shared slots (y and n), and filled the fused buffer with the    *
+     *  5 deduplicated slots:                                               *
+     *    args[0] = &s_val   (scale s)                                      *
+     *    args[1] = &yp      (y*, shared by scale and axpy)                 *
+     *    args[2] = &nn      (n,  shared by scale and axpy)                 *
+     *    args[3] = &a_val   (axpy a)                                       *
+     *    args[4] = &xp      (axpy x*)                                      *
+     *  Each slot holds a void* that points to the actual value, matching   *
+     *  the double-dereference in load_arg() inside the wrapper.            *
      * ------------------------------------------------------------------ */
 
-    /* The variadic launcher stores fn, the pre-allocated args buffer, and
-     * its byte size.  args_size / sizeof(void*) gives the slot count.   */
-    void *   fn        = fused->command->prog.launcher.variadic.fn;
-    void **  args_buf  = static_cast<void **>(fused->command->prog.launcher.variadic.args);
-    size_t   args_size = fused->command->prog.launcher.variadic.args_size;
+    /* The variadic launcher stores fn, the args buffer (already filled by the
+     * pass), and its slot count n_args.  */
+    auto     fn       = fused->command->prog.launcher.variadic.fn;
+    void **  args_buf = fused->command->prog.args;
+    size_t   n_args   = fused->command->prog.n_args;
 
     if (!fn)
     {
@@ -269,33 +430,16 @@ main(void)
         return 1;
     }
 
-    size_t n_args = args_size / sizeof(void *);
-    if (n_args != 7)
+    if (n_args != 5)
     {
-        fprintf(stderr, "FAIL: expected 7 args slots (3 for scale + 4 for axpy), got %zu\n", n_args);
+        fprintf(stderr, "FAIL: expected 5 deduplicated arg slots "
+                        "(scale{s,y,n} + axpy{a,x,y,n} with y and n shared), got %zu\n", n_args);
         return 1;
     }
 
-    /* Typed variables whose addresses are passed to the wrapper.
-     * Use int64_t for the length to match the i64 IR parameter type.    */
-    double    s_val  = s;
-    double    a_val  = a;
-    double *  xp     = x;
-    double *  yp     = y;
-    int64_t   nn     = static_cast<int64_t>(n);
-
-    /* Populate the args buffer: each slot = pointer to the typed value. */
-    args_buf[0] = &s_val;   /* scale: s      */
-    args_buf[1] = &yp;      /* scale: y*     */
-    args_buf[2] = &nn;      /* scale: n      */
-    args_buf[3] = &a_val;   /* axpy:  a      */
-    args_buf[4] = &xp;      /* axpy:  x*     */
-    args_buf[5] = &yp;      /* axpy:  y*     */
-    args_buf[6] = &nn;      /* axpy:  n      */
-
-    /* Call the fused wrapper. */
-    typedef void (*fused_fn_t)(void **);
-    reinterpret_cast<fused_fn_t>(fn)(args_buf);
+    /* The pass already filled args_buf with the deduplicated slots (pointing at
+     * s_val / yp / nn / a_val / xp declared above), so just invoke the wrapper. */
+    fn(args_buf);
 
     /* Check results: the fused kernel performed scale then axpy, so:
      *   y[i]  = a * x[i] + s * y_init[i]
@@ -317,5 +461,10 @@ main(void)
         return 1;
 
     fprintf(stdout, "PASS: fused kernel produced numerically correct results\n");
+
+    /* Negative test: programs with distinct launch parameters must not fuse. */
+    if (test_distinct_grid_not_fused() != 0)
+        return 1;
+
     return 0;
 }

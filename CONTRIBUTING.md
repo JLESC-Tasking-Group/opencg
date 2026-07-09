@@ -1,13 +1,13 @@
-# Contributing to OpenCG
+# Contributing to CGIR
 
-We welcome any form of contributions to OpenCG.
-Note that OpenCG is primarly a research software, and may be unstable.
+We welcome any form of contributions to CGIR.
+Note that CGIR is primarly a research software, and may be unstable.
 
 ## Bug reports, Feature Requests
 
-Please open issues at [https://github.com/JLESC-Tasking-Group/opencg/issues](https://github.com/JLESC-Tasking-Group/opencg/issues) (no template required, just be descriptive)
+Please open issues at [https://github.com/JLESC-Tasking-Group/cgir/issues](https://github.com/JLESC-Tasking-Group/cgir/issues) (no template required, just be descriptive)
 
-## Extending OpenCG
+## Extending CGIR
 
 We strongly recommend any external contributors to reach-out with the team first ([Contact](#contact)).
 
