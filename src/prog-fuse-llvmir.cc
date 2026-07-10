@@ -74,7 +74,9 @@
 # include <llvm/Analysis/ValueTracking.h>
 # include <llvm/IR/Function.h>
 # include <llvm/IR/IRBuilder.h>
+# include <llvm/IR/CallingConv.h>
 # include <llvm/IR/Instructions.h>
+# include <llvm/IR/IntrinsicInst.h>
 # include <llvm/IR/LLVMContext.h>
 # include <llvm/IR/MDBuilder.h>
 # include <llvm/IR/Module.h>
@@ -101,6 +103,12 @@
 # include <llvm/Transforms/Scalar/LoopPassManager.h>
 # include <llvm/Transforms/Scalar/LoopRotation.h>
 # include <llvm/Transforms/Utils/LoopSimplify.h>
+/* Pre-fusion cleanup: promote the per-body reconstruction allocas and remove the
+ * inter-loop cruft so LoopFuse sees adjacent loops accessing the shared base
+ * pointers directly (see optimize_module). */
+# include <llvm/Transforms/Scalar/SROA.h>
+# include <llvm/Transforms/Scalar/SimplifyCFG.h>
+# include <llvm/Transforms/InstCombine/InstCombine.h>
 
 /* In-process JIT (replaces the former Proteus dependency) */
 # include <llvm/ExecutionEngine/Orc/LLJIT.h>
@@ -112,6 +120,11 @@
 # include <llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h>
 # include <llvm/Support/CodeGen.h>
 # include <llvm/Support/Error.h>
+
+/* Device (GPU) code generation: emit PTX for a device target (nvptx64) via the
+ * legacy codegen pass manager (addPassesToEmitFile). */
+# include <llvm/IR/LegacyPassManager.h>
+# include <llvm/ADT/SmallString.h>
 
 # include <atomic>
 # include <cassert>
@@ -297,10 +310,212 @@ prefix_functions(llvm::Module & M, const std::string & prefix)
         F->setName(prefix + F->getName().str());
 }
 
-/* Run an O3 module pipeline (inlining + loop-fuse + vectorization) on the
- * merged module, so the inlined kernels' loops can vectorize/fuse. */
+/* Attach shared-domain scoped-noalias metadata to the fused wrapper's memory
+ * accesses: one alias scope per distinct captured base pointer, with every data
+ * access marked `noalias` against all the OTHER bases. This is the restrict-like
+ * assumption (distinct captured base pointer => non-overlapping), consistent with
+ * prog-fuse's dedup contract (the same array collapses to one slot, hence one base
+ * load, so distinct base loads are distinct arrays).
+ *
+ * A "captured base" is a pointer LOADED from the args buffer -- the deduplicated
+ * array base each kernel reads/writes through. We restrict tagging to loads/stores
+ * of NON-pointer values (the actual array data) so the args-buffer pointer chasing
+ * is skipped, and require the access's underlying object to be a load (the base),
+ * so stack temporaries are left alone.
+ *
+ * MUST run AFTER SROA (see optimize_module): only then does each array access
+ * resolve to its base load -- uniformly for the pointers (void**, base = the
+ * &value's deref) and packed (void*,size_t, base = the pointer read from the
+ * buffer) shapes. With it, DependenceAnalysis can fuse the loops and the loop
+ * vectorizer needs no runtime alias check. */
 static void
-optimize_module(llvm::Module & M, llvm::TargetMachine * tm)
+tag_noalias_domains(llvm::Function & F)
+{
+    llvm::LLVMContext & ctx = F.getContext();
+    llvm::MDBuilder mdb(ctx);
+    llvm::MDNode * domain = mdb.createAnonymousAliasScopeDomain("cgir.prog-fuse");
+
+    /* Only the deduplicated CAPTURE base loads carry the "cgir.fuse.base" marker
+     * (stamped where they are hoisted, see command_graph_prog_fuse_llvmir). We tag
+     * exactly those, never arbitrary loaded pointers: the restrict-like "distinct
+     * base => no overlap" assumption is only valid for distinct captures (same
+     * array collapses to one slot = one marked load), NOT for pointers a body loads
+     * from its own data (e.g. pointer-array/linked-structure chasing), which could
+     * genuinely alias. Missing the marker just leaves an access untagged
+     * (conservative), never mis-tagged. */
+    const unsigned base_kind = ctx.getMDKindID("cgir.fuse.base");
+
+    /* the deduplicated captured base of a taggable data access, or nullptr */
+    auto data_base = [&] (llvm::Instruction & I) -> llvm::Value *
+    {
+        llvm::Value * ptr = llvm::getLoadStorePointerOperand(&I);
+        if (ptr == nullptr)
+            return nullptr;
+        llvm::Type * ty = nullptr;
+        if (auto * LI = llvm::dyn_cast<llvm::LoadInst>(&I))
+            ty = LI->getType();
+        else if (auto * SI = llvm::dyn_cast<llvm::StoreInst>(&I))
+            ty = SI->getValueOperand()->getType();
+        if (ty == nullptr || ty->isPointerTy())
+            return nullptr; /* skip args-buffer pointer chasing */
+        llvm::Value * base = llvm::getUnderlyingObject(ptr);
+        auto * L = llvm::dyn_cast<llvm::LoadInst>(base);
+        return (L && L->getMetadata(base_kind)) ? base : nullptr;
+    };
+
+    std::unordered_map<llvm::Value *, llvm::MDNode *> base_to_scope;
+    std::vector<llvm::Metadata *>                     all_scopes;
+    for (llvm::BasicBlock & BB : F)
+        for (llvm::Instruction & I : BB)
+        {
+            llvm::Value * base = data_base(I);
+            if (base == nullptr)
+                continue;
+            if (base_to_scope.find(base) == base_to_scope.end())
+            {
+                llvm::MDNode * sc = mdb.createAnonymousAliasScope(domain, "cgir.prog-fuse.base");
+                base_to_scope[base] = sc;
+                all_scopes.push_back(sc);
+            }
+        }
+
+    /* With <2 distinct bases there is nothing to disambiguate. */
+    if (all_scopes.size() < 2)
+        return ;
+
+    for (llvm::BasicBlock & BB : F)
+        for (llvm::Instruction & I : BB)
+        {
+            llvm::Value * base = data_base(I);
+            if (base == nullptr)
+                continue;
+            llvm::Metadata * own = base_to_scope[base];
+            I.setMetadata(llvm::LLVMContext::MD_alias_scope,
+                          llvm::MDNode::get(ctx, { own }));
+            std::vector<llvm::Metadata *> others;
+            others.reserve(all_scopes.size() - 1);
+            for (llvm::Metadata * s : all_scopes)
+                if (s != own)
+                    others.push_back(s);
+            I.setMetadata(llvm::LLVMContext::MD_noalias,
+                          llvm::MDNode::get(ctx, others));
+        }
+}
+
+/* Structural (by-value) equality of two constants. prog-fuse parses every kernel
+ * module into ONE LLVMContext, which renames structurally-identical named struct
+ * types (ConfigurationEnvironmentTy -> .2, .3, ...); identical launch configs are
+ * then DISTINCT uniqued Constants, so a pointer compare is insufficient -- recurse
+ * and compare integer field values instead. */
+static bool
+constant_value_equal(llvm::Constant * a, llvm::Constant * b)
+{
+    if (a == b)                                 return true;   // same uniqued constant
+    if (a == nullptr || b == nullptr)           return false;
+    if (a->isNullValue() && b->isNullValue())   return true;   // zero-inits of renamed types
+    if (auto * ia = llvm::dyn_cast<llvm::ConstantInt>(a))
+    {
+        auto * ib = llvm::dyn_cast<llvm::ConstantInt>(b);
+        return ib && ia->getValue() == ib->getValue();
+    }
+    auto * aa = llvm::dyn_cast<llvm::ConstantAggregate>(a);
+    auto * ab = llvm::dyn_cast<llvm::ConstantAggregate>(b);
+    if (!aa || !ab || aa->getNumOperands() != ab->getNumOperands())
+        return false;
+    for (unsigned i = 0 ; i < aa->getNumOperands() ; ++i)
+        if (!constant_value_equal(aa->getOperand(i), ab->getOperand(i)))
+            return false;
+    return true;
+}
+
+/* Collapse the per-kernel OpenMP-device runtime brackets in a fused device kernel.
+ * Inlining N device target-region kernels into one wrapper leaves N
+ * `__kmpc_target_init`/`__kmpc_target_deinit` pairs, but a single launch must have
+ * exactly ONE. For SPMD kernels (target_init returns -1 => every thread runs the
+ * body) with an identical launch configuration, keep the FIRST init and the LAST
+ * deinit and drop the inner ones: each removed init's result is replaced by -1 so
+ * its "== -1 => body" branch falls through into the body, and each removed deinit
+ * is erased. Returns false if the kernels are not the expected SPMD shape or their
+ * launch configurations differ (caller must then NOT fuse them). Assumes the
+ * inlined bodies appear in launch order (block layout order), which holds since the
+ * wrapper calls them in order and we inline in place. */
+static bool
+collapse_device_kernel_brackets(llvm::Function & F)
+{
+    std::vector<llvm::CallInst *> inits, deinits;
+    for (llvm::BasicBlock & BB : F)
+        for (llvm::Instruction & I : BB)
+            if (auto * CI = llvm::dyn_cast<llvm::CallInst>(&I))
+                if (llvm::Function * cf = CI->getCalledFunction())
+                {
+                    if (cf->getName() == "__kmpc_target_init")   inits.push_back(CI);
+                    else if (cf->getName() == "__kmpc_target_deinit") deinits.push_back(CI);
+                }
+
+    /* need N matched pairs (N == number of fused kernels >= 2) */
+    if (inits.size() < 2 || inits.size() != deinits.size())
+        return false;
+
+    /* All kernels must share the launch configuration: the first field of
+     * KernelEnvironmentTy (ConfigurationEnvironmentTy), which holds only integers
+     * (exec-mode, thread/team bounds, reduction sizes). Compare it by VALUE
+     * (constant_value_equal), not by Constant pointer: parsing the kernels into one
+     * context renames the type per kernel (.2/.3), so identical configs are not the
+     * same uniqued Constant. */
+    auto config_of = [] (llvm::CallInst * init) -> llvm::Constant *
+    {
+        llvm::Value * env = init->getArgOperand(0)->stripPointerCasts();
+        auto * G = llvm::dyn_cast<llvm::GlobalVariable>(env);
+        if (!G || !G->hasInitializer())
+            return nullptr;
+        auto * CS = llvm::dyn_cast<llvm::ConstantStruct>(G->getInitializer());
+        return (CS && CS->getNumOperands() >= 1) ? CS->getOperand(0) : nullptr;
+    };
+    llvm::Constant * cfg0 = config_of(inits[0]);
+    if (cfg0 == nullptr)
+        return false;
+    for (size_t i = 1 ; i < inits.size() ; ++i)
+        if (!constant_value_equal(config_of(inits[i]), cfg0))
+            return false;
+
+    /* Each init must be the SPMD pattern: its result feeds `icmp eq <res>, -1`. */
+    auto is_spmd_init = [] (llvm::CallInst * init) -> bool
+    {
+        for (llvm::User * u : init->users())
+            if (auto * ic = llvm::dyn_cast<llvm::ICmpInst>(u))
+                if (ic->getPredicate() == llvm::CmpInst::ICMP_EQ)
+                    if (auto * c = llvm::dyn_cast<llvm::ConstantInt>(ic->getOperand(1)))
+                        if (c->isMinusOne())
+                            return true;
+        return false;
+    };
+    for (llvm::CallInst * init : inits)
+        if (!is_spmd_init(init))
+            return false;
+
+    /* keep inits[0] and deinits[last]; drop the inner brackets */
+    llvm::Type * i32 = llvm::Type::getInt32Ty(F.getContext());
+    for (size_t i = 1 ; i < inits.size() ; ++i)
+    {
+        inits[i]->replaceAllUsesWith(llvm::ConstantInt::getSigned(i32, -1));
+        inits[i]->eraseFromParent();
+    }
+    for (size_t i = 0 ; i + 1 < deinits.size() ; ++i)
+        deinits[i]->eraseFromParent();
+    return true;
+}
+
+/* Write `M` as textual IR to <dir>/<name> (defined below; forward-declared so the
+ * optimize pipeline can dump the pre-LoopFuse wrapper for debugging). */
+static void dump_module(const std::string & dir, const char * name, llvm::Module & M);
+
+/* Run an O3 module pipeline (inlining + loop-fuse + vectorization) on the
+ * merged module, so the inlined kernels' loops can vectorize/fuse. `dump_dir` is
+ * the (possibly empty) CGIR_PROG_FUSE_DUMP directory: when set, the wrapper is
+ * dumped after the SROA+noalias cleanup and BEFORE loop-fusion, so the exact IR
+ * LoopFuse operates on can be inspected. */
+static void
+optimize_module(llvm::Module & M, llvm::TargetMachine * tm, const std::string & dump_dir)
 {
     llvm::PassBuilder PB(tm);
 
@@ -331,27 +546,52 @@ optimize_module(llvm::Module & M, llvm::TargetMachine * tm)
      * its sibling-loop ("SameSD") reasoning only kicks in when the access address
      * recurrence is provably non-wrapping, i.e. the kernel's array GEPs are
      * `inbounds` (checkSubscript -> hasNoSignedWrap in DependenceAnalysis.cpp).
-     * Compiler-emitted kernels (clang/libomptarget) always use `inbounds` GEPs,
-     * so they fuse. We currently RELY on that witness (option (i)): present =>
-     * provably safe => fuse; absent => DA stays conservative => fusion is safely
-     * skipped. A future option (ii) — for more aggressive coverage of hand-rolled
-     * or non-`inbounds` IR — would have this pass stamp `inbounds`/`nsw` onto the
-     * inlined kernel GEPs/IVs under cgir's well-formedness (in-bounds, elementwise)
-     * contract. That never produces an illegal fusion (LoopFuse still enforces
-     * legality) but does assert memory-safety, so it is deferred for now. */
+     * Compiler-emitted kernels (clang/libomptarget) always use `inbounds` GEPs.
+     *
+     * BUT LoopFuse also requires the loops to be ADJACENT and to access memory it
+     * can relate. As inlined by step 6b (before any SROA), each kernel body still
+     * rebuilds its captures through LOCAL allocas and its params carry
+     * `llvm.experimental.noalias.scope.decl` intrinsics -- so consecutive loops
+     * (a) access the shared arrays indirectly through distinct allocas (DA cannot
+     * relate scale's y[i] to axpy's y[i]) and (b) are separated by the scope.decl
+     * cruft (not adjacent). We therefore CLEAN UP first: SROA promotes the
+     * reconstruction allocas so the accesses use the deduplicated base pointers
+     * directly, and instcombine + simplify-cfg drop the now-dead scope decls and
+     * empty blocks. THEN we attach the shared-domain scoped-noalias metadata
+     * (tag_noalias_domains) -- now that each access resolves to its base load --
+     * so DependenceAnalysis can prove the cross-loop dependences and the vectorizer
+     * needs no runtime alias check; after which loop-simplify/rotate/fuse merge the
+     * loops (e.g. scale+axpy -> one axpby) and the O3 pipeline vectorizes it. */
     {
-        llvm::FunctionPassManager FPM;
-        FPM.addPass(llvm::LoopSimplifyPass());
+        /* 1. cleanup: promote reconstruction allocas + remove inter-loop cruft */
+        llvm::FunctionPassManager FPM1;
+        FPM1.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+        FPM1.addPass(llvm::InstCombinePass());
+        FPM1.addPass(llvm::SimplifyCFGPass());
+        llvm::ModulePassManager MPM1;
+        MPM1.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM1)));
+        MPM1.run(M, MAM);
 
+        /* 2. attach scoped-noalias now that accesses resolve to their base loads */
+        if (llvm::Function * wrapper = M.getFunction("__fused_wrapper"))
+            tag_noalias_domains(*wrapper);
+        /* the tagging edited IR outside the pass managers; drop cached analyses so
+         * the loop passes below see the new metadata. */
+        MAM.invalidate(M, llvm::PreservedAnalyses::none());
+
+        /* dump the exact IR loop-fusion will see (post cleanup + noalias, pre-fuse) */
+        dump_module(dump_dir, "prefuse.ll", M);
+
+        /* 3. canonicalize + rotate + fuse the loops */
+        llvm::FunctionPassManager FPM2;
+        FPM2.addPass(llvm::LoopSimplifyPass());
         llvm::LoopPassManager LPM;
         LPM.addPass(llvm::LoopRotatePass());
-        FPM.addPass(llvm::createFunctionToLoopPassAdaptor(std::move(LPM)));
-
-        FPM.addPass(llvm::LoopFusePass());
-
-        llvm::ModulePassManager PreMPM;
-        PreMPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
-        PreMPM.run(M, MAM);
+        FPM2.addPass(llvm::createFunctionToLoopPassAdaptor(std::move(LPM)));
+        FPM2.addPass(llvm::LoopFusePass());
+        llvm::ModulePassManager MPM2;
+        MPM2.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM2)));
+        MPM2.run(M, MAM);
     }
 
     llvm::ModulePassManager MPM = PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3);
@@ -499,6 +739,13 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     {
         std::string          fused_name;  /* entry name after prefixing */
         bool                 is_wrapper;  /* true if entry is void(void**) */
+        /* true if entry is a packed self-contained body void(void*, size_t): its
+         * arg slots (&value) come from the params table (one per capture), not the
+         * IR parameters (which are just the buffer pointer + size). Fusion
+         * reconstructs each such body's own packed buffer from the deduplicated
+         * fused buffer (at the params' offsets) and calls it. */
+        bool                 is_packed_leaf;
+        size_t               buf_size;    /* packed-leaf: this body's buffer size */
         unsigned             arity;       /* number of arg slots consumed */
         std::vector<void *>  slots;       /* the originals' arg slots (&value) */
         /* Deduplicate leaf slots by the DEREFERENCED value (not by slot address)
@@ -527,17 +774,24 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
 
         llvm::Function * entry = nullptr;
         bool is_wrapper = false;
+        bool is_packed_leaf = false;
+        size_t buf_size = 0;
         unsigned arity = 0;
         bool value_dedup = false;
 
-        /* A task-spawn body comes in one of two forms, distinguished by the
+        /* A task-spawn body comes in one of three forms, distinguished by the
          * entry signature:
-         *  - unpacked (fusable): `void .omp_task_kernel.(<captured values...>)`,
+         *  - unpacked leaf (fusable): `void .omp_task_kernel.(<captured values...>)`,
          *    one parameter per captured value, so its loops can be fused. Deduped
          *    by VALUE (each task has its own storage, so slot addresses differ
          *    across bodies even when values are equal; see value_dedup).
-         *  - packed: the `void(void**)` kernel consuming the whole args block
-         *    (args[0] == kmp_task_t*); fuses only at the PROGRAM level. */
+         *  - packed leaf (fusable): `void .omp_task_kernel.(void*, size_t)`, a
+         *    self-contained body reading its captures from a packed buffer at the
+         *    params table's offsets. Its arg slots come from the params table (one
+         *    &value per capture); fusion reconstructs each body's buffer from the
+         *    deduplicated fused buffer and calls it (see is_packed_leaf).
+         *  - packed wrapper: the `void(void**)` kernel consuming the whole args
+         *    block (args[0] == kmp_task_t*); fuses only at the PROGRAM level. */
         if (progs[i]->launch_mode == CGIR_COMMAND_PROG_LAUNCH_MODE_TASK_SPAWN)
         {
             if (const char * sym = progs[i]->source.content.llvmir.symbol)
@@ -547,7 +801,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             if (entry == nullptr)
                 entry = find_packed_wrapper(M);   /* packed void(void**) kernel */
             if (entry == nullptr)
-                entry = find_external_def(M);      /* unpacked .omp_task_kernel. */
+                entry = find_external_def(M);      /* unpacked/packed .omp_task_kernel. */
             if (!entry || entry->isDeclaration())
             {
                 fprintf(stderr, "prog-fuse: no entry found in task-spawn program %zu\n", i);
@@ -555,14 +809,37 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             }
 
             llvm::FunctionType * fty = entry->getFunctionType();
+            const command_prog_param_t * params = progs[i]->source.content.llvmir.params;
             if (is_void_voidptr(fty))
             {
                 is_wrapper = true;
                 arity      = (unsigned) progs[i]->n_args;
             }
+            else if (is_void_ptr_size(fty))
+            {
+                /* packed self-contained body: slots + layout come from the params
+                 * table. A packed body without a params table is a previously-fused
+                 * packed program (prog-fuse clears params); re-fusing that is not
+                 * supported (it consumes a whole buffer, not per-slot values). */
+                if (params == nullptr)
+                {
+                    fprintf(stderr, "prog-fuse: cannot re-fuse packed fused program %zu "
+                                    "(no params table)\n", i);
+                    abort();
+                }
+                is_packed_leaf = true;
+                arity          = (unsigned) progs[i]->source.content.llvmir.param_count;
+                /* this body's own packed buffer size = max(offset + size) */
+                for (unsigned k = 0 ; k < arity ; ++k)
+                {
+                    const size_t end = params[k].offset + params[k].size;
+                    if (end > buf_size) buf_size = end;
+                }
+                if (buf_size == 0) buf_size = 1;
+            }
             else
             {
-                /* leaf form: one slot per captured value, deduplicated by value */
+                /* unpacked leaf: one slot per captured value, deduplicated by value */
                 is_wrapper  = false;
                 arity       = fty->getNumParams();
                 value_dedup = true;
@@ -582,6 +859,12 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             }
             is_wrapper = false;
             arity      = entry->getFunctionType()->getNumParams();
+            /* device (GPU) target-region kernels: deduplicate their kernelParams by
+             * VALUE so a shared mapped array / equal scalar is passed once to the
+             * fused kernel (their per-launch kernelParams live at distinct host
+             * addresses, so address dedup would not merge them). */
+            if (progs[i]->source.content.llvmir.triple)
+                value_dedup = true;
         }
 
         if (entry == nullptr)
@@ -622,12 +905,14 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         snprintf(prefix, sizeof(prefix), "__fz%zu_", i);
         prefix_functions(M, prefix);
 
-        inputs[i].fused_name  = std::string(prefix) + name;
-        inputs[i].is_wrapper  = is_wrapper;
-        inputs[i].arity       = arity;
-        inputs[i].value_dedup = value_dedup;
-        inputs[i].params      = progs[i]->source.content.llvmir.params;
-        inputs[i].param_count = progs[i]->source.content.llvmir.param_count;
+        inputs[i].fused_name     = std::string(prefix) + name;
+        inputs[i].is_wrapper     = is_wrapper;
+        inputs[i].is_packed_leaf = is_packed_leaf;
+        inputs[i].buf_size       = buf_size;
+        inputs[i].arity          = arity;
+        inputs[i].value_dedup    = value_dedup;
+        inputs[i].params         = progs[i]->source.content.llvmir.params;
+        inputs[i].param_count    = progs[i]->source.content.llvmir.param_count;
 
         /* for value-deduplicated leaf inputs, snapshot the parameter types so the
          * dedup key can read exactly the value bytes (and distinguish types) */
@@ -659,10 +944,61 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      *     across the fused bodies, and merging them into one hoisted load   *
      *     is what lets the fused loops share trip counts/offsets and fuse.  *
      * ------------------------------------------------------------------ */
+    /* Packed-leaf fusion is homogeneous: if any input is a packed self-contained
+     * body, they all must be (mixing shapes would need per-input ABIs the single
+     * fused entry cannot express). Guaranteed by per-TU -fopenmp-task-jit-type. */
+    bool any_packed_leaf = false;
+    for (size_t i = 0 ; i < n ; ++i)
+        any_packed_leaf |= inputs[i].is_packed_leaf;
+    if (any_packed_leaf)
+        for (size_t i = 0 ; i < n ; ++i)
+            if (!inputs[i].is_packed_leaf)
+            {
+                fprintf(stderr, "prog-fuse: cannot mix packed and non-packed task "
+                                "bodies in one fused chain (program %zu)\n", i);
+                abort();
+            }
+
+    /* Device (GPU) fusion: the chain's PROGs carry a device codegen target
+     * (triple/arch). Homogeneous by construction (a device kernel only chains with
+     * others on the same device via equal launch params). The fused entry is a
+     * single `ptx_kernel` (see below) compiled to PTX by the jit pass. */
+    const char * dev_triple = progs[0]->source.content.llvmir.triple;
+    const char * dev_arch   = progs[0]->source.content.llvmir.arch;
+    const bool   device     = (dev_triple != nullptr);
+    if (device)
+        for (size_t i = 0 ; i < n ; ++i)
+            if (progs[i]->source.content.llvmir.triple == nullptr)
+            {
+                fprintf(stderr, "prog-fuse: cannot mix device and host programs in one "
+                                "fused chain (program %zu)\n", i);
+                abort();
+            }
+
     std::vector<void *>                    unique_slots;
+    std::vector<size_t>                    unique_slot_size; /* byte size per unique slot */
+    std::vector<bool>                      unique_slot_is_ref; /* slot holds a pointer (REFERENCE) */
     std::unordered_map<std::string, unsigned> slot_to_index;
     std::vector<std::vector<unsigned>>     index_map(n);
     std::vector<unsigned>                  wrapper_block_start(n, 0);
+
+    /* byte size of leaf slot (i,j) from its param descriptor (0 if unknown) */
+    auto slot_size = [&] (size_t i, unsigned j) -> size_t
+    {
+        if (inputs[i].params != nullptr && j < inputs[i].param_count)
+        {
+            const command_prog_param_t & p = inputs[i].params[j];
+            return (p.kind == CGIR_COMMAND_PROG_PARAM_COPY) ? p.size : sizeof(void *);
+        }
+        return 0;
+    };
+
+    /* true iff leaf slot (i,j) is a by-reference (pointer) parameter */
+    auto slot_is_ref = [&] (size_t i, unsigned j) -> bool
+    {
+        return inputs[i].params != nullptr && j < inputs[i].param_count &&
+               inputs[i].params[j].kind == CGIR_COMMAND_PROG_PARAM_REFERENCE;
+    };
 
     /* Identity key for a leaf slot. When the compiler forwarded per-parameter
      * descriptors (kind+size), dedup is EXPLICIT: a REFERENCE (shared) slot by
@@ -714,7 +1050,11 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         {
             wrapper_block_start[i] = (unsigned) unique_slots.size();
             for (unsigned k = 0 ; k < inputs[i].arity ; ++k)
+            {
                 unique_slots.push_back(inputs[i].slots[k]);
+                unique_slot_size.push_back(sizeof(void *));
+                unique_slot_is_ref.push_back(true); /* void** slice slots are pointers */
+            }
         }
         else
         {
@@ -728,6 +1068,8 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
                 {
                     idx = (unsigned) unique_slots.size();
                     unique_slots.push_back(inputs[i].slots[j]);
+                    unique_slot_size.push_back(slot_size(i, j));
+                    unique_slot_is_ref.push_back(slot_is_ref(i, j));
                     slot_to_index[key] = idx;
                 }
                 else
@@ -780,6 +1122,11 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         /* fold the constituent into __fused_wrapper */
         F->setLinkage(llvm::GlobalValue::InternalLinkage);
         F->addFnAttr(llvm::Attribute::AlwaysInline);
+        /* device kernels carry the `ptx_kernel` calling convention; as an inlined
+         * internal helper it must be plain-callable, so neutralize the CC (the body
+         * is unaffected; the single fused entry re-declares ptx_kernel). */
+        if (device)
+            F->setCallingConv(llvm::CallingConv::C);
     }
 
     /* ------------------------------------------------------------------ *
@@ -797,11 +1144,13 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     /* Determine the value type of each deduplicated leaf slot from its first
      * use. Every kernel sharing a slot must read it as the same type (the slot
      * holds one &value); with opaque pointers, pointer args are all `ptr`, and
-     * shared scalars (e.g. the length `n`) are consistent. */
+     * shared scalars (e.g. the length `n`) are consistent. Packed leaves carry no
+     * per-slot IR types (their IR params are just buffer ptr + size); their slot
+     * byte sizes come from unique_slot_size instead, so they are skipped here. */
     std::vector<llvm::Type *> slot_type(total_args, nullptr);
     for (size_t i = 0 ; i < n ; ++i)
     {
-        if (inputs[i].is_wrapper)
+        if (inputs[i].is_wrapper || inputs[i].is_packed_leaf)
             continue;
         llvm::FunctionType * fty = mod_u->getFunction(inputs[i].fused_name)->getFunctionType();
         for (unsigned j = 0 ; j < inputs[i].arity ; ++j)
@@ -815,17 +1164,30 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         }
     }
 
-    /* Optional packed output ABI (CGIR_PROG_FUSE_PACKED): emit the fused entry as
-     * `void(void*, size_t)` over a single packed byte buffer -- each deduplicated
-     * slot inlined at a fixed (naturally-aligned) offset -- instead of
-     * `void(void**)` over a pointer array. Enabled only when every input is a leaf
-     * (a nested void** sub-wrapper needs a pointer slice the buffer cannot give).
-     * The dedup/inline/noalias logic is identical; only the arg access shape and
-     * the recorded args buffer differ. */
+    /* Packed output ABI: emit the fused entry as `void(void*, size_t)` over a
+     * single packed byte buffer -- each deduplicated slot inlined at a fixed
+     * (naturally-aligned) offset -- instead of `void(void**)` over a pointer
+     * array. Requested by -fopenmp-task-jit-type=packed (a PACKED_BUFFER source
+     * proto), or forced via CGIR_PROG_FUSE_PACKED. Enabled only when every input
+     * is a leaf (a nested void** sub-wrapper needs a pointer slice the buffer
+     * cannot give). The dedup/inline/noalias logic is identical; only the arg
+     * access shape and the recorded args buffer differ. */
     bool packed_output = dump_enabled("CGIR_PROG_FUSE_PACKED");
+    for (size_t i = 0 ; i < n ; ++i)
+        if (progs[i]->source.content.llvmir.proto ==
+            CGIR_COMMAND_PROG_SOURCE_PROTO_PACKED_BUFFER)
+            packed_output = true;
+    /* packed self-contained bodies (void(void*,size_t)) can only be fused into a
+     * packed buffer -- the reconstruction path requires the fused slot offsets. */
+    if (any_packed_leaf)
+        packed_output = true;
     for (size_t i = 0 ; packed_output && i < n ; ++i)
         if (inputs[i].is_wrapper)
             packed_output = false;
+    /* device fusion uses an individual-parameter ptx_kernel (kernelParams ABI),
+     * never the host void** packed byte-buffer shapes. */
+    if (device)
+        packed_output = false;
 
     std::vector<size_t> slot_offset(total_args, 0);
     size_t packed_size = 0;
@@ -833,9 +1195,23 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     {
         for (unsigned k = 0 ; k < total_args ; ++k)
         {
-            llvm::Type * T = slot_type[k] ? slot_type[k] : ptr_ty;
-            const size_t sz = (size_t) DL.getTypeStoreSize(T).getFixedValue();
-            const size_t al = (size_t) DL.getABITypeAlign(T).value();
+            size_t sz, al;
+            if (any_packed_leaf)
+            {
+                /* packed leaves: slot bytes come from the params table. Reference
+                 * (pointer) slots are reconstructed with a typed load/store (to
+                 * preserve pointer provenance so DependenceAnalysis can fuse the
+                 * loops), so align them naturally; by-value copies go through memcpy
+                 * and tolerate any alignment. */
+                sz = unique_slot_size[k] ? unique_slot_size[k] : 1;
+                al = unique_slot_is_ref[k] ? sizeof(void *) : 1;
+            }
+            else
+            {
+                llvm::Type * T = slot_type[k] ? slot_type[k] : ptr_ty;
+                sz = (size_t) DL.getTypeStoreSize(T).getFixedValue();
+                al = (size_t) DL.getABITypeAlign(T).value();
+            }
             packed_size = (packed_size + al - 1) & ~(al - 1);
             slot_offset[k] = packed_size;
             packed_size += sz;
@@ -844,6 +1220,116 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             packed_size = 1;
     }
 
+    if (device)
+    {
+        /* Device fusion (Level 1, program-level): build a single `ptx_kernel` over
+         * the deduplicated kernel parameters, call each region kernel with its
+         * subset, inline them, then collapse the per-kernel target_init/deinit
+         * brackets into one. The jit pass codegens this to PTX. */
+        std::vector<llvm::Type *> ptypes(total_args);
+        for (unsigned k = 0 ; k < total_args ; ++k)
+            ptypes[k] = slot_type[k] ? slot_type[k] : ptr_ty;
+        llvm::FunctionType * wfty = llvm::FunctionType::get(void_ty, ptypes, false);
+        llvm::Function * wrapper = llvm::Function::Create(
+            wfty, llvm::GlobalValue::ExternalLinkage, "__fused_wrapper", mod_u.get());
+        wrapper->setCallingConv(llvm::CallingConv::PTX_Kernel);
+
+        /* carry the device kernel function attributes (kernel, nvvm.maxntid,
+         * target-cpu/features) from a constituent; drop alwaysinline (this is the
+         * launched entry, not an inline callee). */
+        if (llvm::Function * proto = mod_u->getFunction(inputs[0].fused_name))
+        {
+            llvm::AttrBuilder ab(llvmctx, proto->getAttributes().getFnAttrs());
+            ab.removeAttribute(llvm::Attribute::AlwaysInline);
+            wrapper->addFnAttrs(ab);
+        }
+        /* distinct captured pointers are assumed non-overlapping (restrict) */
+        for (unsigned k = 0 ; k < total_args ; ++k)
+            if (ptypes[k]->isPointerTy())
+                wrapper->addParamAttr(k, llvm::Attribute::NoAlias);
+
+        llvm::BasicBlock * bb = llvm::BasicBlock::Create(llvmctx, "entry", wrapper);
+        llvm::IRBuilder<> builder(bb);
+        std::vector<llvm::CallInst *> kernel_calls;
+        kernel_calls.reserve(n);
+        for (size_t i = 0 ; i < n ; ++i)
+        {
+            llvm::Function * fn = mod_u->getFunction(inputs[i].fused_name);
+            std::vector<llvm::Value *> call_args;
+            call_args.reserve(inputs[i].arity);
+            for (unsigned j = 0 ; j < inputs[i].arity ; ++j)
+                call_args.push_back(wrapper->getArg(index_map[i][j]));
+            llvm::CallInst * ci = builder.CreateCall(fn->getFunctionType(), fn, call_args);
+            ci->setCallingConv(fn->getCallingConv());
+            kernel_calls.push_back(ci);
+        }
+        builder.CreateRetVoid();
+
+        for (llvm::CallInst * ci : kernel_calls)
+        {
+            llvm::InlineFunctionInfo ifi;
+            if (!llvm::InlineFunction(*ci, ifi).isSuccess())
+            {
+                fprintf(stderr, "prog-fuse: failed to inline a device kernel\n");
+                abort();
+            }
+        }
+
+        /* Transitively force-inline the kernels' whole helper chain into the
+         * wrapper (ptx_kernel entry -> *_debug__ -> *_omp_outlined -> ...). Only the
+         * entry was inlined above; the __kmpc_target_init/deinit brackets and the
+         * compute loops live in those (noinline/optnone) callees, so they must be
+         * pulled in here for collapse_device_kernel_brackets + loop-fusion to see
+         * them. In SPMD mode the parallel region is a direct call, so every level is
+         * inlinable; we stop at declarations (the __kmpc_* runtime) and intrinsics.
+         * Iterate to a fixpoint, restarting the scan after each inline (which
+         * invalidates iterators). */
+        for (bool changed = true ; changed ; )
+        {
+            changed = false;
+            for (llvm::BasicBlock & BB : *wrapper)
+            {
+                for (llvm::Instruction & I : BB)
+                {
+                    auto * ci = llvm::dyn_cast<llvm::CallInst>(&I);
+                    if (ci == nullptr)
+                        continue;
+                    llvm::Function * callee = ci->getCalledFunction();
+                    if (callee == nullptr || callee == wrapper ||
+                        callee->isDeclaration() || callee->isIntrinsic())
+                        continue;
+                    llvm::InlineFunctionInfo ifi;
+                    if (llvm::InlineFunction(*ci, ifi).isSuccess())
+                    {
+                        changed = true;
+                        break;   /* iterators invalidated -- rescan from the top */
+                    }
+                }
+                if (changed)
+                    break;
+            }
+        }
+
+        /* the inlined entries/helpers are now unused; drop the entries (the
+         * internal helpers are removed by globalDCE in optimize_module). */
+        for (size_t i = 0 ; i < n ; ++i)
+        {
+            llvm::Function * F = mod_u->getFunction(inputs[i].fused_name);
+            if (F && F->use_empty())
+                F->eraseFromParent();
+        }
+
+        /* collapse the N target_init/deinit brackets into one (SPMD + same config;
+         * aborts if that precondition does not hold). */
+        if (!collapse_device_kernel_brackets(*wrapper))
+        {
+            fprintf(stderr, "prog-fuse: device kernels are not fusible "
+                            "(non-SPMD or differing launch configuration)\n");
+            abort();
+        }
+    }
+    else
+    {
     llvm::FunctionType * wrapper_fty = packed_output
         ? llvm::FunctionType::get(void_ty, { ptr_ty, i64_ty }, false)
         : llvm::FunctionType::get(void_ty, { ptr_ty }, false);
@@ -860,6 +1346,16 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     llvm::BasicBlock * bb = llvm::BasicBlock::Create(llvmctx, "entry", wrapper);
     llvm::IRBuilder<> builder(bb);
     llvm::Value * args_ptr = wrapper->getArg(0);
+
+    /* Mark a hoisted capture-base load so tag_noalias_domains (run post-SROA)
+     * disambiguates ONLY genuine captures -- never pointers a body loads from its
+     * own data. Only pointer-typed bases matter (scalars are not memory bases). */
+    const unsigned base_kind = llvmctx.getMDKindID("cgir.fuse.base");
+    auto mark_base = [&] (llvm::Value * v)
+    {
+        if (auto * L = llvm::dyn_cast<llvm::LoadInst>(v))
+            L->setMetadata(base_kind, llvm::MDNode::get(llvmctx, {}));
+    };
 
     /* Load slot `idx` as type T. void** form: args[idx] is a &value (double load).
      * packed form: the value is inline at args_ptr + slot_offset[idx] (one load). */
@@ -892,7 +1388,56 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     std::vector<llvm::Value *> slot_value(total_args, nullptr);
     for (unsigned k = 0 ; k < total_args ; ++k)
         if (slot_type[k] != nullptr)
+        {
             slot_value[k] = load_arg(k, slot_type[k]);
+            if (slot_type[k]->isPointerTy())
+                mark_base(slot_value[k]); /* a captured array/pointer base */
+        }
+
+    /* Packed leaves reconstruct their own buffer in a stack slot. Create ALL the
+     * allocas up front (entry block, before any call) so they remain static and
+     * promotable after we split the entry block by inlining the calls below. */
+    std::vector<llvm::Value *> recon_buf(n, nullptr);
+    if (any_packed_leaf)
+        for (size_t i = 0 ; i < n ; ++i)
+        {
+            llvm::AllocaInst * a = builder.CreateAlloca(
+                i8_ty, llvm::ConstantInt::get(i64_ty, inputs[i].buf_size), "recon");
+            a->setAlignment(llvm::Align(16));
+            recon_buf[i] = a;
+        }
+
+    /* Hoist ONE typed load per register-sized unique slot, shared by every body
+     * that uses it (analogous to slot_value above): a reference slot as a typed
+     * `ptr` (preserves provenance -- no inttoptr -- so DependenceAnalysis can fuse),
+     * a by-value scalar copy (size 1/2/4/8) as an integer of that width. Each body's
+     * reconstruction stores this single SSA value into its recon buffer, so after
+     * SROA every body reads the SAME deduplicated value with NO per-body reload.
+     * This matters for BOTH correctness (the scoped-noalias tagging must see one
+     * base per array; two separate loads would look like distinct, wrongly-noalias
+     * arrays) AND fusion: a per-body scalar reload (e.g. a firstprivate loop bound
+     * `j`) otherwise lands in the block between the two loops and breaks LoopFuse's
+     * adjacency check. Aggregate copies (other sizes) fall back to memcpy. */
+    std::vector<llvm::Value *> slot_hoist(total_args, nullptr);
+    if (any_packed_leaf)
+        for (unsigned k = 0 ; k < total_args ; ++k)
+        {
+            llvm::Type * ht = nullptr;
+            if (unique_slot_is_ref[k])
+                ht = ptr_ty;
+            else if (unique_slot_size[k] == 1 || unique_slot_size[k] == 2 ||
+                     unique_slot_size[k] == 4 || unique_slot_size[k] == 8)
+                ht = llvm::Type::getIntNTy(llvmctx, (unsigned) unique_slot_size[k] * 8);
+            if (ht == nullptr)
+                continue; /* aggregate copy -> reconstructed via memcpy below */
+            llvm::Value * src = builder.CreateGEP(
+                i8_ty, args_ptr, llvm::ConstantInt::get(i64_ty, slot_offset[k]), "fslot");
+            slot_hoist[k] = builder.CreateAlignedLoad(
+                ht, src, llvm::MaybeAlign(1),
+                unique_slot_is_ref[k] ? "refbase" : "copyval");
+            if (unique_slot_is_ref[k])
+                mark_base(slot_hoist[k]); /* a captured array/pointer base */
+        }
 
     std::vector<llvm::CallInst *> kernel_calls;
     kernel_calls.reserve(n);
@@ -905,6 +1450,49 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         {
             /* a previously-fused sub-wrapper consumes a raw void** slice */
             kernel_calls.push_back(builder.CreateCall(fty, fn, { slice_ptr(wrapper_block_start[i]) }));
+        }
+        else if (inputs[i].is_packed_leaf)
+        {
+            /* Reconstruct this body's own packed buffer from the deduplicated
+             * fused buffer: for each capture, copy its bytes from the fused slot
+             * (args_ptr + slot_offset) to this body's layout (recon + params.offset),
+             * then call the self-contained kernel(recon, size). After AlwaysInline
+             * + SROA the recon alloca promotes away and the body reads the shared
+             * (deduplicated) slot values directly.
+             *
+             * A register-sized slot (reference pointer or scalar copy) is copied
+             * with a TYPED store of its shared hoisted value (slot_hoist), NOT a
+             * byte memcpy: memcpy of a pointer is recovered by SROA as an integer
+             * load + inttoptr (loses provenance, defeats DependenceAnalysis), and a
+             * per-body memcpy of a scalar leaves a per-body reload that can break
+             * LoopFuse adjacency. The typed shared value keeps provenance/`inbounds`
+             * and gives every body ONE deduplicated SSA value, so scale's store
+             * forwards to axpy's load and LoopFuse merges the loops. Aggregate copies
+             * (not hoisted) keep memcpy. */
+            llvm::Value * recon = recon_buf[i];
+            for (unsigned j = 0 ; j < inputs[i].arity ; ++j)
+            {
+                const command_prog_param_t & p = inputs[i].params[j];
+                const unsigned uidx = index_map[i][j];
+                llvm::Value * dst = builder.CreateGEP(
+                    i8_ty, recon, llvm::ConstantInt::get(i64_ty, p.offset), "rslot");
+                if (slot_hoist[uidx] != nullptr)
+                {
+                    /* store the shared hoisted value (typed => provenance / no reload) */
+                    builder.CreateAlignedStore(slot_hoist[uidx], dst, llvm::MaybeAlign(1));
+                }
+                else
+                {
+                    /* aggregate copy: byte memcpy from the fused buffer */
+                    llvm::Value * src = builder.CreateGEP(
+                        i8_ty, args_ptr,
+                        llvm::ConstantInt::get(i64_ty, slot_offset[uidx]), "fslot");
+                    builder.CreateMemCpy(dst, llvm::MaybeAlign(1), src, llvm::MaybeAlign(1),
+                                         (uint64_t) p.size);
+                }
+            }
+            kernel_calls.push_back(builder.CreateCall(
+                fty, fn, { recon, llvm::ConstantInt::get(i64_ty, inputs[i].buf_size) }));
         }
         else
         {
@@ -943,6 +1531,23 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         }
     }
 
+    /* Remove the inlined bodies' `llvm.experimental.noalias.scope.decl` intrinsics:
+     * inlining copies each kernel's per-parameter scope declarations into the
+     * wrapper, where they land BETWEEN the consecutive loops and break LoopFuse's
+     * adjacency check. They are redundant here -- cross-kernel disambiguation is
+     * provided by the shared-domain scoped-noalias metadata attached below -- so
+     * dropping them is safe (the metadata on the loads/stores is untouched). */
+    {
+        std::vector<llvm::Instruction *> dead;
+        for (llvm::BasicBlock & BB : *wrapper)
+            for (llvm::Instruction & I : BB)
+                if (auto * II = llvm::dyn_cast<llvm::IntrinsicInst>(&I))
+                    if (II->getIntrinsicID() == llvm::Intrinsic::experimental_noalias_scope_decl)
+                        dead.push_back(II);
+        for (llvm::Instruction * I : dead)
+            I->eraseFromParent();
+    }
+
     /* drop the now-inlined (dead) constituent functions */
     for (size_t i = 0 ; i < n ; ++i)
     {
@@ -950,68 +1555,16 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         if (F && F->use_empty())
             F->eraseFromParent();
     }
+    }   /* end host wrapper build (else !device) */
 
-    {
-        /* One alias-scope domain for the whole fused body; one scope per
-         * distinct base pointer value (the deref of each pointer arg slot). */
-        llvm::MDBuilder mdb(llvmctx);
-        llvm::MDNode *  domain = mdb.createAnonymousAliasScopeDomain("cgir.prog-fuse");
-
-        std::unordered_map<void *, llvm::MDNode *> base_to_scope;
-        std::vector<llvm::Metadata *>              all_scopes;
-        std::unordered_map<llvm::Value *, void *>  load_base; /* hoisted ptr load -> base */
-
-        for (unsigned k = 0 ; k < total_args ; ++k)
-        {
-            if (slot_value[k] == nullptr)                                continue; /* wrapper-block slot */
-            if (slot_type[k] == nullptr || !slot_type[k]->isPointerTy()) continue; /* not a pointer    */
-            if (unique_slots[k] == nullptr)                              continue; /* no &value         */
-
-            void * base = *static_cast<void **>(unique_slots[k]);
-            if (base == nullptr)
-                continue;
-
-            load_base[slot_value[k]] = base;
-            if (base_to_scope.find(base) == base_to_scope.end())
-            {
-                llvm::MDNode * sc = mdb.createAnonymousAliasScope(domain, "cgir.prog-fuse.ptr");
-                base_to_scope[base] = sc;
-                all_scopes.push_back(sc);
-            }
-        }
-
-        /* With <2 distinct bases there is nothing to disambiguate. */
-        if (all_scopes.size() >= 2)
-        {
-            for (llvm::BasicBlock & BB : *wrapper)
-            {
-                for (llvm::Instruction & I : BB)
-                {
-                    if (!I.mayReadOrWriteMemory())
-                        continue;
-                    llvm::Value * ptr = llvm::getLoadStorePointerOperand(&I);
-                    if (ptr == nullptr)
-                        continue;
-
-                    auto it = load_base.find(llvm::getUnderlyingObject(ptr));
-                    if (it == load_base.end())
-                        continue;
-
-                    llvm::Metadata * own = base_to_scope[it->second];
-                    I.setMetadata(llvm::LLVMContext::MD_alias_scope,
-                                  llvm::MDNode::get(llvmctx, { own }));
-
-                    std::vector<llvm::Metadata *> others;
-                    others.reserve(all_scopes.size() - 1);
-                    for (llvm::Metadata * s : all_scopes)
-                        if (s != own)
-                            others.push_back(s);
-                    I.setMetadata(llvm::LLVMContext::MD_noalias,
-                                  llvm::MDNode::get(llvmctx, others));
-                }
-            }
-        }
-    }
+    /* Shared-domain scoped-noalias tagging (the restrict-like "distinct captured
+     * base pointer => no overlap" assumption that lets DependenceAnalysis fuse and
+     * the vectorizer skip runtime alias checks) is NOT done here: at this point the
+     * kernels reach their captures through un-promoted reconstruction allocas
+     * (packed leaves) or param stores, so the accesses' underlying object is not
+     * yet the deduplicated base. It is applied in optimize_module() AFTER the SROA
+     * cleanup, when every access resolves to its base load -- uniformly for the
+     * pointers (void**) and packed (void*,size_t) shapes. See tag_noalias_domains(). */
 
     /* ------------------------------------------------------------------ *
      * 7. Stamp the host triple + data layout (parsed IR omits them) and    *
@@ -1019,7 +1572,12 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      * ------------------------------------------------------------------ */
     std::unique_ptr<llvm::TargetMachine> tm;
     {
-        if (mod_u->getTargetTriple().empty())
+        /* Device chains keep the device triple (from the linked device IR) and use
+         * the runtime device arch as the target-cpu; host chains use the process
+         * triple + host cpu. */
+        if (device)
+            mod_u->setTargetTriple(llvm::Triple(dev_triple));
+        else if (mod_u->getTargetTriple().empty())
             mod_u->setTargetTriple(llvm::Triple(llvm::sys::getProcessTriple()));
 
         const llvm::Triple & TT = mod_u->getTargetTriple();
@@ -1032,12 +1590,13 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         }
         llvm::TargetOptions opts;
         tm.reset(tgt->createTargetMachine(
-            TT, llvm::sys::getHostCPUName(), /* features */ "", opts,
+            TT, device ? (dev_arch ? dev_arch : "") : llvm::sys::getHostCPUName(),
+            /* features */ "", opts,
             /* reloc */ std::nullopt, /* code model */ std::nullopt,
             /* match the O3 IR pipeline below for end-to-end aggressive codegen */
             llvm::CodeGenOptLevel::Aggressive));
 
-        if (tm && mod_u->getDataLayout().isDefault())
+        if (tm && (device || mod_u->getDataLayout().isDefault()))
             mod_u->setDataLayout(tm->createDataLayout());
     }
 
@@ -1055,7 +1614,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      * 8. Optimize (inline the kernels into the wrapper, vectorize, fuse).  *
      * ------------------------------------------------------------------ */
     if (tm)
-        optimize_module(*mod_u, tm.get());
+        optimize_module(*mod_u, tm.get(), dump_dir);
 
     /* dump the final fused/optimized module */
     if (dump)
@@ -1092,9 +1651,11 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     dst->source.content.llvmir.raw    = bc_buf;
     dst->source.content.llvmir.size   = bitcode.size();
     dst->source.content.llvmir._owned = true;   /* heap (malloc) — the pass owns it */
-    /* the fused entry is `__fused_wrapper`; clear any per-input entry symbol
-     * (dst may alias progs[0], which could carry a device kernel symbol) */
-    dst->source.content.llvmir.symbol = nullptr;
+    /* The fused entry is `__fused_wrapper`. Host chains resolve it by name/shape,
+     * so clear the per-input symbol; device chains must name it so the driver can
+     * cuModuleGetFunction the PTX entry. (dst may alias progs[0] whose triple/arch
+     * are preserved here, driving the jit pass's PTX codegen.) */
+    dst->source.content.llvmir.symbol = device ? "__fused_wrapper" : nullptr;
     /* the fused entry is void(void**) (or void(void*,size_t) when packed); it
      * carries no per-parameter table (a re-fusion detects its shape by signature). */
     dst->source.content.llvmir.proto        = packed_output
@@ -1172,14 +1733,23 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     {
         /* Packed byte buffer: each deduplicated slot's VALUE inlined at its
          * offset (matching the fused kernel's fixed-offset loads). unique_slots[k]
-         * points at the value (a &value slot), so we copy its store-size bytes. */
+         * points at the value (a &value slot), so we copy its byte size -- from the
+         * params table (packed leaves) or the IR slot type (unpacked leaves). */
         char * buf = static_cast<char *>(calloc(packed_size ? packed_size : 1, 1));
         if (!buf) { fprintf(stderr, "prog-fuse: calloc failed\n"); abort(); }
         for (unsigned k = 0 ; k < total_args ; ++k)
         {
-            if (unique_slots[k] == nullptr || slot_type[k] == nullptr)
+            if (unique_slots[k] == nullptr)
                 continue;
-            const size_t sz = (size_t) DL.getTypeStoreSize(slot_type[k]).getFixedValue();
+            size_t sz;
+            if (any_packed_leaf)
+                sz = unique_slot_size[k];
+            else if (slot_type[k] != nullptr)
+                sz = (size_t) DL.getTypeStoreSize(slot_type[k]).getFixedValue();
+            else
+                continue;
+            if (sz == 0)
+                continue;
             memcpy(buf + slot_offset[k], unique_slots[k], sz);
         }
         args_buf = reinterpret_cast<void **>(buf);
@@ -1288,6 +1858,97 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     # endif /* CGIR_SUPPORT_LLVM */
 }
 
+# if CGIR_SUPPORT_LLVM
+/* Link the OpenMP device runtime (DeviceRTL) bitcode at `bc_path` into `M` so the
+ * device-runtime externs the kernel references (e.g. __kmpc_target_init) become
+ * defined. Without this the CUDA driver cannot JIT the emitted PTX -- ptxas fails
+ * on the unresolved externs (CUDA_ERROR_INVALID_PTX / 218). Only the referenced
+ * symbols and their transitive dependencies are imported (LinkOnlyNeeded), so the
+ * rest of the (large) runtime is not pulled in. Returns false + sets `err`. */
+static bool
+link_device_runtime(llvm::Module & M, const char * bc_path, std::string & err)
+{
+    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buf =
+        llvm::MemoryBuffer::getFile(bc_path);
+    if (!buf)
+    {
+        err = "cannot read CGIR_DEVICE_RTL_BC '" + std::string(bc_path) + "': " +
+              buf.getError().message();
+        return false;
+    }
+
+    llvm::SMDiagnostic diag;
+    std::unique_ptr<llvm::Module> rtl =
+        llvm::parseIR((*buf)->getMemBufferRef(), diag, M.getContext());
+    if (!rtl)
+    {
+        err = "parse DeviceRTL bitcode '" + std::string(bc_path) + "' failed: " +
+              diag.getMessage().str();
+        return false;
+    }
+
+    /* Align triple/DataLayout with the destination so the linker does not refuse
+     * on a mismatch (the RTL is already nvptx64, same as M). */
+    rtl->setTargetTriple(M.getTargetTriple());
+    rtl->setDataLayout(M.getDataLayout());
+
+    llvm::Linker linker(M);
+    if (linker.linkInModule(std::move(rtl), llvm::Linker::Flags::LinkOnlyNeeded))
+    {
+        err = "linking DeviceRTL bitcode '" + std::string(bc_path) + "' failed";
+        return false;
+    }
+    return true;
+}
+
+/* Emit PTX for a device (GPU) module: build a device TargetMachine for `triple`
+ * (e.g. "nvptx64-nvidia-cuda") + `arch` (target-cpu, e.g. "sm_80"), stamp the
+ * module's triple/DataLayout, and run codegen to a PTX assembly string. Returns
+ * the PTX (empty + `err` set on failure). The CUDA driver JIT-compiles this PTX
+ * to SASS at cuModuleLoadData (see the xkrt driver). */
+static std::string
+emit_device_ptx(llvm::Module & M, const char * triple, const char * arch,
+                const char * runtime_bc, std::string & err)
+{
+    llvm::Triple TT(triple);
+    std::string terr;
+    const llvm::Target * T = llvm::TargetRegistry::lookupTarget(TT, terr);
+    if (!T) { err = "lookupTarget('" + TT.str() + "'): " + terr; return {}; }
+
+    llvm::TargetOptions opts;
+    std::unique_ptr<llvm::TargetMachine> TM(T->createTargetMachine(
+        TT, arch ? arch : "", /* features */ "", opts,
+        std::nullopt, std::nullopt, llvm::CodeGenOptLevel::Aggressive));
+    if (!TM) { err = "createTargetMachine failed"; return {}; }
+
+    M.setTargetTriple(TT);
+    M.setDataLayout(TM->createDataLayout());
+
+    /* Resolve the device-runtime externs the kernel references (e.g. __kmpc_*) by
+     * linking a runtime bitcode before codegen, so ptxas can JIT the PTX at
+     * cuModuleLoadData. The path is the producer-supplied `runtime_bc` (see the
+     * prog source), overridable for debugging by the CGIR_DEVICE_RTL_BC env var.
+     * Inert when neither is set. */
+    const char * rtl_bc = getenv("CGIR_DEVICE_RTL_BC");
+    if (!rtl_bc || !rtl_bc[0])
+        rtl_bc = runtime_bc;
+    if (rtl_bc && rtl_bc[0])
+    {
+        if (!link_device_runtime(M, rtl_bc, err))
+            return {};
+    }
+
+    llvm::SmallString<0> out;
+    llvm::raw_svector_ostream os(out);
+    llvm::legacy::PassManager pm;
+    if (TM->addPassesToEmitFile(pm, os, /* DwoOut */ nullptr,
+                                llvm::CodeGenFileType::AssemblyFile))
+    { err = "addPassesToEmitFile: PTX (assembly) emission not supported"; return {}; }
+    pm.run(M);
+    return std::string(out.begin(), out.end());
+}
+# endif /* CGIR_SUPPORT_LLVM */
+
 void
 CGIR_NAMESPACE::command_graph_jit_llvmir(
     command_prog_t * prog
@@ -1347,6 +2008,50 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
      * launcher untouched. */
     if (entry == nullptr || entry->isDeclaration() || entry->hasLocalLinkage())
         return ;
+
+    /* Device (GPU) target: compile the (fused) device kernel to PTX for the
+     * device's triple/arch instead of the in-process host JIT. The PTX is stored
+     * back in the source; the driver JIT-loads it (cuModuleLoadData) and resolves
+     * the entry (source.symbol) at launch. The launcher fn is left null (the
+     * driver fills it once the module is loaded). */
+    if (const char * dtriple = prog->source.content.llvmir.triple)
+    {
+        std::string perr;
+        std::string ptx = emit_device_ptx(*mod, dtriple,
+                                           prog->source.content.llvmir.arch,
+                                           prog->source.content.llvmir.runtime_bc, perr);
+        if (ptx.empty())
+        {
+            fprintf(stderr, "jit(device): PTX emission failed: %s\n", perr.c_str());
+            abort();
+        }
+        if (dump)
+        {
+            std::string path = dump_dir + "/final.ptx";
+            std::error_code ec;
+            llvm::raw_fd_ostream f(path, ec, llvm::sys::fs::OF_Text);
+            if (!ec) f << ptx;
+        }
+
+        /* replace the source IR with the emitted PTX (owned); keep the entry symbol
+         * so the driver can cuModuleGetFunction it. */
+        if (prog->source.content.llvmir._owned && prog->source.content.llvmir.raw)
+            free(prog->source.content.llvmir.raw);
+        char * buf = static_cast<char *>(malloc(ptx.size() + 1));
+        if (!buf) { fprintf(stderr, "jit(device): malloc failed\n"); abort(); }
+        memcpy(buf, ptx.data(), ptx.size());
+        buf[ptx.size()] = '\0';
+        prog->source.type                  = COMMAND_PROG_SOURCE_TYPE_PTX;
+        prog->source.content.llvmir.raw    = buf;
+        prog->source.content.llvmir.size   = ptx.size() + 1; /* incl. NUL */
+        prog->source.content.llvmir._owned = true;
+        /* device kernels launch through the VARIADIC (kernelParams=args) path; the
+         * driver reinterprets launcher.variadic.fn as the loaded device function,
+         * resolved lazily at launch (null until then). */
+        prog->prototype            = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC;
+        prog->launcher.variadic.fn = nullptr;
+        return ;
+    }
 
     /* The runtime launches a JIT'd PROG as `void(void**)` (VARIADIC) or, for a
      * packed body, `void(void*, size_t)` (PACKED). If the entry already has one
@@ -1491,6 +2196,38 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
      * recorded OpenMP task was KMP before this; its kargs stay in prog->args). */
     if (entry_is_packed)
     {
+        /* A STANDALONE packed leaf (never fused) still carries the recorded
+         * per-value &value slots (void** args) plus its params table (prog-fuse
+         * clears params on a fused packed program, so params != NULL identifies
+         * the standalone case). The packed launcher expects a single packed byte
+         * buffer, so materialize it here from the slots at the params' offsets --
+         * the same layout the packed body reads. */
+        const cgir_command_prog_param_t * params = prog->source.content.llvmir.params;
+        const size_t nparams = prog->source.content.llvmir.param_count;
+        /* args_size == 0 means the recorded void** slots have not been packed yet
+         * (prog-fuse/a prior jit set args_size > 0), keeping this idempotent. */
+        if (params != nullptr && nparams > 0 && prog->args_size == 0)
+        {
+            size_t buf_size = 0;
+            for (size_t k = 0 ; k < nparams ; ++k)
+            {
+                const size_t end = params[k].offset + params[k].size;
+                if (end > buf_size) buf_size = end;
+            }
+            if (buf_size == 0) buf_size = 1;
+            char * buf = static_cast<char *>(calloc(buf_size, 1));
+            if (!buf) { fprintf(stderr, "jit: calloc failed\n"); abort(); }
+            void ** slots = prog->args;
+            for (size_t k = 0 ; slots != nullptr && k < nparams ; ++k)
+                if (slots[k] != nullptr)
+                    memcpy(buf + params[k].offset, slots[k], params[k].size);
+            if (prog->_args_owned && prog->args)
+                free(prog->args);
+            prog->args        = reinterpret_cast<void **>(buf);
+            prog->n_args      = nparams;
+            prog->args_size   = buf_size;
+            prog->_args_owned = true;
+        }
         prog->prototype          = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED;
         prog->launcher.packed.fn = reinterpret_cast<void (*)(void *, size_t)>(fn_addr);
     }

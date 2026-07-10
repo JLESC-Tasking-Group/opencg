@@ -95,13 +95,17 @@ typedef enum    cgir_command_prog_param_kind_t
     CGIR_COMMAND_PROG_PARAM_COPY            /* firstprivate: the arg slot holds a copy */
 }               cgir_command_prog_param_kind_t;
 
-/* Descriptor of one entry parameter: its passing kind and byte size. Lets the
- * fuse pass deduplicate references by pointer and copies by memcmp over `size`
- * bytes. C-compatible POD. */
+/* Descriptor of one entry parameter: its passing kind, byte size and byte
+ * offset within the packed buffer (PACKED_BUFFER proto). Lets the fuse pass
+ * deduplicate references by pointer and copies by memcmp over `size` bytes, and
+ * lets the fuse/jit passes pack/reconstruct the per-task buffer at `offset`.
+ * `offset` is the producer's (compiler's) natural-aligned layout of THIS task's
+ * buffer; it is unused for the UNPACKED_PARAMS proto. C-compatible POD. */
 typedef struct  cgir_command_prog_param_t
 {
     cgir_command_prog_param_kind_t kind;
     size_t                         size;   /* byte size of the value */
+    size_t                         offset; /* byte offset within the packed buffer */
 }               cgir_command_prog_param_t;
 
 /* One entry of a program's externalized-global resolution table: a symbol that
@@ -156,6 +160,22 @@ typedef struct  cgir_command_prog_source_t
              * tables are non-owning (compile-time constants); defaults to false
              * (see command_t's constructor). */
             bool _externs_owned;
+
+            /* Target for device (GPU) code generation. When non-NULL, the fuse/jit
+             * passes compile `raw` for this device instead of the host: `triple` is
+             * the LLVM target triple (e.g. "nvptx64-nvidia-cuda") and `arch` the
+             * device arch / target-cpu (e.g. "sm_80"), obtained at runtime from the
+             * driver of the executing device. NULL => host (default). Non-owning
+             * (stable driver-provided strings). */
+            const char * triple;
+            const char * arch;
+
+            /* Optional extra bitcode module linked into the device program before
+             * codegen (see emit_device_ptx). Resolves externs `raw` references but
+             * does not define -- e.g. a device runtime library. CGIR is agnostic to
+             * its contents; the producer (which knows the toolchain layout) supplies
+             * the path. NULL => nothing extra to link. Non-owning (stable string). */
+            const char * runtime_bc;
 
             /* prototype (ABI) of the entry function within `raw` (see enum). */
             cgir_command_prog_source_proto_t proto;
