@@ -1132,21 +1132,35 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             recon_buf[i] = a;
         }
 
-    /* Hoist ONE typed pointer load per unique reference slot, shared by every body
-     * that uses it (analogous to slot_value above). Each body's reconstruction then
-     * stores this single SSA pointer into its recon buffer, so after SROA all bodies
-     * read the SAME deduplicated base -- which the scoped-noalias tagging needs to
-     * treat as one array (two separate loads would look like two distinct, wrongly-
-     * noalias arrays). A typed `ptr` load also preserves provenance (no inttoptr). */
-    std::vector<llvm::Value *> slot_ptr(total_args, nullptr);
+    /* Hoist ONE typed load per register-sized unique slot, shared by every body
+     * that uses it (analogous to slot_value above): a reference slot as a typed
+     * `ptr` (preserves provenance -- no inttoptr -- so DependenceAnalysis can fuse),
+     * a by-value scalar copy (size 1/2/4/8) as an integer of that width. Each body's
+     * reconstruction stores this single SSA value into its recon buffer, so after
+     * SROA every body reads the SAME deduplicated value with NO per-body reload.
+     * This matters for BOTH correctness (the scoped-noalias tagging must see one
+     * base per array; two separate loads would look like distinct, wrongly-noalias
+     * arrays) AND fusion: a per-body scalar reload (e.g. a firstprivate loop bound
+     * `j`) otherwise lands in the block between the two loops and breaks LoopFuse's
+     * adjacency check. Aggregate copies (other sizes) fall back to memcpy. */
+    std::vector<llvm::Value *> slot_hoist(total_args, nullptr);
     if (any_packed_leaf)
         for (unsigned k = 0 ; k < total_args ; ++k)
+        {
+            llvm::Type * ht = nullptr;
             if (unique_slot_is_ref[k])
-            {
-                llvm::Value * src = builder.CreateGEP(
-                    i8_ty, args_ptr, llvm::ConstantInt::get(i64_ty, slot_offset[k]), "fslot");
-                slot_ptr[k] = builder.CreateAlignedLoad(ptr_ty, src, llvm::MaybeAlign(1), "refbase");
-            }
+                ht = ptr_ty;
+            else if (unique_slot_size[k] == 1 || unique_slot_size[k] == 2 ||
+                     unique_slot_size[k] == 4 || unique_slot_size[k] == 8)
+                ht = llvm::Type::getIntNTy(llvmctx, (unsigned) unique_slot_size[k] * 8);
+            if (ht == nullptr)
+                continue; /* aggregate copy -> reconstructed via memcpy below */
+            llvm::Value * src = builder.CreateGEP(
+                i8_ty, args_ptr, llvm::ConstantInt::get(i64_ty, slot_offset[k]), "fslot");
+            slot_hoist[k] = builder.CreateAlignedLoad(
+                ht, src, llvm::MaybeAlign(1),
+                unique_slot_is_ref[k] ? "refbase" : "copyval");
+        }
 
     std::vector<llvm::CallInst *> kernel_calls;
     kernel_calls.reserve(n);
@@ -1169,13 +1183,15 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
              * + SROA the recon alloca promotes away and the body reads the shared
              * (deduplicated) slot values directly.
              *
-             * A by-reference (pointer) slot is copied with a TYPED load/store, not
-             * memcpy: a byte memcpy of a pointer is recovered by SROA as an integer
-             * load + inttoptr, which loses pointer provenance and defeats
-             * DependenceAnalysis (so the loops would not fuse). A typed `ptr`
-             * copy keeps provenance (and the body's `inbounds` GEPs), so scale's
-             * store forwards to axpy's load and LoopFuse merges the loops. By-value
-             * copies (scalars/aggregates) keep memcpy. */
+             * A register-sized slot (reference pointer or scalar copy) is copied
+             * with a TYPED store of its shared hoisted value (slot_hoist), NOT a
+             * byte memcpy: memcpy of a pointer is recovered by SROA as an integer
+             * load + inttoptr (loses provenance, defeats DependenceAnalysis), and a
+             * per-body memcpy of a scalar leaves a per-body reload that can break
+             * LoopFuse adjacency. The typed shared value keeps provenance/`inbounds`
+             * and gives every body ONE deduplicated SSA value, so scale's store
+             * forwards to axpy's load and LoopFuse merges the loops. Aggregate copies
+             * (not hoisted) keep memcpy. */
             llvm::Value * recon = recon_buf[i];
             for (unsigned j = 0 ; j < inputs[i].arity ; ++j)
             {
@@ -1183,13 +1199,14 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
                 const unsigned uidx = index_map[i][j];
                 llvm::Value * dst = builder.CreateGEP(
                     i8_ty, recon, llvm::ConstantInt::get(i64_ty, p.offset), "rslot");
-                if (p.kind == CGIR_COMMAND_PROG_PARAM_REFERENCE)
+                if (slot_hoist[uidx] != nullptr)
                 {
-                    /* store the shared hoisted base pointer (typed => provenance) */
-                    builder.CreateAlignedStore(slot_ptr[uidx], dst, llvm::MaybeAlign(1));
+                    /* store the shared hoisted value (typed => provenance / no reload) */
+                    builder.CreateAlignedStore(slot_hoist[uidx], dst, llvm::MaybeAlign(1));
                 }
                 else
                 {
+                    /* aggregate copy: byte memcpy from the fused buffer */
                     llvm::Value * src = builder.CreateGEP(
                         i8_ty, args_ptr,
                         llvm::ConstantInt::get(i64_ty, slot_offset[uidx]), "fslot");
