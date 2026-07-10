@@ -385,10 +385,17 @@ tag_noalias_domains(llvm::Function & F)
         }
 }
 
+/* Write `M` as textual IR to <dir>/<name> (defined below; forward-declared so the
+ * optimize pipeline can dump the pre-LoopFuse wrapper for debugging). */
+static void dump_module(const std::string & dir, const char * name, llvm::Module & M);
+
 /* Run an O3 module pipeline (inlining + loop-fuse + vectorization) on the
- * merged module, so the inlined kernels' loops can vectorize/fuse. */
+ * merged module, so the inlined kernels' loops can vectorize/fuse. `dump_dir` is
+ * the (possibly empty) CGIR_PROG_FUSE_DUMP directory: when set, the wrapper is
+ * dumped after the SROA+noalias cleanup and BEFORE loop-fusion, so the exact IR
+ * LoopFuse operates on can be inspected. */
 static void
-optimize_module(llvm::Module & M, llvm::TargetMachine * tm)
+optimize_module(llvm::Module & M, llvm::TargetMachine * tm, const std::string & dump_dir)
 {
     llvm::PassBuilder PB(tm);
 
@@ -451,6 +458,9 @@ optimize_module(llvm::Module & M, llvm::TargetMachine * tm)
         /* the tagging edited IR outside the pass managers; drop cached analyses so
          * the loop passes below see the new metadata. */
         MAM.invalidate(M, llvm::PreservedAnalyses::none());
+
+        /* dump the exact IR loop-fusion will see (post cleanup + noalias, pre-fuse) */
+        dump_module(dump_dir, "prefuse.ll", M);
 
         /* 3. canonicalize + rotate + fuse the loops */
         llvm::FunctionPassManager FPM2;
@@ -1303,7 +1313,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      * 8. Optimize (inline the kernels into the wrapper, vectorize, fuse).  *
      * ------------------------------------------------------------------ */
     if (tm)
-        optimize_module(*mod_u, tm.get());
+        optimize_module(*mod_u, tm.get(), dump_dir);
 
     /* dump the final fused/optimized module */
     if (dump)
