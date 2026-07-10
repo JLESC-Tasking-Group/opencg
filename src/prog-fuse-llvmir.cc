@@ -1122,6 +1122,22 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             recon_buf[i] = a;
         }
 
+    /* Hoist ONE typed pointer load per unique reference slot, shared by every body
+     * that uses it (analogous to slot_value above). Each body's reconstruction then
+     * stores this single SSA pointer into its recon buffer, so after SROA all bodies
+     * read the SAME deduplicated base -- which the scoped-noalias tagging needs to
+     * treat as one array (two separate loads would look like two distinct, wrongly-
+     * noalias arrays). A typed `ptr` load also preserves provenance (no inttoptr). */
+    std::vector<llvm::Value *> slot_ptr(total_args, nullptr);
+    if (any_packed_leaf)
+        for (unsigned k = 0 ; k < total_args ; ++k)
+            if (unique_slot_is_ref[k])
+            {
+                llvm::Value * src = builder.CreateGEP(
+                    i8_ty, args_ptr, llvm::ConstantInt::get(i64_ty, slot_offset[k]), "fslot");
+                slot_ptr[k] = builder.CreateAlignedLoad(ptr_ty, src, llvm::MaybeAlign(1), "refbase");
+            }
+
     std::vector<llvm::CallInst *> kernel_calls;
     kernel_calls.reserve(n);
     for (size_t i = 0 ; i < n ; ++i)
@@ -1154,18 +1170,19 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             for (unsigned j = 0 ; j < inputs[i].arity ; ++j)
             {
                 const command_prog_param_t & p = inputs[i].params[j];
+                const unsigned uidx = index_map[i][j];
                 llvm::Value * dst = builder.CreateGEP(
                     i8_ty, recon, llvm::ConstantInt::get(i64_ty, p.offset), "rslot");
-                llvm::Value * src = builder.CreateGEP(
-                    i8_ty, args_ptr,
-                    llvm::ConstantInt::get(i64_ty, slot_offset[index_map[i][j]]), "fslot");
                 if (p.kind == CGIR_COMMAND_PROG_PARAM_REFERENCE)
                 {
-                    llvm::Value * ptr = builder.CreateAlignedLoad(ptr_ty, src, llvm::MaybeAlign(1), "refslot");
-                    builder.CreateAlignedStore(ptr, dst, llvm::MaybeAlign(1));
+                    /* store the shared hoisted base pointer (typed => provenance) */
+                    builder.CreateAlignedStore(slot_ptr[uidx], dst, llvm::MaybeAlign(1));
                 }
                 else
                 {
+                    llvm::Value * src = builder.CreateGEP(
+                        i8_ty, args_ptr,
+                        llvm::ConstantInt::get(i64_ty, slot_offset[uidx]), "fslot");
                     builder.CreateMemCpy(dst, llvm::MaybeAlign(1), src, llvm::MaybeAlign(1),
                                          (uint64_t) p.size);
                 }
