@@ -732,6 +732,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
 
     std::vector<void *>                    unique_slots;
     std::vector<size_t>                    unique_slot_size; /* byte size per unique slot */
+    std::vector<bool>                      unique_slot_is_ref; /* slot holds a pointer (REFERENCE) */
     std::unordered_map<std::string, unsigned> slot_to_index;
     std::vector<std::vector<unsigned>>     index_map(n);
     std::vector<unsigned>                  wrapper_block_start(n, 0);
@@ -745,6 +746,13 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             return (p.kind == CGIR_COMMAND_PROG_PARAM_COPY) ? p.size : sizeof(void *);
         }
         return 0;
+    };
+
+    /* true iff leaf slot (i,j) is a by-reference (pointer) parameter */
+    auto slot_is_ref = [&] (size_t i, unsigned j) -> bool
+    {
+        return inputs[i].params != nullptr && j < inputs[i].param_count &&
+               inputs[i].params[j].kind == CGIR_COMMAND_PROG_PARAM_REFERENCE;
     };
 
     /* Identity key for a leaf slot. When the compiler forwarded per-parameter
@@ -800,6 +808,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             {
                 unique_slots.push_back(inputs[i].slots[k]);
                 unique_slot_size.push_back(sizeof(void *));
+                unique_slot_is_ref.push_back(true); /* void** slice slots are pointers */
             }
         }
         else
@@ -815,6 +824,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
                     idx = (unsigned) unique_slots.size();
                     unique_slots.push_back(inputs[i].slots[j]);
                     unique_slot_size.push_back(slot_size(i, j));
+                    unique_slot_is_ref.push_back(slot_is_ref(i, j));
                     slot_to_index[key] = idx;
                 }
                 else
@@ -934,11 +944,13 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             size_t sz, al;
             if (any_packed_leaf)
             {
-                /* packed leaves: slot bytes come from the params table. The fused
-                 * buffer is only intermediate storage (memcpy'd to/from each body's
-                 * reconstructed buffer), so byte packing (align 1) is sufficient. */
+                /* packed leaves: slot bytes come from the params table. Reference
+                 * (pointer) slots are reconstructed with a typed load/store (to
+                 * preserve pointer provenance so DependenceAnalysis can fuse the
+                 * loops), so align them naturally; by-value copies go through memcpy
+                 * and tolerate any alignment. */
                 sz = unique_slot_size[k] ? unique_slot_size[k] : 1;
-                al = 1;
+                al = unique_slot_is_ref[k] ? sizeof(void *) : 1;
             }
             else
             {
@@ -1036,7 +1048,15 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
              * (args_ptr + slot_offset) to this body's layout (recon + params.offset),
              * then call the self-contained kernel(recon, size). After AlwaysInline
              * + SROA the recon alloca promotes away and the body reads the shared
-             * (deduplicated) slot values directly. */
+             * (deduplicated) slot values directly.
+             *
+             * A by-reference (pointer) slot is copied with a TYPED load/store, not
+             * memcpy: a byte memcpy of a pointer is recovered by SROA as an integer
+             * load + inttoptr, which loses pointer provenance and defeats
+             * DependenceAnalysis (so the loops would not fuse). A typed `ptr`
+             * copy keeps provenance (and the body's `inbounds` GEPs), so scale's
+             * store forwards to axpy's load and LoopFuse merges the loops. By-value
+             * copies (scalars/aggregates) keep memcpy. */
             llvm::Value * recon = recon_buf[i];
             for (unsigned j = 0 ; j < inputs[i].arity ; ++j)
             {
@@ -1046,8 +1066,16 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
                 llvm::Value * src = builder.CreateGEP(
                     i8_ty, args_ptr,
                     llvm::ConstantInt::get(i64_ty, slot_offset[index_map[i][j]]), "fslot");
-                builder.CreateMemCpy(dst, llvm::MaybeAlign(1), src, llvm::MaybeAlign(1),
-                                     (uint64_t) p.size);
+                if (p.kind == CGIR_COMMAND_PROG_PARAM_REFERENCE)
+                {
+                    llvm::Value * ptr = builder.CreateAlignedLoad(ptr_ty, src, llvm::MaybeAlign(1), "refslot");
+                    builder.CreateAlignedStore(ptr, dst, llvm::MaybeAlign(1));
+                }
+                else
+                {
+                    builder.CreateMemCpy(dst, llvm::MaybeAlign(1), src, llvm::MaybeAlign(1),
+                                         (uint64_t) p.size);
+                }
             }
             kernel_calls.push_back(builder.CreateCall(
                 fty, fn, { recon, llvm::ConstantInt::get(i64_ty, inputs[i].buf_size) }));
