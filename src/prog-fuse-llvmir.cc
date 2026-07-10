@@ -75,6 +75,7 @@
 # include <llvm/IR/Function.h>
 # include <llvm/IR/IRBuilder.h>
 # include <llvm/IR/Instructions.h>
+# include <llvm/IR/IntrinsicInst.h>
 # include <llvm/IR/LLVMContext.h>
 # include <llvm/IR/MDBuilder.h>
 # include <llvm/IR/Module.h>
@@ -101,6 +102,12 @@
 # include <llvm/Transforms/Scalar/LoopPassManager.h>
 # include <llvm/Transforms/Scalar/LoopRotation.h>
 # include <llvm/Transforms/Utils/LoopSimplify.h>
+/* Pre-fusion cleanup: promote the per-body reconstruction allocas and remove the
+ * inter-loop cruft so LoopFuse sees adjacent loops accessing the shared base
+ * pointers directly (see optimize_module). */
+# include <llvm/Transforms/Scalar/SROA.h>
+# include <llvm/Transforms/Scalar/SimplifyCFG.h>
+# include <llvm/Transforms/InstCombine/InstCombine.h>
 
 /* In-process JIT (replaces the former Proteus dependency) */
 # include <llvm/ExecutionEngine/Orc/LLJIT.h>
@@ -331,16 +338,26 @@ optimize_module(llvm::Module & M, llvm::TargetMachine * tm)
      * its sibling-loop ("SameSD") reasoning only kicks in when the access address
      * recurrence is provably non-wrapping, i.e. the kernel's array GEPs are
      * `inbounds` (checkSubscript -> hasNoSignedWrap in DependenceAnalysis.cpp).
-     * Compiler-emitted kernels (clang/libomptarget) always use `inbounds` GEPs,
-     * so they fuse. We currently RELY on that witness (option (i)): present =>
-     * provably safe => fuse; absent => DA stays conservative => fusion is safely
-     * skipped. A future option (ii) — for more aggressive coverage of hand-rolled
-     * or non-`inbounds` IR — would have this pass stamp `inbounds`/`nsw` onto the
-     * inlined kernel GEPs/IVs under cgir's well-formedness (in-bounds, elementwise)
-     * contract. That never produces an illegal fusion (LoopFuse still enforces
-     * legality) but does assert memory-safety, so it is deferred for now. */
+     * Compiler-emitted kernels (clang/libomptarget) always use `inbounds` GEPs.
+     *
+     * BUT LoopFuse also requires the loops to be ADJACENT and to access memory it
+     * can relate. As inlined by step 6b (before any SROA), each kernel body still
+     * rebuilds its captures through LOCAL allocas and its params carry
+     * `llvm.experimental.noalias.scope.decl` intrinsics -- so consecutive loops
+     * (a) access the shared arrays indirectly through distinct allocas (DA cannot
+     * relate scale's y[i] to axpy's y[i]) and (b) are separated by the scope.decl
+     * cruft (not adjacent). We therefore CLEAN UP first: SROA promotes the
+     * reconstruction allocas so the accesses use the deduplicated base pointers
+     * directly, and instcombine + simplify-cfg drop the now-dead scope decls and
+     * empty blocks -- after which loop-simplify/rotate/fuse merge the loops (e.g.
+     * scale+axpy -> one axpby) and the O3 pipeline vectorizes the single loop. */
     {
         llvm::FunctionPassManager FPM;
+        /* promote per-body reconstruction allocas + remove inter-loop cruft */
+        FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+        FPM.addPass(llvm::InstCombinePass());
+        FPM.addPass(llvm::SimplifyCFGPass());
+
         FPM.addPass(llvm::LoopSimplifyPass());
 
         llvm::LoopPassManager LPM;
@@ -1070,6 +1087,23 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             fprintf(stderr, "prog-fuse: failed to inline a kernel: %s\n", ir.getFailureReason());
             abort();
         }
+    }
+
+    /* Remove the inlined bodies' `llvm.experimental.noalias.scope.decl` intrinsics:
+     * inlining copies each kernel's per-parameter scope declarations into the
+     * wrapper, where they land BETWEEN the consecutive loops and break LoopFuse's
+     * adjacency check. They are redundant here -- cross-kernel disambiguation is
+     * provided by the shared-domain scoped-noalias metadata attached below -- so
+     * dropping them is safe (the metadata on the loads/stores is untouched). */
+    {
+        std::vector<llvm::Instruction *> dead;
+        for (llvm::BasicBlock & BB : *wrapper)
+            for (llvm::Instruction & I : BB)
+                if (auto * II = llvm::dyn_cast<llvm::IntrinsicInst>(&I))
+                    if (II->getIntrinsicID() == llvm::Intrinsic::experimental_noalias_scope_decl)
+                        dead.push_back(II);
+        for (llvm::Instruction * I : dead)
+            I->eraseFromParent();
     }
 
     /* drop the now-inlined (dead) constituent functions */
