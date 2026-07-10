@@ -161,6 +161,15 @@ typedef struct  cgir_command_prog_source_t
              * (see command_t's constructor). */
             bool _externs_owned;
 
+            /* Target for device (GPU) code generation. When non-NULL, the fuse/jit
+             * passes compile `raw` for this device instead of the host: `triple` is
+             * the LLVM target triple (e.g. "nvptx64-nvidia-cuda") and `arch` the
+             * device arch / target-cpu (e.g. "sm_80"), obtained at runtime from the
+             * driver of the executing device. NULL => host (default). Non-owning
+             * (stable driver-provided strings). */
+            const char * triple;
+            const char * arch;
+
             /* prototype (ABI) of the entry function within `raw` (see enum). */
             cgir_command_prog_source_proto_t proto;
 

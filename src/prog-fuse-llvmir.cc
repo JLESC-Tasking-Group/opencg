@@ -74,6 +74,7 @@
 # include <llvm/Analysis/ValueTracking.h>
 # include <llvm/IR/Function.h>
 # include <llvm/IR/IRBuilder.h>
+# include <llvm/IR/CallingConv.h>
 # include <llvm/IR/Instructions.h>
 # include <llvm/IR/IntrinsicInst.h>
 # include <llvm/IR/LLVMContext.h>
@@ -119,6 +120,11 @@
 # include <llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h>
 # include <llvm/Support/CodeGen.h>
 # include <llvm/Support/Error.h>
+
+/* Device (GPU) code generation: emit PTX for a device target (nvptx64) via the
+ * legacy codegen pass manager (addPassesToEmitFile). */
+# include <llvm/IR/LegacyPassManager.h>
+# include <llvm/ADT/SmallString.h>
 
 # include <atomic>
 # include <cassert>
@@ -329,8 +335,18 @@ tag_noalias_domains(llvm::Function & F)
     llvm::MDBuilder mdb(ctx);
     llvm::MDNode * domain = mdb.createAnonymousAliasScopeDomain("cgir.prog-fuse");
 
+    /* Only the deduplicated CAPTURE base loads carry the "cgir.fuse.base" marker
+     * (stamped where they are hoisted, see command_graph_prog_fuse_llvmir). We tag
+     * exactly those, never arbitrary loaded pointers: the restrict-like "distinct
+     * base => no overlap" assumption is only valid for distinct captures (same
+     * array collapses to one slot = one marked load), NOT for pointers a body loads
+     * from its own data (e.g. pointer-array/linked-structure chasing), which could
+     * genuinely alias. Missing the marker just leaves an access untagged
+     * (conservative), never mis-tagged. */
+    const unsigned base_kind = ctx.getMDKindID("cgir.fuse.base");
+
     /* the deduplicated captured base of a taggable data access, or nullptr */
-    auto data_base = [] (llvm::Instruction & I) -> llvm::Value *
+    auto data_base = [&] (llvm::Instruction & I) -> llvm::Value *
     {
         llvm::Value * ptr = llvm::getLoadStorePointerOperand(&I);
         if (ptr == nullptr)
@@ -343,7 +359,8 @@ tag_noalias_domains(llvm::Function & F)
         if (ty == nullptr || ty->isPointerTy())
             return nullptr; /* skip args-buffer pointer chasing */
         llvm::Value * base = llvm::getUnderlyingObject(ptr);
-        return llvm::isa<llvm::LoadInst>(base) ? base : nullptr;
+        auto * L = llvm::dyn_cast<llvm::LoadInst>(base);
+        return (L && L->getMetadata(base_kind)) ? base : nullptr;
     };
 
     std::unordered_map<llvm::Value *, llvm::MDNode *> base_to_scope;
@@ -383,6 +400,81 @@ tag_noalias_domains(llvm::Function & F)
             I.setMetadata(llvm::LLVMContext::MD_noalias,
                           llvm::MDNode::get(ctx, others));
         }
+}
+
+/* Collapse the per-kernel OpenMP-device runtime brackets in a fused device kernel.
+ * Inlining N device target-region kernels into one wrapper leaves N
+ * `__kmpc_target_init`/`__kmpc_target_deinit` pairs, but a single launch must have
+ * exactly ONE. For SPMD kernels (target_init returns -1 => every thread runs the
+ * body) with an identical launch configuration, keep the FIRST init and the LAST
+ * deinit and drop the inner ones: each removed init's result is replaced by -1 so
+ * its "== -1 => body" branch falls through into the body, and each removed deinit
+ * is erased. Returns false if the kernels are not the expected SPMD shape or their
+ * launch configurations differ (caller must then NOT fuse them). Assumes the
+ * inlined bodies appear in launch order (block layout order), which holds since the
+ * wrapper calls them in order and we inline in place. */
+static bool
+collapse_device_kernel_brackets(llvm::Function & F)
+{
+    std::vector<llvm::CallInst *> inits, deinits;
+    for (llvm::BasicBlock & BB : F)
+        for (llvm::Instruction & I : BB)
+            if (auto * CI = llvm::dyn_cast<llvm::CallInst>(&I))
+                if (llvm::Function * cf = CI->getCalledFunction())
+                {
+                    if (cf->getName() == "__kmpc_target_init")   inits.push_back(CI);
+                    else if (cf->getName() == "__kmpc_target_deinit") deinits.push_back(CI);
+                }
+
+    /* need N matched pairs (N == number of fused kernels >= 2) */
+    if (inits.size() < 2 || inits.size() != deinits.size())
+        return false;
+
+    /* All kernels must share the launch configuration. It is the first field of
+     * KernelEnvironmentTy (ConfigurationEnvironmentTy), which holds only integers
+     * (exec-mode, thread/team bounds, reduction sizes), so equal configs are the
+     * SAME uniqued Constant -- a pointer compare suffices. */
+    auto config_of = [] (llvm::CallInst * init) -> llvm::Constant *
+    {
+        llvm::Value * env = init->getArgOperand(0)->stripPointerCasts();
+        auto * G = llvm::dyn_cast<llvm::GlobalVariable>(env);
+        if (!G || !G->hasInitializer())
+            return nullptr;
+        auto * CS = llvm::dyn_cast<llvm::ConstantStruct>(G->getInitializer());
+        return (CS && CS->getNumOperands() >= 1) ? CS->getOperand(0) : nullptr;
+    };
+    llvm::Constant * cfg0 = config_of(inits[0]);
+    if (cfg0 == nullptr)
+        return false;
+    for (size_t i = 1 ; i < inits.size() ; ++i)
+        if (config_of(inits[i]) != cfg0)
+            return false;
+
+    /* Each init must be the SPMD pattern: its result feeds `icmp eq <res>, -1`. */
+    auto is_spmd_init = [] (llvm::CallInst * init) -> bool
+    {
+        for (llvm::User * u : init->users())
+            if (auto * ic = llvm::dyn_cast<llvm::ICmpInst>(u))
+                if (ic->getPredicate() == llvm::CmpInst::ICMP_EQ)
+                    if (auto * c = llvm::dyn_cast<llvm::ConstantInt>(ic->getOperand(1)))
+                        if (c->isMinusOne())
+                            return true;
+        return false;
+    };
+    for (llvm::CallInst * init : inits)
+        if (!is_spmd_init(init))
+            return false;
+
+    /* keep inits[0] and deinits[last]; drop the inner brackets */
+    llvm::Type * i32 = llvm::Type::getInt32Ty(F.getContext());
+    for (size_t i = 1 ; i < inits.size() ; ++i)
+    {
+        inits[i]->replaceAllUsesWith(llvm::ConstantInt::getSigned(i32, -1));
+        inits[i]->eraseFromParent();
+    }
+    for (size_t i = 0 ; i + 1 < deinits.size() ; ++i)
+        deinits[i]->eraseFromParent();
+    return true;
 }
 
 /* Write `M` as textual IR to <dir>/<name> (defined below; forward-declared so the
@@ -739,6 +831,12 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             }
             is_wrapper = false;
             arity      = entry->getFunctionType()->getNumParams();
+            /* device (GPU) target-region kernels: deduplicate their kernelParams by
+             * VALUE so a shared mapped array / equal scalar is passed once to the
+             * fused kernel (their per-launch kernelParams live at distinct host
+             * addresses, so address dedup would not merge them). */
+            if (progs[i]->source.content.llvmir.triple)
+                value_dedup = true;
         }
 
         if (entry == nullptr)
@@ -830,6 +928,22 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             {
                 fprintf(stderr, "prog-fuse: cannot mix packed and non-packed task "
                                 "bodies in one fused chain (program %zu)\n", i);
+                abort();
+            }
+
+    /* Device (GPU) fusion: the chain's PROGs carry a device codegen target
+     * (triple/arch). Homogeneous by construction (a device kernel only chains with
+     * others on the same device via equal launch params). The fused entry is a
+     * single `ptx_kernel` (see below) compiled to PTX by the jit pass. */
+    const char * dev_triple = progs[0]->source.content.llvmir.triple;
+    const char * dev_arch   = progs[0]->source.content.llvmir.arch;
+    const bool   device     = (dev_triple != nullptr);
+    if (device)
+        for (size_t i = 0 ; i < n ; ++i)
+            if (progs[i]->source.content.llvmir.triple == nullptr)
+            {
+                fprintf(stderr, "prog-fuse: cannot mix device and host programs in one "
+                                "fused chain (program %zu)\n", i);
                 abort();
             }
 
@@ -980,6 +1094,11 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         /* fold the constituent into __fused_wrapper */
         F->setLinkage(llvm::GlobalValue::InternalLinkage);
         F->addFnAttr(llvm::Attribute::AlwaysInline);
+        /* device kernels carry the `ptx_kernel` calling convention; as an inlined
+         * internal helper it must be plain-callable, so neutralize the CC (the body
+         * is unaffected; the single fused entry re-declares ptx_kernel). */
+        if (device)
+            F->setCallingConv(llvm::CallingConv::C);
     }
 
     /* ------------------------------------------------------------------ *
@@ -1037,6 +1156,10 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     for (size_t i = 0 ; packed_output && i < n ; ++i)
         if (inputs[i].is_wrapper)
             packed_output = false;
+    /* device fusion uses an individual-parameter ptx_kernel (kernelParams ABI),
+     * never the host void**/packed byte-buffer shapes. */
+    if (device)
+        packed_output = false;
 
     std::vector<size_t> slot_offset(total_args, 0);
     size_t packed_size = 0;
@@ -1069,6 +1192,78 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             packed_size = 1;
     }
 
+    if (device)
+    {
+        /* Device fusion (Level 1, program-level): build a single `ptx_kernel` over
+         * the deduplicated kernel parameters, call each region kernel with its
+         * subset, inline them, then collapse the per-kernel target_init/deinit
+         * brackets into one. The jit pass codegens this to PTX. */
+        std::vector<llvm::Type *> ptypes(total_args);
+        for (unsigned k = 0 ; k < total_args ; ++k)
+            ptypes[k] = slot_type[k] ? slot_type[k] : ptr_ty;
+        llvm::FunctionType * wfty = llvm::FunctionType::get(void_ty, ptypes, false);
+        llvm::Function * wrapper = llvm::Function::Create(
+            wfty, llvm::GlobalValue::ExternalLinkage, "__fused_wrapper", mod_u.get());
+        wrapper->setCallingConv(llvm::CallingConv::PTX_Kernel);
+
+        /* carry the device kernel function attributes (kernel, nvvm.maxntid,
+         * target-cpu/features) from a constituent; drop alwaysinline (this is the
+         * launched entry, not an inline callee). */
+        if (llvm::Function * proto = mod_u->getFunction(inputs[0].fused_name))
+        {
+            llvm::AttrBuilder ab(llvmctx, proto->getAttributes().getFnAttrs());
+            ab.removeAttribute(llvm::Attribute::AlwaysInline);
+            wrapper->addFnAttrs(ab);
+        }
+        /* distinct captured pointers are assumed non-overlapping (restrict) */
+        for (unsigned k = 0 ; k < total_args ; ++k)
+            if (ptypes[k]->isPointerTy())
+                wrapper->addParamAttr(k, llvm::Attribute::NoAlias);
+
+        llvm::BasicBlock * bb = llvm::BasicBlock::Create(llvmctx, "entry", wrapper);
+        llvm::IRBuilder<> builder(bb);
+        std::vector<llvm::CallInst *> kernel_calls;
+        kernel_calls.reserve(n);
+        for (size_t i = 0 ; i < n ; ++i)
+        {
+            llvm::Function * fn = mod_u->getFunction(inputs[i].fused_name);
+            std::vector<llvm::Value *> call_args;
+            call_args.reserve(inputs[i].arity);
+            for (unsigned j = 0 ; j < inputs[i].arity ; ++j)
+                call_args.push_back(wrapper->getArg(index_map[i][j]));
+            llvm::CallInst * ci = builder.CreateCall(fn->getFunctionType(), fn, call_args);
+            ci->setCallingConv(fn->getCallingConv());
+            kernel_calls.push_back(ci);
+        }
+        builder.CreateRetVoid();
+
+        for (llvm::CallInst * ci : kernel_calls)
+        {
+            llvm::InlineFunctionInfo ifi;
+            if (!llvm::InlineFunction(*ci, ifi).isSuccess())
+            {
+                fprintf(stderr, "prog-fuse: failed to inline a device kernel\n");
+                abort();
+            }
+        }
+        for (size_t i = 0 ; i < n ; ++i)
+        {
+            llvm::Function * F = mod_u->getFunction(inputs[i].fused_name);
+            if (F && F->use_empty())
+                F->eraseFromParent();
+        }
+
+        /* collapse the N target_init/deinit brackets into one (SPMD + same config;
+         * aborts if that precondition does not hold). */
+        if (!collapse_device_kernel_brackets(*wrapper))
+        {
+            fprintf(stderr, "prog-fuse: device kernels are not fusible "
+                            "(non-SPMD or differing launch configuration)\n");
+            abort();
+        }
+    }
+    else
+    {
     llvm::FunctionType * wrapper_fty = packed_output
         ? llvm::FunctionType::get(void_ty, { ptr_ty, i64_ty }, false)
         : llvm::FunctionType::get(void_ty, { ptr_ty }, false);
@@ -1085,6 +1280,16 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     llvm::BasicBlock * bb = llvm::BasicBlock::Create(llvmctx, "entry", wrapper);
     llvm::IRBuilder<> builder(bb);
     llvm::Value * args_ptr = wrapper->getArg(0);
+
+    /* Mark a hoisted capture-base load so tag_noalias_domains (run post-SROA)
+     * disambiguates ONLY genuine captures -- never pointers a body loads from its
+     * own data. Only pointer-typed bases matter (scalars are not memory bases). */
+    const unsigned base_kind = llvmctx.getMDKindID("cgir.fuse.base");
+    auto mark_base = [&] (llvm::Value * v)
+    {
+        if (auto * L = llvm::dyn_cast<llvm::LoadInst>(v))
+            L->setMetadata(base_kind, llvm::MDNode::get(llvmctx, {}));
+    };
 
     /* Load slot `idx` as type T. void** form: args[idx] is a &value (double load).
      * packed form: the value is inline at args_ptr + slot_offset[idx] (one load). */
@@ -1117,7 +1322,11 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     std::vector<llvm::Value *> slot_value(total_args, nullptr);
     for (unsigned k = 0 ; k < total_args ; ++k)
         if (slot_type[k] != nullptr)
+        {
             slot_value[k] = load_arg(k, slot_type[k]);
+            if (slot_type[k]->isPointerTy())
+                mark_base(slot_value[k]); /* a captured array/pointer base */
+        }
 
     /* Packed leaves reconstruct their own buffer in a stack slot. Create ALL the
      * allocas up front (entry block, before any call) so they remain static and
@@ -1160,6 +1369,8 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             slot_hoist[k] = builder.CreateAlignedLoad(
                 ht, src, llvm::MaybeAlign(1),
                 unique_slot_is_ref[k] ? "refbase" : "copyval");
+            if (unique_slot_is_ref[k])
+                mark_base(slot_hoist[k]); /* a captured array/pointer base */
         }
 
     std::vector<llvm::CallInst *> kernel_calls;
@@ -1278,6 +1489,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         if (F && F->use_empty())
             F->eraseFromParent();
     }
+    }   /* end host wrapper build (else !device) */
 
     /* Shared-domain scoped-noalias tagging (the restrict-like "distinct captured
      * base pointer => no overlap" assumption that lets DependenceAnalysis fuse and
@@ -1294,7 +1506,12 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      * ------------------------------------------------------------------ */
     std::unique_ptr<llvm::TargetMachine> tm;
     {
-        if (mod_u->getTargetTriple().empty())
+        /* Device chains keep the device triple (from the linked device IR) and use
+         * the runtime device arch as the target-cpu; host chains use the process
+         * triple + host cpu. */
+        if (device)
+            mod_u->setTargetTriple(llvm::Triple(dev_triple));
+        else if (mod_u->getTargetTriple().empty())
             mod_u->setTargetTriple(llvm::Triple(llvm::sys::getProcessTriple()));
 
         const llvm::Triple & TT = mod_u->getTargetTriple();
@@ -1307,12 +1524,13 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         }
         llvm::TargetOptions opts;
         tm.reset(tgt->createTargetMachine(
-            TT, llvm::sys::getHostCPUName(), /* features */ "", opts,
+            TT, device ? (dev_arch ? dev_arch : "") : llvm::sys::getHostCPUName(),
+            /* features */ "", opts,
             /* reloc */ std::nullopt, /* code model */ std::nullopt,
             /* match the O3 IR pipeline below for end-to-end aggressive codegen */
             llvm::CodeGenOptLevel::Aggressive));
 
-        if (tm && mod_u->getDataLayout().isDefault())
+        if (tm && (device || mod_u->getDataLayout().isDefault()))
             mod_u->setDataLayout(tm->createDataLayout());
     }
 
@@ -1367,9 +1585,11 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     dst->source.content.llvmir.raw    = bc_buf;
     dst->source.content.llvmir.size   = bitcode.size();
     dst->source.content.llvmir._owned = true;   /* heap (malloc) — the pass owns it */
-    /* the fused entry is `__fused_wrapper`; clear any per-input entry symbol
-     * (dst may alias progs[0], which could carry a device kernel symbol) */
-    dst->source.content.llvmir.symbol = nullptr;
+    /* The fused entry is `__fused_wrapper`. Host chains resolve it by name/shape,
+     * so clear the per-input symbol; device chains must name it so the driver can
+     * cuModuleGetFunction the PTX entry. (dst may alias progs[0] whose triple/arch
+     * are preserved here, driving the jit pass's PTX codegen.) */
+    dst->source.content.llvmir.symbol = device ? "__fused_wrapper" : nullptr;
     /* the fused entry is void(void**) (or void(void*,size_t) when packed); it
      * carries no per-parameter table (a re-fusion detects its shape by signature). */
     dst->source.content.llvmir.proto        = packed_output
@@ -1572,6 +1792,40 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     # endif /* CGIR_SUPPORT_LLVM */
 }
 
+# if CGIR_SUPPORT_LLVM
+/* Emit PTX for a device (GPU) module: build a device TargetMachine for `triple`
+ * (e.g. "nvptx64-nvidia-cuda") + `arch` (target-cpu, e.g. "sm_80"), stamp the
+ * module's triple/DataLayout, and run codegen to a PTX assembly string. Returns
+ * the PTX (empty + `err` set on failure). The CUDA driver JIT-compiles this PTX
+ * to SASS at cuModuleLoadData (see the xkrt driver). */
+static std::string
+emit_device_ptx(llvm::Module & M, const char * triple, const char * arch, std::string & err)
+{
+    llvm::Triple TT(triple);
+    std::string terr;
+    const llvm::Target * T = llvm::TargetRegistry::lookupTarget(TT.str(), terr);
+    if (!T) { err = "lookupTarget('" + TT.str() + "'): " + terr; return {}; }
+
+    llvm::TargetOptions opts;
+    std::unique_ptr<llvm::TargetMachine> TM(T->createTargetMachine(
+        TT, arch ? arch : "", /* features */ "", opts,
+        std::nullopt, std::nullopt, llvm::CodeGenOptLevel::Aggressive));
+    if (!TM) { err = "createTargetMachine failed"; return {}; }
+
+    M.setTargetTriple(TT);
+    M.setDataLayout(TM->createDataLayout());
+
+    llvm::SmallString<0> out;
+    llvm::raw_svector_ostream os(out);
+    llvm::legacy::PassManager pm;
+    if (TM->addPassesToEmitFile(pm, os, /* DwoOut */ nullptr,
+                                llvm::CodeGenFileType::AssemblyFile))
+    { err = "addPassesToEmitFile: PTX (assembly) emission not supported"; return {}; }
+    pm.run(M);
+    return std::string(out.begin(), out.end());
+}
+# endif /* CGIR_SUPPORT_LLVM */
+
 void
 CGIR_NAMESPACE::command_graph_jit_llvmir(
     command_prog_t * prog
@@ -1631,6 +1885,49 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
      * launcher untouched. */
     if (entry == nullptr || entry->isDeclaration() || entry->hasLocalLinkage())
         return ;
+
+    /* Device (GPU) target: compile the (fused) device kernel to PTX for the
+     * device's triple/arch instead of the in-process host JIT. The PTX is stored
+     * back in the source; the driver JIT-loads it (cuModuleLoadData) and resolves
+     * the entry (source.symbol) at launch. The launcher fn is left null (the
+     * driver fills it once the module is loaded). */
+    if (const char * dtriple = prog->source.content.llvmir.triple)
+    {
+        std::string perr;
+        std::string ptx = emit_device_ptx(*mod, dtriple,
+                                           prog->source.content.llvmir.arch, perr);
+        if (ptx.empty())
+        {
+            fprintf(stderr, "jit(device): PTX emission failed: %s\n", perr.c_str());
+            abort();
+        }
+        if (dump)
+        {
+            std::string path = dump_dir + "/final.ptx";
+            std::error_code ec;
+            llvm::raw_fd_ostream f(path, ec, llvm::sys::fs::OF_Text);
+            if (!ec) f << ptx;
+        }
+
+        /* replace the source IR with the emitted PTX (owned); keep the entry symbol
+         * so the driver can cuModuleGetFunction it. */
+        if (prog->source.content.llvmir._owned && prog->source.content.llvmir.raw)
+            free(prog->source.content.llvmir.raw);
+        char * buf = static_cast<char *>(malloc(ptx.size() + 1));
+        if (!buf) { fprintf(stderr, "jit(device): malloc failed\n"); abort(); }
+        memcpy(buf, ptx.data(), ptx.size());
+        buf[ptx.size()] = '\0';
+        prog->source.type                  = COMMAND_PROG_SOURCE_TYPE_PTX;
+        prog->source.content.llvmir.raw    = buf;
+        prog->source.content.llvmir.size   = ptx.size() + 1; /* incl. NUL */
+        prog->source.content.llvmir._owned = true;
+        /* device kernels launch through the VARIADIC (kernelParams=args) path; the
+         * driver reinterprets launcher.variadic.fn as the loaded device function,
+         * resolved lazily at launch (null until then). */
+        prog->prototype            = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC;
+        prog->launcher.variadic.fn = nullptr;
+        return ;
+    }
 
     /* The runtime launches a JIT'd PROG as `void(void**)` (VARIADIC) or, for a
      * packed body, `void(void*, size_t)` (PACKED). If the entry already has one
