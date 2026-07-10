@@ -95,13 +95,17 @@ typedef enum    cgir_command_prog_param_kind_t
     CGIR_COMMAND_PROG_PARAM_COPY            /* firstprivate: the arg slot holds a copy */
 }               cgir_command_prog_param_kind_t;
 
-/* Descriptor of one entry parameter: its passing kind and byte size. Lets the
- * fuse pass deduplicate references by pointer and copies by memcmp over `size`
- * bytes. C-compatible POD. */
+/* Descriptor of one entry parameter: its passing kind, byte size and byte
+ * offset within the packed buffer (PACKED_BUFFER proto). Lets the fuse pass
+ * deduplicate references by pointer and copies by memcmp over `size` bytes, and
+ * lets the fuse/jit passes pack/reconstruct the per-task buffer at `offset`.
+ * `offset` is the producer's (compiler's) natural-aligned layout of THIS task's
+ * buffer; it is unused for the UNPACKED_PARAMS proto. C-compatible POD. */
 typedef struct  cgir_command_prog_param_t
 {
     cgir_command_prog_param_kind_t kind;
     size_t                         size;   /* byte size of the value */
+    size_t                         offset; /* byte offset within the packed buffer */
 }               cgir_command_prog_param_t;
 
 /* One entry of a program's externalized-global resolution table: a symbol that

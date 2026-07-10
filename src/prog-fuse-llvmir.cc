@@ -499,6 +499,13 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     {
         std::string          fused_name;  /* entry name after prefixing */
         bool                 is_wrapper;  /* true if entry is void(void**) */
+        /* true if entry is a packed self-contained body void(void*, size_t): its
+         * arg slots (&value) come from the params table (one per capture), not the
+         * IR parameters (which are just the buffer pointer + size). Fusion
+         * reconstructs each such body's own packed buffer from the deduplicated
+         * fused buffer (at the params' offsets) and calls it. */
+        bool                 is_packed_leaf;
+        size_t               buf_size;    /* packed-leaf: this body's buffer size */
         unsigned             arity;       /* number of arg slots consumed */
         std::vector<void *>  slots;       /* the originals' arg slots (&value) */
         /* Deduplicate leaf slots by the DEREFERENCED value (not by slot address)
@@ -527,17 +534,24 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
 
         llvm::Function * entry = nullptr;
         bool is_wrapper = false;
+        bool is_packed_leaf = false;
+        size_t buf_size = 0;
         unsigned arity = 0;
         bool value_dedup = false;
 
-        /* A task-spawn body comes in one of two forms, distinguished by the
+        /* A task-spawn body comes in one of three forms, distinguished by the
          * entry signature:
-         *  - unpacked (fusable): `void .omp_task_kernel.(<captured values...>)`,
+         *  - unpacked leaf (fusable): `void .omp_task_kernel.(<captured values...>)`,
          *    one parameter per captured value, so its loops can be fused. Deduped
          *    by VALUE (each task has its own storage, so slot addresses differ
          *    across bodies even when values are equal; see value_dedup).
-         *  - packed: the `void(void**)` kernel consuming the whole args block
-         *    (args[0] == kmp_task_t*); fuses only at the PROGRAM level. */
+         *  - packed leaf (fusable): `void .omp_task_kernel.(void*, size_t)`, a
+         *    self-contained body reading its captures from a packed buffer at the
+         *    params table's offsets. Its arg slots come from the params table (one
+         *    &value per capture); fusion reconstructs each body's buffer from the
+         *    deduplicated fused buffer and calls it (see is_packed_leaf).
+         *  - packed wrapper: the `void(void**)` kernel consuming the whole args
+         *    block (args[0] == kmp_task_t*); fuses only at the PROGRAM level. */
         if (progs[i]->launch_mode == CGIR_COMMAND_PROG_LAUNCH_MODE_TASK_SPAWN)
         {
             if (const char * sym = progs[i]->source.content.llvmir.symbol)
@@ -547,7 +561,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             if (entry == nullptr)
                 entry = find_packed_wrapper(M);   /* packed void(void**) kernel */
             if (entry == nullptr)
-                entry = find_external_def(M);      /* unpacked .omp_task_kernel. */
+                entry = find_external_def(M);      /* unpacked/packed .omp_task_kernel. */
             if (!entry || entry->isDeclaration())
             {
                 fprintf(stderr, "prog-fuse: no entry found in task-spawn program %zu\n", i);
@@ -555,14 +569,37 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             }
 
             llvm::FunctionType * fty = entry->getFunctionType();
+            const command_prog_param_t * params = progs[i]->source.content.llvmir.params;
             if (is_void_voidptr(fty))
             {
                 is_wrapper = true;
                 arity      = (unsigned) progs[i]->n_args;
             }
+            else if (is_void_ptr_size(fty))
+            {
+                /* packed self-contained body: slots + layout come from the params
+                 * table. A packed body without a params table is a previously-fused
+                 * packed program (prog-fuse clears params); re-fusing that is not
+                 * supported (it consumes a whole buffer, not per-slot values). */
+                if (params == nullptr)
+                {
+                    fprintf(stderr, "prog-fuse: cannot re-fuse packed fused program %zu "
+                                    "(no params table)\n", i);
+                    abort();
+                }
+                is_packed_leaf = true;
+                arity          = (unsigned) progs[i]->source.content.llvmir.param_count;
+                /* this body's own packed buffer size = max(offset + size) */
+                for (unsigned k = 0 ; k < arity ; ++k)
+                {
+                    const size_t end = params[k].offset + params[k].size;
+                    if (end > buf_size) buf_size = end;
+                }
+                if (buf_size == 0) buf_size = 1;
+            }
             else
             {
-                /* leaf form: one slot per captured value, deduplicated by value */
+                /* unpacked leaf: one slot per captured value, deduplicated by value */
                 is_wrapper  = false;
                 arity       = fty->getNumParams();
                 value_dedup = true;
@@ -622,12 +659,14 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         snprintf(prefix, sizeof(prefix), "__fz%zu_", i);
         prefix_functions(M, prefix);
 
-        inputs[i].fused_name  = std::string(prefix) + name;
-        inputs[i].is_wrapper  = is_wrapper;
-        inputs[i].arity       = arity;
-        inputs[i].value_dedup = value_dedup;
-        inputs[i].params      = progs[i]->source.content.llvmir.params;
-        inputs[i].param_count = progs[i]->source.content.llvmir.param_count;
+        inputs[i].fused_name     = std::string(prefix) + name;
+        inputs[i].is_wrapper     = is_wrapper;
+        inputs[i].is_packed_leaf = is_packed_leaf;
+        inputs[i].buf_size       = buf_size;
+        inputs[i].arity          = arity;
+        inputs[i].value_dedup    = value_dedup;
+        inputs[i].params         = progs[i]->source.content.llvmir.params;
+        inputs[i].param_count    = progs[i]->source.content.llvmir.param_count;
 
         /* for value-deduplicated leaf inputs, snapshot the parameter types so the
          * dedup key can read exactly the value bytes (and distinguish types) */
@@ -659,10 +698,37 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      *     across the fused bodies, and merging them into one hoisted load   *
      *     is what lets the fused loops share trip counts/offsets and fuse.  *
      * ------------------------------------------------------------------ */
+    /* Packed-leaf fusion is homogeneous: if any input is a packed self-contained
+     * body, they all must be (mixing shapes would need per-input ABIs the single
+     * fused entry cannot express). Guaranteed by per-TU -fopenmp-task-jit-type. */
+    bool any_packed_leaf = false;
+    for (size_t i = 0 ; i < n ; ++i)
+        any_packed_leaf |= inputs[i].is_packed_leaf;
+    if (any_packed_leaf)
+        for (size_t i = 0 ; i < n ; ++i)
+            if (!inputs[i].is_packed_leaf)
+            {
+                fprintf(stderr, "prog-fuse: cannot mix packed and non-packed task "
+                                "bodies in one fused chain (program %zu)\n", i);
+                abort();
+            }
+
     std::vector<void *>                    unique_slots;
+    std::vector<size_t>                    unique_slot_size; /* byte size per unique slot */
     std::unordered_map<std::string, unsigned> slot_to_index;
     std::vector<std::vector<unsigned>>     index_map(n);
     std::vector<unsigned>                  wrapper_block_start(n, 0);
+
+    /* byte size of leaf slot (i,j) from its param descriptor (0 if unknown) */
+    auto slot_size = [&] (size_t i, unsigned j) -> size_t
+    {
+        if (inputs[i].params != nullptr && j < inputs[i].param_count)
+        {
+            const command_prog_param_t & p = inputs[i].params[j];
+            return (p.kind == CGIR_COMMAND_PROG_PARAM_COPY) ? p.size : sizeof(void *);
+        }
+        return 0;
+    };
 
     /* Identity key for a leaf slot. When the compiler forwarded per-parameter
      * descriptors (kind+size), dedup is EXPLICIT: a REFERENCE (shared) slot by
@@ -714,7 +780,10 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         {
             wrapper_block_start[i] = (unsigned) unique_slots.size();
             for (unsigned k = 0 ; k < inputs[i].arity ; ++k)
+            {
                 unique_slots.push_back(inputs[i].slots[k]);
+                unique_slot_size.push_back(sizeof(void *));
+            }
         }
         else
         {
@@ -728,6 +797,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
                 {
                     idx = (unsigned) unique_slots.size();
                     unique_slots.push_back(inputs[i].slots[j]);
+                    unique_slot_size.push_back(slot_size(i, j));
                     slot_to_index[key] = idx;
                 }
                 else
@@ -797,11 +867,13 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     /* Determine the value type of each deduplicated leaf slot from its first
      * use. Every kernel sharing a slot must read it as the same type (the slot
      * holds one &value); with opaque pointers, pointer args are all `ptr`, and
-     * shared scalars (e.g. the length `n`) are consistent. */
+     * shared scalars (e.g. the length `n`) are consistent. Packed leaves carry no
+     * per-slot IR types (their IR params are just buffer ptr + size); their slot
+     * byte sizes come from unique_slot_size instead, so they are skipped here. */
     std::vector<llvm::Type *> slot_type(total_args, nullptr);
     for (size_t i = 0 ; i < n ; ++i)
     {
-        if (inputs[i].is_wrapper)
+        if (inputs[i].is_wrapper || inputs[i].is_packed_leaf)
             continue;
         llvm::FunctionType * fty = mod_u->getFunction(inputs[i].fused_name)->getFunctionType();
         for (unsigned j = 0 ; j < inputs[i].arity ; ++j)
@@ -815,14 +887,23 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         }
     }
 
-    /* Optional packed output ABI (CGIR_PROG_FUSE_PACKED): emit the fused entry as
-     * `void(void*, size_t)` over a single packed byte buffer -- each deduplicated
-     * slot inlined at a fixed (naturally-aligned) offset -- instead of
-     * `void(void**)` over a pointer array. Enabled only when every input is a leaf
-     * (a nested void** sub-wrapper needs a pointer slice the buffer cannot give).
-     * The dedup/inline/noalias logic is identical; only the arg access shape and
-     * the recorded args buffer differ. */
+    /* Packed output ABI: emit the fused entry as `void(void*, size_t)` over a
+     * single packed byte buffer -- each deduplicated slot inlined at a fixed
+     * (naturally-aligned) offset -- instead of `void(void**)` over a pointer
+     * array. Requested by -fopenmp-task-jit-type=packed (a PACKED_BUFFER source
+     * proto), or forced via CGIR_PROG_FUSE_PACKED. Enabled only when every input
+     * is a leaf (a nested void** sub-wrapper needs a pointer slice the buffer
+     * cannot give). The dedup/inline/noalias logic is identical; only the arg
+     * access shape and the recorded args buffer differ. */
     bool packed_output = dump_enabled("CGIR_PROG_FUSE_PACKED");
+    for (size_t i = 0 ; i < n ; ++i)
+        if (progs[i]->source.content.llvmir.proto ==
+            CGIR_COMMAND_PROG_SOURCE_PROTO_PACKED_BUFFER)
+            packed_output = true;
+    /* packed self-contained bodies (void(void*,size_t)) can only be fused into a
+     * packed buffer -- the reconstruction path requires the fused slot offsets. */
+    if (any_packed_leaf)
+        packed_output = true;
     for (size_t i = 0 ; packed_output && i < n ; ++i)
         if (inputs[i].is_wrapper)
             packed_output = false;
@@ -833,9 +914,21 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     {
         for (unsigned k = 0 ; k < total_args ; ++k)
         {
-            llvm::Type * T = slot_type[k] ? slot_type[k] : ptr_ty;
-            const size_t sz = (size_t) DL.getTypeStoreSize(T).getFixedValue();
-            const size_t al = (size_t) DL.getABITypeAlign(T).value();
+            size_t sz, al;
+            if (any_packed_leaf)
+            {
+                /* packed leaves: slot bytes come from the params table. The fused
+                 * buffer is only intermediate storage (memcpy'd to/from each body's
+                 * reconstructed buffer), so byte packing (align 1) is sufficient. */
+                sz = unique_slot_size[k] ? unique_slot_size[k] : 1;
+                al = 1;
+            }
+            else
+            {
+                llvm::Type * T = slot_type[k] ? slot_type[k] : ptr_ty;
+                sz = (size_t) DL.getTypeStoreSize(T).getFixedValue();
+                al = (size_t) DL.getABITypeAlign(T).value();
+            }
             packed_size = (packed_size + al - 1) & ~(al - 1);
             slot_offset[k] = packed_size;
             packed_size += sz;
@@ -894,6 +987,19 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         if (slot_type[k] != nullptr)
             slot_value[k] = load_arg(k, slot_type[k]);
 
+    /* Packed leaves reconstruct their own buffer in a stack slot. Create ALL the
+     * allocas up front (entry block, before any call) so they remain static and
+     * promotable after we split the entry block by inlining the calls below. */
+    std::vector<llvm::Value *> recon_buf(n, nullptr);
+    if (any_packed_leaf)
+        for (size_t i = 0 ; i < n ; ++i)
+        {
+            llvm::AllocaInst * a = builder.CreateAlloca(
+                i8_ty, llvm::ConstantInt::get(i64_ty, inputs[i].buf_size), "recon");
+            a->setAlignment(llvm::Align(16));
+            recon_buf[i] = a;
+        }
+
     std::vector<llvm::CallInst *> kernel_calls;
     kernel_calls.reserve(n);
     for (size_t i = 0 ; i < n ; ++i)
@@ -905,6 +1011,29 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         {
             /* a previously-fused sub-wrapper consumes a raw void** slice */
             kernel_calls.push_back(builder.CreateCall(fty, fn, { slice_ptr(wrapper_block_start[i]) }));
+        }
+        else if (inputs[i].is_packed_leaf)
+        {
+            /* Reconstruct this body's own packed buffer from the deduplicated
+             * fused buffer: for each capture, copy its bytes from the fused slot
+             * (args_ptr + slot_offset) to this body's layout (recon + params.offset),
+             * then call the self-contained kernel(recon, size). After AlwaysInline
+             * + SROA the recon alloca promotes away and the body reads the shared
+             * (deduplicated) slot values directly. */
+            llvm::Value * recon = recon_buf[i];
+            for (unsigned j = 0 ; j < inputs[i].arity ; ++j)
+            {
+                const command_prog_param_t & p = inputs[i].params[j];
+                llvm::Value * dst = builder.CreateGEP(
+                    i8_ty, recon, llvm::ConstantInt::get(i64_ty, p.offset), "rslot");
+                llvm::Value * src = builder.CreateGEP(
+                    i8_ty, args_ptr,
+                    llvm::ConstantInt::get(i64_ty, slot_offset[index_map[i][j]]), "fslot");
+                builder.CreateMemCpy(dst, llvm::MaybeAlign(1), src, llvm::MaybeAlign(1),
+                                     (uint64_t) p.size);
+            }
+            kernel_calls.push_back(builder.CreateCall(
+                fty, fn, { recon, llvm::ConstantInt::get(i64_ty, inputs[i].buf_size) }));
         }
         else
         {
@@ -951,9 +1080,13 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             F->eraseFromParent();
     }
 
+    if (!any_packed_leaf)
     {
         /* One alias-scope domain for the whole fused body; one scope per
-         * distinct base pointer value (the deref of each pointer arg slot). */
+         * distinct base pointer value (the deref of each pointer arg slot).
+         * (Skipped for packed leaves: their captures are memcpy'd into per-body
+         * reconstructed buffers rather than shared hoisted loads, so there are no
+         * slot_value pointer loads to disambiguate; loop fusion is deferred.) */
         llvm::MDBuilder mdb(llvmctx);
         llvm::MDNode *  domain = mdb.createAnonymousAliasScopeDomain("cgir.prog-fuse");
 
@@ -1172,14 +1305,23 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     {
         /* Packed byte buffer: each deduplicated slot's VALUE inlined at its
          * offset (matching the fused kernel's fixed-offset loads). unique_slots[k]
-         * points at the value (a &value slot), so we copy its store-size bytes. */
+         * points at the value (a &value slot), so we copy its byte size -- from the
+         * params table (packed leaves) or the IR slot type (unpacked leaves). */
         char * buf = static_cast<char *>(calloc(packed_size ? packed_size : 1, 1));
         if (!buf) { fprintf(stderr, "prog-fuse: calloc failed\n"); abort(); }
         for (unsigned k = 0 ; k < total_args ; ++k)
         {
-            if (unique_slots[k] == nullptr || slot_type[k] == nullptr)
+            if (unique_slots[k] == nullptr)
                 continue;
-            const size_t sz = (size_t) DL.getTypeStoreSize(slot_type[k]).getFixedValue();
+            size_t sz;
+            if (any_packed_leaf)
+                sz = unique_slot_size[k];
+            else if (slot_type[k] != nullptr)
+                sz = (size_t) DL.getTypeStoreSize(slot_type[k]).getFixedValue();
+            else
+                continue;
+            if (sz == 0)
+                continue;
             memcpy(buf + slot_offset[k], unique_slots[k], sz);
         }
         args_buf = reinterpret_cast<void **>(buf);
@@ -1491,6 +1633,38 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
      * recorded OpenMP task was KMP before this; its kargs stay in prog->args). */
     if (entry_is_packed)
     {
+        /* A STANDALONE packed leaf (never fused) still carries the recorded
+         * per-value &value slots (void** args) plus its params table (prog-fuse
+         * clears params on a fused packed program, so params != NULL identifies
+         * the standalone case). The packed launcher expects a single packed byte
+         * buffer, so materialize it here from the slots at the params' offsets --
+         * the same layout the packed body reads. */
+        const cgir_command_prog_param_t * params = prog->source.content.llvmir.params;
+        const size_t nparams = prog->source.content.llvmir.param_count;
+        /* args_size == 0 means the recorded void** slots have not been packed yet
+         * (prog-fuse/a prior jit set args_size > 0), keeping this idempotent. */
+        if (params != nullptr && nparams > 0 && prog->args_size == 0)
+        {
+            size_t buf_size = 0;
+            for (size_t k = 0 ; k < nparams ; ++k)
+            {
+                const size_t end = params[k].offset + params[k].size;
+                if (end > buf_size) buf_size = end;
+            }
+            if (buf_size == 0) buf_size = 1;
+            char * buf = static_cast<char *>(calloc(buf_size, 1));
+            if (!buf) { fprintf(stderr, "jit: calloc failed\n"); abort(); }
+            void ** slots = prog->args;
+            for (size_t k = 0 ; slots != nullptr && k < nparams ; ++k)
+                if (slots[k] != nullptr)
+                    memcpy(buf + params[k].offset, slots[k], params[k].size);
+            if (prog->_args_owned && prog->args)
+                free(prog->args);
+            prog->args        = reinterpret_cast<void **>(buf);
+            prog->n_args      = nparams;
+            prog->args_size   = buf_size;
+            prog->_args_owned = true;
+        }
         prog->prototype          = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED;
         prog->launcher.packed.fn = reinterpret_cast<void (*)(void *, size_t)>(fn_addr);
     }
