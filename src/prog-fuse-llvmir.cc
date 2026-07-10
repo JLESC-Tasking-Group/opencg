@@ -304,6 +304,87 @@ prefix_functions(llvm::Module & M, const std::string & prefix)
         F->setName(prefix + F->getName().str());
 }
 
+/* Attach shared-domain scoped-noalias metadata to the fused wrapper's memory
+ * accesses: one alias scope per distinct captured base pointer, with every data
+ * access marked `noalias` against all the OTHER bases. This is the restrict-like
+ * assumption (distinct captured base pointer => non-overlapping), consistent with
+ * prog-fuse's dedup contract (the same array collapses to one slot, hence one base
+ * load, so distinct base loads are distinct arrays).
+ *
+ * A "captured base" is a pointer LOADED from the args buffer -- the deduplicated
+ * array base each kernel reads/writes through. We restrict tagging to loads/stores
+ * of NON-pointer values (the actual array data) so the args-buffer pointer chasing
+ * is skipped, and require the access's underlying object to be a load (the base),
+ * so stack temporaries are left alone.
+ *
+ * MUST run AFTER SROA (see optimize_module): only then does each array access
+ * resolve to its base load -- uniformly for the pointers (void**, base = the
+ * &value's deref) and packed (void*,size_t, base = the pointer read from the
+ * buffer) shapes. With it, DependenceAnalysis can fuse the loops and the loop
+ * vectorizer needs no runtime alias check. */
+static void
+tag_noalias_domains(llvm::Function & F)
+{
+    llvm::LLVMContext & ctx = F.getContext();
+    llvm::MDBuilder mdb(ctx);
+    llvm::MDNode * domain = mdb.createAnonymousAliasScopeDomain("cgir.prog-fuse");
+
+    /* the deduplicated captured base of a taggable data access, or nullptr */
+    auto data_base = [] (llvm::Instruction & I) -> llvm::Value *
+    {
+        llvm::Value * ptr = llvm::getLoadStorePointerOperand(&I);
+        if (ptr == nullptr)
+            return nullptr;
+        llvm::Type * ty = nullptr;
+        if (auto * LI = llvm::dyn_cast<llvm::LoadInst>(&I))
+            ty = LI->getType();
+        else if (auto * SI = llvm::dyn_cast<llvm::StoreInst>(&I))
+            ty = SI->getValueOperand()->getType();
+        if (ty == nullptr || ty->isPointerTy())
+            return nullptr; /* skip args-buffer pointer chasing */
+        llvm::Value * base = llvm::getUnderlyingObject(ptr);
+        return llvm::isa<llvm::LoadInst>(base) ? base : nullptr;
+    };
+
+    std::unordered_map<llvm::Value *, llvm::MDNode *> base_to_scope;
+    std::vector<llvm::Metadata *>                     all_scopes;
+    for (llvm::BasicBlock & BB : F)
+        for (llvm::Instruction & I : BB)
+        {
+            llvm::Value * base = data_base(I);
+            if (base == nullptr)
+                continue;
+            if (base_to_scope.find(base) == base_to_scope.end())
+            {
+                llvm::MDNode * sc = mdb.createAnonymousAliasScope(domain, "cgir.prog-fuse.base");
+                base_to_scope[base] = sc;
+                all_scopes.push_back(sc);
+            }
+        }
+
+    /* With <2 distinct bases there is nothing to disambiguate. */
+    if (all_scopes.size() < 2)
+        return ;
+
+    for (llvm::BasicBlock & BB : F)
+        for (llvm::Instruction & I : BB)
+        {
+            llvm::Value * base = data_base(I);
+            if (base == nullptr)
+                continue;
+            llvm::Metadata * own = base_to_scope[base];
+            I.setMetadata(llvm::LLVMContext::MD_alias_scope,
+                          llvm::MDNode::get(ctx, { own }));
+            std::vector<llvm::Metadata *> others;
+            others.reserve(all_scopes.size() - 1);
+            for (llvm::Metadata * s : all_scopes)
+                if (s != own)
+                    others.push_back(s);
+            I.setMetadata(llvm::LLVMContext::MD_noalias,
+                          llvm::MDNode::get(ctx, others));
+        }
+}
+
 /* Run an O3 module pipeline (inlining + loop-fuse + vectorization) on the
  * merged module, so the inlined kernels' loops can vectorize/fuse. */
 static void
@@ -349,26 +430,38 @@ optimize_module(llvm::Module & M, llvm::TargetMachine * tm)
      * cruft (not adjacent). We therefore CLEAN UP first: SROA promotes the
      * reconstruction allocas so the accesses use the deduplicated base pointers
      * directly, and instcombine + simplify-cfg drop the now-dead scope decls and
-     * empty blocks -- after which loop-simplify/rotate/fuse merge the loops (e.g.
-     * scale+axpy -> one axpby) and the O3 pipeline vectorizes the single loop. */
+     * empty blocks. THEN we attach the shared-domain scoped-noalias metadata
+     * (tag_noalias_domains) -- now that each access resolves to its base load --
+     * so DependenceAnalysis can prove the cross-loop dependences and the vectorizer
+     * needs no runtime alias check; after which loop-simplify/rotate/fuse merge the
+     * loops (e.g. scale+axpy -> one axpby) and the O3 pipeline vectorizes it. */
     {
-        llvm::FunctionPassManager FPM;
-        /* promote per-body reconstruction allocas + remove inter-loop cruft */
-        FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
-        FPM.addPass(llvm::InstCombinePass());
-        FPM.addPass(llvm::SimplifyCFGPass());
+        /* 1. cleanup: promote reconstruction allocas + remove inter-loop cruft */
+        llvm::FunctionPassManager FPM1;
+        FPM1.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+        FPM1.addPass(llvm::InstCombinePass());
+        FPM1.addPass(llvm::SimplifyCFGPass());
+        llvm::ModulePassManager MPM1;
+        MPM1.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM1)));
+        MPM1.run(M, MAM);
 
-        FPM.addPass(llvm::LoopSimplifyPass());
+        /* 2. attach scoped-noalias now that accesses resolve to their base loads */
+        if (llvm::Function * wrapper = M.getFunction("__fused_wrapper"))
+            tag_noalias_domains(*wrapper);
+        /* the tagging edited IR outside the pass managers; drop cached analyses so
+         * the loop passes below see the new metadata. */
+        MAM.invalidate(M, llvm::PreservedAnalyses::none());
 
+        /* 3. canonicalize + rotate + fuse the loops */
+        llvm::FunctionPassManager FPM2;
+        FPM2.addPass(llvm::LoopSimplifyPass());
         llvm::LoopPassManager LPM;
         LPM.addPass(llvm::LoopRotatePass());
-        FPM.addPass(llvm::createFunctionToLoopPassAdaptor(std::move(LPM)));
-
-        FPM.addPass(llvm::LoopFusePass());
-
-        llvm::ModulePassManager PreMPM;
-        PreMPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
-        PreMPM.run(M, MAM);
+        FPM2.addPass(llvm::createFunctionToLoopPassAdaptor(std::move(LPM)));
+        FPM2.addPass(llvm::LoopFusePass());
+        llvm::ModulePassManager MPM2;
+        MPM2.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM2)));
+        MPM2.run(M, MAM);
     }
 
     llvm::ModulePassManager MPM = PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3);
@@ -1142,71 +1235,14 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             F->eraseFromParent();
     }
 
-    if (!any_packed_leaf)
-    {
-        /* One alias-scope domain for the whole fused body; one scope per
-         * distinct base pointer value (the deref of each pointer arg slot).
-         * (Skipped for packed leaves: their captures are memcpy'd into per-body
-         * reconstructed buffers rather than shared hoisted loads, so there are no
-         * slot_value pointer loads to disambiguate; loop fusion is deferred.) */
-        llvm::MDBuilder mdb(llvmctx);
-        llvm::MDNode *  domain = mdb.createAnonymousAliasScopeDomain("cgir.prog-fuse");
-
-        std::unordered_map<void *, llvm::MDNode *> base_to_scope;
-        std::vector<llvm::Metadata *>              all_scopes;
-        std::unordered_map<llvm::Value *, void *>  load_base; /* hoisted ptr load -> base */
-
-        for (unsigned k = 0 ; k < total_args ; ++k)
-        {
-            if (slot_value[k] == nullptr)                                continue; /* wrapper-block slot */
-            if (slot_type[k] == nullptr || !slot_type[k]->isPointerTy()) continue; /* not a pointer    */
-            if (unique_slots[k] == nullptr)                              continue; /* no &value         */
-
-            void * base = *static_cast<void **>(unique_slots[k]);
-            if (base == nullptr)
-                continue;
-
-            load_base[slot_value[k]] = base;
-            if (base_to_scope.find(base) == base_to_scope.end())
-            {
-                llvm::MDNode * sc = mdb.createAnonymousAliasScope(domain, "cgir.prog-fuse.ptr");
-                base_to_scope[base] = sc;
-                all_scopes.push_back(sc);
-            }
-        }
-
-        /* With <2 distinct bases there is nothing to disambiguate. */
-        if (all_scopes.size() >= 2)
-        {
-            for (llvm::BasicBlock & BB : *wrapper)
-            {
-                for (llvm::Instruction & I : BB)
-                {
-                    if (!I.mayReadOrWriteMemory())
-                        continue;
-                    llvm::Value * ptr = llvm::getLoadStorePointerOperand(&I);
-                    if (ptr == nullptr)
-                        continue;
-
-                    auto it = load_base.find(llvm::getUnderlyingObject(ptr));
-                    if (it == load_base.end())
-                        continue;
-
-                    llvm::Metadata * own = base_to_scope[it->second];
-                    I.setMetadata(llvm::LLVMContext::MD_alias_scope,
-                                  llvm::MDNode::get(llvmctx, { own }));
-
-                    std::vector<llvm::Metadata *> others;
-                    others.reserve(all_scopes.size() - 1);
-                    for (llvm::Metadata * s : all_scopes)
-                        if (s != own)
-                            others.push_back(s);
-                    I.setMetadata(llvm::LLVMContext::MD_noalias,
-                                  llvm::MDNode::get(llvmctx, others));
-                }
-            }
-        }
-    }
+    /* Shared-domain scoped-noalias tagging (the restrict-like "distinct captured
+     * base pointer => no overlap" assumption that lets DependenceAnalysis fuse and
+     * the vectorizer skip runtime alias checks) is NOT done here: at this point the
+     * kernels reach their captures through un-promoted reconstruction allocas
+     * (packed leaves) or param stores, so the accesses' underlying object is not
+     * yet the deduplicated base. It is applied in optimize_module() AFTER the SROA
+     * cleanup, when every access resolves to its base load -- uniformly for the
+     * pointers (void**) and packed (void*,size_t) shapes. See tag_noalias_domains(). */
 
     /* ------------------------------------------------------------------ *
      * 7. Stamp the host triple + data layout (parsed IR omits them) and    *
