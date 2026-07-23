@@ -1274,6 +1274,44 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
                 abort();
             }
         }
+
+        /* Transitively force-inline the kernels' whole helper chain into the
+         * wrapper (ptx_kernel entry -> *_debug__ -> *_omp_outlined -> ...). Only the
+         * entry was inlined above; the __kmpc_target_init/deinit brackets and the
+         * compute loops live in those (noinline/optnone) callees, so they must be
+         * pulled in here for collapse_device_kernel_brackets + loop-fusion to see
+         * them. In SPMD mode the parallel region is a direct call, so every level is
+         * inlinable; we stop at declarations (the __kmpc_* runtime) and intrinsics.
+         * Iterate to a fixpoint, restarting the scan after each inline (which
+         * invalidates iterators). */
+        for (bool changed = true ; changed ; )
+        {
+            changed = false;
+            for (llvm::BasicBlock & BB : *wrapper)
+            {
+                for (llvm::Instruction & I : BB)
+                {
+                    auto * ci = llvm::dyn_cast<llvm::CallInst>(&I);
+                    if (ci == nullptr)
+                        continue;
+                    llvm::Function * callee = ci->getCalledFunction();
+                    if (callee == nullptr || callee == wrapper ||
+                        callee->isDeclaration() || callee->isIntrinsic())
+                        continue;
+                    llvm::InlineFunctionInfo ifi;
+                    if (llvm::InlineFunction(*ci, ifi).isSuccess())
+                    {
+                        changed = true;
+                        break;   /* iterators invalidated -- rescan from the top */
+                    }
+                }
+                if (changed)
+                    break;
+            }
+        }
+
+        /* the inlined entries/helpers are now unused; drop the entries (the
+         * internal helpers are removed by globalDCE in optimize_module). */
         for (size_t i = 0 ; i < n ; ++i)
         {
             llvm::Function * F = mod_u->getFunction(inputs[i].fused_name);
