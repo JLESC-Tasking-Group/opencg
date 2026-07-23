@@ -402,6 +402,32 @@ tag_noalias_domains(llvm::Function & F)
         }
 }
 
+/* Structural (by-value) equality of two constants. prog-fuse parses every kernel
+ * module into ONE LLVMContext, which renames structurally-identical named struct
+ * types (ConfigurationEnvironmentTy -> .2, .3, ...); identical launch configs are
+ * then DISTINCT uniqued Constants, so a pointer compare is insufficient -- recurse
+ * and compare integer field values instead. */
+static bool
+constant_value_equal(llvm::Constant * a, llvm::Constant * b)
+{
+    if (a == b)                                 return true;   // same uniqued constant
+    if (a == nullptr || b == nullptr)           return false;
+    if (a->isNullValue() && b->isNullValue())   return true;   // zero-inits of renamed types
+    if (auto * ia = llvm::dyn_cast<llvm::ConstantInt>(a))
+    {
+        auto * ib = llvm::dyn_cast<llvm::ConstantInt>(b);
+        return ib && ia->getValue() == ib->getValue();
+    }
+    auto * aa = llvm::dyn_cast<llvm::ConstantAggregate>(a);
+    auto * ab = llvm::dyn_cast<llvm::ConstantAggregate>(b);
+    if (!aa || !ab || aa->getNumOperands() != ab->getNumOperands())
+        return false;
+    for (unsigned i = 0 ; i < aa->getNumOperands() ; ++i)
+        if (!constant_value_equal(aa->getOperand(i), ab->getOperand(i)))
+            return false;
+    return true;
+}
+
 /* Collapse the per-kernel OpenMP-device runtime brackets in a fused device kernel.
  * Inlining N device target-region kernels into one wrapper leaves N
  * `__kmpc_target_init`/`__kmpc_target_deinit` pairs, but a single launch must have
@@ -430,10 +456,12 @@ collapse_device_kernel_brackets(llvm::Function & F)
     if (inits.size() < 2 || inits.size() != deinits.size())
         return false;
 
-    /* All kernels must share the launch configuration. It is the first field of
+    /* All kernels must share the launch configuration: the first field of
      * KernelEnvironmentTy (ConfigurationEnvironmentTy), which holds only integers
-     * (exec-mode, thread/team bounds, reduction sizes), so equal configs are the
-     * SAME uniqued Constant -- a pointer compare suffices. */
+     * (exec-mode, thread/team bounds, reduction sizes). Compare it by VALUE
+     * (constant_value_equal), not by Constant pointer: parsing the kernels into one
+     * context renames the type per kernel (.2/.3), so identical configs are not the
+     * same uniqued Constant. */
     auto config_of = [] (llvm::CallInst * init) -> llvm::Constant *
     {
         llvm::Value * env = init->getArgOperand(0)->stripPointerCasts();
@@ -447,7 +475,7 @@ collapse_device_kernel_brackets(llvm::Function & F)
     if (cfg0 == nullptr)
         return false;
     for (size_t i = 1 ; i < inits.size() ; ++i)
-        if (config_of(inits[i]) != cfg0)
+        if (!constant_value_equal(config_of(inits[i]), cfg0))
             return false;
 
     /* Each init must be the SPMD pattern: its result feeds `icmp eq <res>, -1`. */
