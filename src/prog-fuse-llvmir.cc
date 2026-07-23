@@ -1157,7 +1157,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         if (inputs[i].is_wrapper)
             packed_output = false;
     /* device fusion uses an individual-parameter ptx_kernel (kernelParams ABI),
-     * never the host void**/packed byte-buffer shapes. */
+     * never the host void** packed byte-buffer shapes. */
     if (device)
         packed_output = false;
 
@@ -1803,7 +1803,7 @@ emit_device_ptx(llvm::Module & M, const char * triple, const char * arch, std::s
 {
     llvm::Triple TT(triple);
     std::string terr;
-    const llvm::Target * T = llvm::TargetRegistry::lookupTarget(TT.str(), terr);
+    const llvm::Target * T = llvm::TargetRegistry::lookupTarget(TT, terr);
     if (!T) { err = "lookupTarget('" + TT.str() + "'): " + terr; return {}; }
 
     llvm::TargetOptions opts;
