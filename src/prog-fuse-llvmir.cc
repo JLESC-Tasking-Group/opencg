@@ -1869,7 +1869,8 @@ link_device_runtime(llvm::Module & M, const char * bc_path, std::string & err)
  * the PTX (empty + `err` set on failure). The CUDA driver JIT-compiles this PTX
  * to SASS at cuModuleLoadData (see the xkrt driver). */
 static std::string
-emit_device_ptx(llvm::Module & M, const char * triple, const char * arch, std::string & err)
+emit_device_ptx(llvm::Module & M, const char * triple, const char * arch,
+                const char * runtime_bc, std::string & err)
 {
     llvm::Triple TT(triple);
     std::string terr;
@@ -1885,10 +1886,15 @@ emit_device_ptx(llvm::Module & M, const char * triple, const char * arch, std::s
     M.setTargetTriple(TT);
     M.setDataLayout(TM->createDataLayout());
 
-    /* Resolve the OpenMP device-runtime externs (__kmpc_*) the kernel references by
-     * linking the DeviceRTL bitcode (path from CGIR_DEVICE_RTL_BC) before codegen,
-     * so ptxas can JIT the PTX at cuModuleLoadData. Inert when the env var is unset. */
-    if (const char * rtl_bc = getenv("CGIR_DEVICE_RTL_BC"); rtl_bc && rtl_bc[0])
+    /* Resolve the device-runtime externs the kernel references (e.g. __kmpc_*) by
+     * linking a runtime bitcode before codegen, so ptxas can JIT the PTX at
+     * cuModuleLoadData. The path is the producer-supplied `runtime_bc` (see the
+     * prog source), overridable for debugging by the CGIR_DEVICE_RTL_BC env var.
+     * Inert when neither is set. */
+    const char * rtl_bc = getenv("CGIR_DEVICE_RTL_BC");
+    if (!rtl_bc || !rtl_bc[0])
+        rtl_bc = runtime_bc;
+    if (rtl_bc && rtl_bc[0])
     {
         if (!link_device_runtime(M, rtl_bc, err))
             return {};
@@ -1974,7 +1980,8 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
     {
         std::string perr;
         std::string ptx = emit_device_ptx(*mod, dtriple,
-                                           prog->source.content.llvmir.arch, perr);
+                                           prog->source.content.llvmir.arch,
+                                           prog->source.content.llvmir.runtime_bc, perr);
         if (ptx.empty())
         {
             fprintf(stderr, "jit(device): PTX emission failed: %s\n", perr.c_str());
