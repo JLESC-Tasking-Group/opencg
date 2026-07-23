@@ -1821,6 +1821,48 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
 }
 
 # if CGIR_SUPPORT_LLVM
+/* Link the OpenMP device runtime (DeviceRTL) bitcode at `bc_path` into `M` so the
+ * device-runtime externs the kernel references (e.g. __kmpc_target_init) become
+ * defined. Without this the CUDA driver cannot JIT the emitted PTX -- ptxas fails
+ * on the unresolved externs (CUDA_ERROR_INVALID_PTX / 218). Only the referenced
+ * symbols and their transitive dependencies are imported (LinkOnlyNeeded), so the
+ * rest of the (large) runtime is not pulled in. Returns false + sets `err`. */
+static bool
+link_device_runtime(llvm::Module & M, const char * bc_path, std::string & err)
+{
+    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buf =
+        llvm::MemoryBuffer::getFile(bc_path);
+    if (!buf)
+    {
+        err = "cannot read CGIR_DEVICE_RTL_BC '" + std::string(bc_path) + "': " +
+              buf.getError().message();
+        return false;
+    }
+
+    llvm::SMDiagnostic diag;
+    std::unique_ptr<llvm::Module> rtl =
+        llvm::parseIR((*buf)->getMemBufferRef(), diag, M.getContext());
+    if (!rtl)
+    {
+        err = "parse DeviceRTL bitcode '" + std::string(bc_path) + "' failed: " +
+              diag.getMessage().str();
+        return false;
+    }
+
+    /* Align triple/DataLayout with the destination so the linker does not refuse
+     * on a mismatch (the RTL is already nvptx64, same as M). */
+    rtl->setTargetTriple(M.getTargetTriple());
+    rtl->setDataLayout(M.getDataLayout());
+
+    llvm::Linker linker(M);
+    if (linker.linkInModule(std::move(rtl), llvm::Linker::Flags::LinkOnlyNeeded))
+    {
+        err = "linking DeviceRTL bitcode '" + std::string(bc_path) + "' failed";
+        return false;
+    }
+    return true;
+}
+
 /* Emit PTX for a device (GPU) module: build a device TargetMachine for `triple`
  * (e.g. "nvptx64-nvidia-cuda") + `arch` (target-cpu, e.g. "sm_80"), stamp the
  * module's triple/DataLayout, and run codegen to a PTX assembly string. Returns
@@ -1842,6 +1884,15 @@ emit_device_ptx(llvm::Module & M, const char * triple, const char * arch, std::s
 
     M.setTargetTriple(TT);
     M.setDataLayout(TM->createDataLayout());
+
+    /* Resolve the OpenMP device-runtime externs (__kmpc_*) the kernel references by
+     * linking the DeviceRTL bitcode (path from CGIR_DEVICE_RTL_BC) before codegen,
+     * so ptxas can JIT the PTX at cuModuleLoadData. Inert when the env var is unset. */
+    if (const char * rtl_bc = getenv("CGIR_DEVICE_RTL_BC"); rtl_bc && rtl_bc[0])
+    {
+        if (!link_device_runtime(M, rtl_bc, err))
+            return {};
+    }
 
     llvm::SmallString<0> out;
     llvm::raw_svector_ostream os(out);
