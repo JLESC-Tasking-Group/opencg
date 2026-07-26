@@ -56,6 +56,12 @@ using node_t = command_graph_t::node_iterator_t<pls_t>;
 
 # define NODE_IS_ATOMIC(N) (N->type == COMMAND_GRAPH_NODE_TYPE_EMPTY || (N->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && N->command && (N->command->type != COMMAND_TYPE_BATCH || N->command->batch.cg == NULL)))
 
+/* A node is "sequence-able" (may belong to an OpenMP-task sequence) if it is a
+ * control node, or a PROG command whose launch mode is TASK_SPAWN (a recorded
+ * OpenMP task body). Copies, non-TASK_SPAWN progs and (nested) batches are not:
+ * a batch containing any of them is not a plain sequence of tasks. */
+# define NODE_IS_SEQABLE(N) (N->type == COMMAND_GRAPH_NODE_TYPE_EMPTY || (N->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && N->command && N->command->type == COMMAND_TYPE_PROG && N->command->prog.launch_mode == CGIR_COMMAND_PROG_LAUNCH_MODE_TASK_SPAWN))
+
 /**
  *  Init a batch command
  */
@@ -353,18 +359,36 @@ command_graph_pass_batch_contract(
      *          (b.2) v is not atomic           -> merge the two graph 'u' and 'v'
      */
 
+    /* a false-twin contraction produces a parallel shape, never a sequence */
+    constexpr bool hint_is_sequence = (hint & COMMAND_GRAPH_CONTRACTION_HINT_U_V_SEQUENCE) || (hint & COMMAND_GRAPH_CONTRACTION_HINT_V_U_SEQUENCE);
+
     if (NODE_IS_ATOMIC(u))
     {
         // (a)
         assert(NODE_IS_ATOMIC(v));
+
+        /* capture seqability of both leaves before 'init' overwrites u->command */
+        const bool su = NODE_IS_SEQABLE(u);
+        const bool sv = NODE_IS_SEQABLE(v);
+
         command_batch_init<hint>(cg, u, v);
+
+        u->command->batch.is_sequence = hint_is_sequence && su && sv;
     }
     else
     {
         if (NODE_IS_ATOMIC(v))
+        {
+            const bool sv = NODE_IS_SEQABLE(v);
             command_graph_pass_batch_contract_batch_single_node<hint>(u->command->batch.cg, v);
+            u->command->batch.is_sequence = u->command->batch.is_sequence && hint_is_sequence && sv;
+        }
         else
+        {
+            const bool v_is_sequence = v->command->batch.is_sequence;
             command_graph_pass_batch_contract_batch_merge<hint>(u, v);
+            u->command->batch.is_sequence = u->command->batch.is_sequence && v_is_sequence && hint_is_sequence;
+        }
     }
 
     return u;
