@@ -373,7 +373,7 @@ command_graph_pass_batch_contract(
 
         command_batch_init<hint>(cg, u, v);
 
-        u->command->batch.is_sequence = hint_is_sequence && su && sv;
+        u->command->batch.cg->is_sequence = hint_is_sequence && su && sv;
     }
     else
     {
@@ -381,13 +381,13 @@ command_graph_pass_batch_contract(
         {
             const bool sv = NODE_IS_SEQABLE(v);
             command_graph_pass_batch_contract_batch_single_node<hint>(u->command->batch.cg, v);
-            u->command->batch.is_sequence = u->command->batch.is_sequence && hint_is_sequence && sv;
+            u->command->batch.cg->is_sequence = u->command->batch.cg->is_sequence && hint_is_sequence && sv;
         }
         else
         {
-            const bool v_is_sequence = v->command->batch.is_sequence;
+            const bool v_is_sequence = v->command->batch.cg->is_sequence;
             command_graph_pass_batch_contract_batch_merge<hint>(u, v);
-            u->command->batch.is_sequence = u->command->batch.is_sequence && v_is_sequence && hint_is_sequence;
+            u->command->batch.cg->is_sequence = u->command->batch.cg->is_sequence && v_is_sequence && hint_is_sequence;
         }
     }
 

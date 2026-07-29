@@ -322,6 +322,13 @@ struct command_graph_t
     /* dfs id */
     command_graph_walk_id_t walk_id;
 
+    /* true iff this graph is a linear chain (A -> B -> ... -> Z) of PROG
+     * commands whose launch mode is TASK_SPAWN (i.e. a sequence of OpenMP
+     * tasks). Set by the batch pass on a batch's sub-graph; lets the runtime
+     * replay the whole graph as a single "super" task instead of one task per
+     * command. */
+    bool is_sequence = false;
+
     /** Methods to allocate command, nodes and graphs */
     command_constructor_t command_new;
 
@@ -348,6 +355,7 @@ struct command_graph_t
         assert(this->exit);
         this->entry->precedes(this->exit);
         this->walk_id = 0;
+        this->is_sequence = false;
     }
 
     /* coherence checks */

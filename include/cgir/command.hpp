@@ -229,17 +229,12 @@ struct command_graph_t;
  * opaque executable (e.g. CUgraphExec on CUDA) */
 struct command_batch_t
 {
-    /* the command graph of that batch */
+    /* the command graph of that batch (its `is_sequence` flag marks a linear
+     * chain of TASK_SPAWN PROG commands, see command_graph_t) */
     command_graph_t * cg;
 
     /* driver specific handle */
     void * driver_handle;
-
-    /* true iff the batch's sub-graph is a linear chain (A -> B -> ... -> Z) of
-     * PROG commands whose launch mode is TASK_SPAWN (i.e. a sequence of OpenMP
-     * tasks). When set, the runtime may replay the whole batch as a single
-     * "super" task instead of one task per command. Set by the batch pass. */
-    bool is_sequence;
 };
 
 struct command_graph_node_t;
@@ -333,15 +328,6 @@ struct command_t
              * even when a producer leaves them unset. */
             prog.grid.x  = prog.grid.y  = prog.grid.z  = 0;
             prog.block.x = prog.block.y = prog.block.z = 0;
-        }
-        /* A batch defaults to an unset sub-graph and is not a sequence until the
-         * batch pass builds it and decides otherwise. Keeps the flag defined for
-         * every batch command however it is constructed. */
-        else if (type == COMMAND_TYPE_BATCH)
-        {
-            batch.cg            = nullptr;
-            batch.driver_handle = nullptr;
-            batch.is_sequence   = false;
         }
     }
 };
