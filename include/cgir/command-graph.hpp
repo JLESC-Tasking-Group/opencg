@@ -172,11 +172,12 @@ struct command_graph_node_t
         const device_unique_id_t device_unique_id,
         const command_graph_node_type_t type
     ) :
-        type(type),
         device_unique_id(device_unique_id),
         predecessors(),
         successors(),
-        walk_id(0)
+        iterator_index(0),
+        walk_id(0),
+        type(type)
     {}
 
     command_graph_node_t(
