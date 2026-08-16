@@ -60,6 +60,11 @@ CGIR_NAMESPACE_USE;
  * successor has a single predecessor, both same-device and sequence-able) until
  * the chain ends, marking every member `contracted` so the outer scan skips the
  * chain's interior.
+ *
+ * Materialization is in place: the chain's external boundary is moved onto a
+ * fresh top-level BATCH node, and the chain's head/tail are reused as the sub
+ * command-graph's entry/exit (no extra empty control nodes), keeping the
+ * internal chain edges as-is.
  */
 
 /* per-node pass storage */

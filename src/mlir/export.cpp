@@ -163,8 +163,9 @@ build_batch_node(command_graph_t * cg, BatchOp batch)
 {
     const uint8_t duid = get_duid(batch.getOperation());
 
-    /* allocate + (callback-)initialize the sub command graph (entry/exit set) */
-    command_graph_t * sub = cg->command_graph_new(cg);
+    /* allocate + (callback-)initialize the sub command graph (fresh empty
+     * entry/exit allocated when both are null) */
+    command_graph_t * sub = cg->command_graph_new(cg, nullptr, nullptr);
     assert(sub);
     command_graph_node_t * sub_entry = sub->node_get_entry();
     command_graph_node_t * sub_exit  = sub->node_get_exit();
