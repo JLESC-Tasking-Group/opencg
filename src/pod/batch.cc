@@ -34,15 +34,15 @@
 ** knowledge of the CeCILL-C license and that you accept its terms.
 **/
 
-# include <cgir/bitset2d.hpp>
 # include <cgir/namespace.hpp>
 # include <cgir/command.hpp>
 # include <cgir/command-graph.hpp>
 
 # include <algorithm>
+# include <map>
 # include <set>
+# include <tuple>
 # include <unordered_map>
-# include <utility>
 # include <vector>
 
 # include <assert.h>
@@ -50,34 +50,26 @@
 CGIR_NAMESPACE_USE;
 
 /*
- * BATCH PASS - group "islands" of same-device nodes into COMMAND_TYPE_BATCH
- * sub-graphs, so a driver can capture each island as a single vendor graph
- * (CUDA/HIP graph, Level-Zero command list, ...).
+ * BATCH PASS - group same-device "islands" into COMMAND_TYPE_BATCH sub-graphs so
+ * a driver can capture each island as a single vendor graph (CUDA/HIP graph,
+ * Level-Zero command list, ...).
  *
- * An island is a MAXIMAL, CONVEX set of same-device nodes. Convexity is what
- * makes an island executable as one atomic sub-graph: no node outside the
- * island lies on a path between two of its members (otherwise that external
- * node would have to run "in the middle" of the batch -> deadlock). Islands are
- * grown by contracting, on a scratch quotient graph, two kinds of same-device
- * relations:
- *
- *   - safe edge  u -> v : the direct edge is the ONLY u..v path (no alternate
- *                         path through another successor). Contracting it never
- *                         creates a cycle nor traps an external node, so the
- *                         result stays a convex DAG. This generalizes a plain
- *                         sequence (single-succ u / single-pred v) to any
- *                         non-bypassed edge, and subsumes v->u (every directed
- *                         edge is examined from its tail).
- *   - false twins u,v   : identical predecessor and successor sets (parallel,
- *                         unconnected) -> merging them is convex.
- *
- * Detection runs on scratch adjacency (Phase 1, no graph mutation); only then
- * is each island with >= 2 real COMMAND members materialized (Phase 2) into a
- * fresh top-level BATCH node whose sub-graph is the island's induced sub-graph.
+ * A command graph is just a DAG whose nodes carry a device id. An island is a
+ * connected region of same-device nodes: it is found by a flood-fill
+ * (union-find) that unites same-device nodes joined by an edge, then folds in
+ * same-device false twins (identical neighborhood, e.g. two independent ops with
+ * the same dependencies). Each island with >= 2 COMMAND nodes is materialized
+ * IN PLACE into a fresh BATCH node whose sub-graph reuses the very same node
+ * objects and their internal edges; only the island boundary is rewired.
  */
 
-/* pass local storage (unused per-node data; islands are tracked out-of-band) */
-struct pls_t {};
+/* per-node pass storage (the device stays on the node: node->device_unique_id) */
+struct pls_t
+{
+    bool                   cand;    /* batching candidate (not entry/exit, not an opaque batch/graph node) */
+    int                    parent;  /* union-find parent index (island detection) */
+    command_graph_node_t * rep;     /* representative top-level node after batching */
+};
 using node_t = command_graph_t::node_iterator_t<pls_t>;
 
 /* A node is "sequence-able" (may belong to an OpenMP-task sequence) if it is a
@@ -92,209 +84,131 @@ using node_t = command_graph_t::node_iterator_t<pls_t>;
 void
 command_graph_t::pass_batch(void)
 {
-    /* Index every top-level node (entry/exit included) so the scratch graph can
-     * reason about the true neighborhood, including whether two nodes share the
-     * entry/exit as their sole predecessor/successor (i.e. are false twins). The
-     * scratch index of a node is its iterator_index in [0, n). */
+    /* Index every top-level node; node->iterator_index is its index in [0, n). */
     constexpr bool include_entry_exit = true;
     std::vector<node_t> nodes = this->create_node_iterators<pls_t, include_entry_exit>();
     const int n = (int) nodes.size();
-    if (n == 0)
+    if (n <= 2)   /* only entry/exit: nothing to batch */
         return ;
 
     command_graph_node_t * g_entry = this->node_get_entry();
     command_graph_node_t * g_exit  = this->node_get_exit();
 
-    std::unordered_map<command_graph_node_t *, int> node2idx;
-    node2idx.reserve((size_t) n * 2);
-    for (int i = 0 ; i < n ; ++i)
-        node2idx[nodes[i].node] = i;
-
-    /* scratch quotient graph */
-    std::vector<device_unique_id_t>                   dev(n);
-    std::vector<char>                                 alive(n, 1);
-    std::vector<char>                                 cand(n, 0);
-    std::vector<std::set<int>>                        preds(n), succs(n);
-    std::vector<std::vector<command_graph_node_t *>>  members(n);
-
+    /* initialize per-node storage: candidate flag (entry/exit and pre-existing
+     * batches / nested graphs are opaque boundaries, never grouped), union-find
+     * parent (self), and post-batch representative (self). */
     for (int i = 0 ; i < n ; ++i)
     {
         command_graph_node_t * u = nodes[i].node;
-        dev[i] = u->device_unique_id;
-        members[i].push_back(u);
-
-        /* candidates: everything but entry/exit and pre-existing batches /
-         * nested command-graphs (treated as opaque boundaries). */
-        const bool is_boundary =
+        const bool boundary =
             (u == g_entry) || (u == g_exit) ||
             (u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND_GRAPH) ||
             (u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && u->command &&
              u->command->type == COMMAND_TYPE_BATCH);
-        cand[i] = !is_boundary;
+        nodes[i].data.cand   = !boundary;
+        nodes[i].data.parent = i;
+        nodes[i].data.rep    = u;
     }
 
-    /* scratch adjacency (deduplicated via std::set) */
-    for (int i = 0 ; i < n ; ++i)
-        for (command_graph_node_t * s : nodes[i].node->successors)
-        {
-            auto it = node2idx.find(s);
-            assert(it != node2idx.end()); /* every top-level node is indexed */
-            succs[i].insert(it->second);
-            preds[it->second].insert(i);
-        }
-
     /* -------------------------------------------------------------------- *
-     * Phase 1 : grow islands to a fixpoint on the scratch graph.           *
+     * Detect islands: union-find flood-fill.                               *
      * -------------------------------------------------------------------- */
 
-    auto can_batch = [&] (int a, int b) {
-        return a != b && alive[a] && alive[b] && cand[a] && cand[b] && dev[a] == dev[b];
-    };
-
-    auto false_twins = [&] (int a, int b) {
-        return preds[a] == preds[b] && succs[a] == succs[b];
-    };
-
-    /* reachability over the current scratch graph: reach.test(i,j) == "j is
-     * reachable from i (inclusive of i)". Recomputed after each contraction so
-     * the convexity test below is always exact on the quotient graph. */
-    bitset2d_t<uint64_t, int> reach(n);
-    std::vector<int> stack;
-    auto compute_reach = [&] (void) {
-        reach.reset_all();
-        for (int i = 0 ; i < n ; ++i)
+    auto find = [&] (int x) {
+        while (nodes[x].data.parent != x)
         {
-            if (!alive[i])
-                continue ;
-            reach.set(i, i);
-            stack.clear();
-            stack.push_back(i);
-            while (!stack.empty())
-            {
-                const int x = stack.back();
-                stack.pop_back();
-                for (int y : succs[x])
-                    if (!reach.test(i, y))
-                    {
-                        reach.set(i, y);
-                        stack.push_back(y);
-                    }
-            }
+            nodes[x].data.parent = nodes[nodes[x].data.parent].data.parent;
+            x = nodes[x].data.parent;
         }
+        return x;
+    };
+    auto unite = [&] (int a, int b) {
+        a = find(a); b = find(b);
+        if (a != b) nodes[a].data.parent = b;
     };
 
-    /* an edge u->v is convex-safe to contract iff it is the only u..v path,
-     * i.e. no OTHER successor w of u can still reach v. */
-    auto safe_edge = [&] (int u, int v) {
-        if (succs[u].find(v) == succs[u].end())
-            return false ;
-        for (int w : succs[u])
+    /* 1. flood-fill along same-device edges */
+    for (int i = 0 ; i < n ; ++i)
+    {
+        if (!nodes[i].data.cand)
+            continue ;
+        const device_unique_id_t di = nodes[i].node->device_unique_id;
+        for (command_graph_node_t * s : nodes[i].node->successors)
         {
-            if (w == v)
-                continue ;
-            if (reach.test(w, v))
-                return false ;
+            const int j = (int) s->iterator_index;
+            if (nodes[j].data.cand && di == s->device_unique_id)
+                unite(i, j);
         }
-        return true ;
-    };
+    }
 
-    /* absorb island 'b' into island 'a' */
-    auto merge = [&] (int a, int b) {
-        for (int x : preds[b])
-        {
-            if (x == a)
-                continue ;
-            succs[x].erase(b);
-            succs[x].insert(a);
-            preds[a].insert(x);
-        }
-        for (int y : succs[b])
-        {
-            if (y == a)
-                continue ;
-            preds[y].erase(b);
-            preds[y].insert(a);
-            succs[a].insert(y);
-        }
-        /* drop the (now self-) edges between a and b */
-        preds[a].erase(b);
-        succs[a].erase(b);
-        preds[a].erase(a);
-        succs[a].erase(a);
-
-        for (command_graph_node_t * m : members[b])
-            members[a].push_back(m);
-
-        alive[b] = 0;
-        preds[b].clear();
-        succs[b].clear();
-        members[b].clear();
-    };
-
+    /* 2. fold same-device false twins: two islands with the same device and the
+     * same set of neighbor-islands (predecessors and successors) are twins. This
+     * is re-evaluated on the quotient until stable (so twins that only appear
+     * after an edge-merge, e.g. a sibling of a merged chain, are caught too). */
     bool changed = true;
     while (changed)
     {
         changed = false;
-        compute_reach();
 
-        for (int a = 0 ; a < n && !changed ; ++a)
+        std::unordered_map<int, std::set<int>> rpred, rsucc;
+        for (int i = 0 ; i < n ; ++i)
         {
-            if (!alive[a] || !cand[a])
-                continue ;
-
-            /* 1. false twins (share a predecessor -> compare full neighborhood) */
-            for (int p : preds[a])
+            const int ri = find(i);
+            for (command_graph_node_t * s : nodes[i].node->successors)
             {
-                for (int b : succs[p])
-                    if (can_batch(a, b) && false_twins(a, b))
-                    {
-                        merge(a, b);
-                        changed = true;
-                        break ;
-                    }
-                if (changed)
-                    break ;
-            }
-            if (changed)
-                break ;
-
-            /* 2. convex-safe edges a->b (covers sequences and, over all a, v->u) */
-            for (int b : succs[a])
-                if (can_batch(a, b) && safe_edge(a, b))
+                const int rj = find((int) s->iterator_index);
+                if (ri != rj)
                 {
-                    merge(a, b);
-                    changed = true;
-                    break ;
+                    rsucc[ri].insert(rj);
+                    rpred[rj].insert(ri);
                 }
+            }
+        }
+
+        std::map<std::tuple<device_unique_id_t, std::set<int>, std::set<int>>, int> seen;
+        for (int i = 0 ; i < n ; ++i)
+        {
+            if (!nodes[i].data.cand || find(i) != i)   /* candidate island roots only */
+                continue ;
+            auto key = std::make_tuple(nodes[i].node->device_unique_id, rpred[i], rsucc[i]);
+            auto it  = seen.find(key);
+            if (it == seen.end())
+                seen.emplace(std::move(key), i);
+            else
+            {
+                unite(i, it->second);
+                changed = true;
+            }
         }
     }
 
+    /* group members by island root (candidates only) */
+    std::unordered_map<int, std::vector<command_graph_node_t *>> island;
+    for (int i = 0 ; i < n ; ++i)
+        if (nodes[i].data.cand)
+            island[find(i)].push_back(nodes[i].node);
+
     /* -------------------------------------------------------------------- *
-     * Phase 2 : materialize each island with >= 2 COMMAND members.         *
+     * Materialize each island with >= 2 COMMAND members.                   *
      * -------------------------------------------------------------------- */
 
-    /* island root of every node index (its surviving representative) */
-    std::vector<int> root(n, -1);
-    for (int a = 0 ; a < n ; ++a)
-        if (alive[a])
-            for (command_graph_node_t * m : members[a])
-                root[m->iterator_index] = a;
-
-    /* rep[i] : the top-level node that replaces node i after batching
-     * (itself for entry/exit/singletons, the new BATCH node for members). */
-    std::vector<command_graph_node_t *> rep(n);
-    for (int i = 0 ; i < n ; ++i)
-        rep[i] = nodes[i].node;
-
-    for (int a = 0 ; a < n ; ++a)
+    /* nodes[i].data.rep already holds each node's post-batch representative
+     * (itself); materialization overwrites it with the BATCH node for members. */
+    struct island_mat_t
     {
-        if (!alive[a] || !cand[a])
-            continue ;
+        command_graph_t *      sub;
+        command_graph_node_t * s_entry;
+        command_graph_node_t * s_exit;
+    };
+    std::unordered_map<int, island_mat_t> mat;
 
-        /* count real commands and pick a real (non-255) device */
-        int ncmd = 0;
-        device_unique_id_t gdev = dev[a];
-        for (command_graph_node_t * m : members[a])
+    for (auto & kv : island)
+    {
+        std::vector<command_graph_node_t *> & members = kv.second;
+
+        int                ncmd = 0;
+        device_unique_id_t gdev = nodes[kv.first].node->device_unique_id;
+        for (command_graph_node_t * m : members)
             if (m->type == COMMAND_GRAPH_NODE_TYPE_COMMAND)
             {
                 if (ncmd == 0)
@@ -304,104 +218,82 @@ command_graph_t::pass_batch(void)
         if (ncmd < 2)
             continue ;
 
-        /* new BATCH command + its (initialized) sub command-graph */
-        assert(this->command_new);
+        /* fresh BATCH command + its (initialized) sub command-graph */
+        assert(this->command_new && this->command_graph_new && this->command_graph_node_new);
         command_t * cmd = this->command_new(this, COMMAND_TYPE_BATCH);
         assert(cmd);
         cmd->batch.driver_handle = NULL;
 
-        assert(this->command_graph_new);
         command_graph_t * sub = this->command_graph_new(this);
         assert(sub);
         cmd->batch.cg = sub;
 
         command_graph_node_t * s_entry = sub->node_get_entry();
         command_graph_node_t * s_exit  = sub->node_get_exit();
-        assert(s_entry && s_exit);
         s_entry->successors.clear();     /* drop the default entry->exit edge */
         s_exit->predecessors.clear();
 
-        /* clone every member into the sub-graph */
-        std::unordered_map<command_graph_node_t *, command_graph_node_t *> map;
-        map.reserve(members[a].size() * 2);
-        for (command_graph_node_t * m : members[a])
-        {
-            assert(sub->command_graph_node_new);
-            command_graph_node_t * mm = sub->command_graph_node_new(sub, m->device_unique_id, m->type);
-            assert(mm);
-            if (m->type == COMMAND_GRAPH_NODE_TYPE_COMMAND)
-                mm->command = m->command;
-            map[m] = mm;
-        }
-
-        /* rebuild the induced sub-graph, wire the boundary to entry/exit, and
-         * decide is_sequence (a linear chain of seqable nodes). */
-        bool seq     = true;
-        int  sources = 0;
-        int  sinks   = 0;
-        for (command_graph_node_t * m : members[a])
-        {
-            int iin  = 0;
-            int iout = 0;
-
-            for (command_graph_node_t * s : m->successors)
-            {
-                auto it = node2idx.find(s);
-                if (it != node2idx.end() && root[it->second] == a)
-                {
-                    map[m]->precedes(map[s]);   /* internal edge (added once, from its tail) */
-                    ++iout;
-                }
-            }
-            for (command_graph_node_t * p : m->predecessors)
-            {
-                auto it = node2idx.find(p);
-                if (it != node2idx.end() && root[it->second] == a)
-                    ++iin;
-            }
-
-            if (iin == 0)  { s_entry->precedes(map[m]); ++sources; }
-            if (iout == 0) { map[m]->precedes(s_exit);  ++sinks;   }
-            if (iin > 1 || iout > 1)
-                seq = false;
-            if (!NODE_IS_SEQABLE(m))
-                seq = false;
-        }
-        sub->is_sequence = seq && (sources == 1) && (sinks == 1);
-
-        /* fresh top-level BATCH node; every member now maps to it */
-        assert(this->command_graph_node_new);
+        /* fresh top-level BATCH node; every member maps to it */
         command_graph_node_t * B = this->command_graph_node_new(this, gdev, COMMAND_GRAPH_NODE_TYPE_COMMAND);
         assert(B);
         B->command = cmd;
-        for (command_graph_node_t * m : members[a])
-            rep[m->iterator_index] = B;
+        for (command_graph_node_t * m : members)
+            nodes[m->iterator_index].data.rep = B;
+
+        mat[kv.first] = island_mat_t{ sub, s_entry, s_exit };
     }
 
-    /* -------------------------------------------------------------------- *
-     * Rewire the top level: map every original edge through rep(), dropping *
-     * island-internal edges and deduplicating. Cross-island edges become   *
-     * B_i -> B_j automatically; member nodes end up detached (orphaned).    *
-     * -------------------------------------------------------------------- */
+    /* Rewire boundaries only: every original edge whose endpoints map to
+     * different representatives is moved onto the batch node(s); internal edges
+     * (both endpoints in the same island) are left physically untouched. */
     std::vector<std::pair<command_graph_node_t *, command_graph_node_t *>> edges;
     for (int i = 0 ; i < n ; ++i)
         for (command_graph_node_t * s : nodes[i].node->successors)
             edges.emplace_back(nodes[i].node, s);
 
-    for (int i = 0 ; i < n ; ++i)
-    {
-        nodes[i].node->successors.clear();
-        nodes[i].node->predecessors.clear();
-    }
-
     for (auto & e : edges)
     {
-        command_graph_node_t * a2 = rep[e.first->iterator_index];
-        command_graph_node_t * b2 = rep[e.second->iterator_index];
-        if (a2 == b2)
-            continue ;   /* island-internal edge */
-        if (std::find(a2->successors.begin(), a2->successors.end(), b2) == a2->successors.end())
-            a2->precedes(b2);
+        command_graph_node_t * u  = e.first;
+        command_graph_node_t * v  = e.second;
+        command_graph_node_t * ru = nodes[u->iterator_index].data.rep;
+        command_graph_node_t * rv = nodes[v->iterator_index].data.rep;
+
+        if (ru == rv)
+            continue ;              /* internal to one island: keep as-is */
+        if (ru == u && rv == v)
+            continue ;              /* neither endpoint batched: keep as-is */
+
+        /* boundary edge: detach the original, add the mapped one (deduplicated) */
+        u->successors.erase(std::find(u->successors.begin(), u->successors.end(), v));
+        v->predecessors.erase(std::find(v->predecessors.begin(), v->predecessors.end(), u));
+        if (std::find(ru->successors.begin(), ru->successors.end(), rv) == ru->successors.end())
+            ru->precedes(rv);
+    }
+
+    /* Connect each sub-graph's entry/exit to the island's sources/sinks. After
+     * boundary removal a member's remaining edges are all internal, so a source
+     * has no predecessor and a sink no successor. */
+    for (auto & kv : mat)
+    {
+        island_mat_t & M       = kv.second;
+        auto &         members = island[kv.first];
+
+        bool seq     = true;
+        int  sources = 0;
+        int  sinks   = 0;
+        for (command_graph_node_t * m : members)
+        {
+            const size_t iin  = m->predecessors.size();
+            const size_t iout = m->successors.size();
+
+            if (iin == 0)  { M.s_entry->precedes(m); ++sources; }
+            if (iout == 0) { m->precedes(M.s_exit);  ++sinks;   }
+            if (iin > 1 || iout > 1)
+                seq = false;
+            if (!NODE_IS_SEQABLE(m))
+                seq = false;
+        }
+        M.sub->is_sequence = seq && (sources == 1) && (sinks == 1);
     }
 
 # ifndef NDEBUG

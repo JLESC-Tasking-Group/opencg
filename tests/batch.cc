@@ -271,11 +271,10 @@ test_batch_mixed(void)
 }
 
 /*
- *  Convex island: a branchy, same-device DAG that is neither a plain sequence
- *  nor a set of false twins, but whose whole body is one maximal convex region
- *  on a single device (entry/exit are the only other nodes and, being the unique
- *  source/sink, never lie between two members). The pass must collapse ALL 12
- *  commands into a single BATCH.
+ *  Island (flood-fill): a branchy, same-device DAG that is neither a plain
+ *  sequence nor a set of false twins. Every c* node is edge-connected to the
+ *  rest on the same device, so the flood-fill puts them all in one island and
+ *  the pass must collapse ALL 12 commands into a single BATCH.
  *
  *  Topology (all c* on batch_device):
  *      entry -> c1, c7, c13
@@ -284,7 +283,7 @@ test_batch_mixed(void)
  *      c10 -> c11 ; c11 -> c2 ; c12 -> c6 ; c13 -> c8
  */
 static int
-test_batch_convex_island(void)
+test_batch_island(void)
 {
     command_graph_node_t * entry;
     command_graph_node_t * exit;
@@ -323,11 +322,11 @@ test_batch_convex_island(void)
     c12->precedes(c6);
     c13->precedes(c8);
 
-    cg->dump("cg-pre-batch-convex-island.dot");
+    cg->dump("cg-pre-batch-island.dot");
     cg->optimize(COMMAND_GRAPH_PASS_BATCH);
-    cg->dump("cg-post-batch-convex-island.dot");
+    cg->dump("cg-post-batch-island.dot");
 
-    return check_batch(cg, "convex-island", 12);
+    return check_batch(cg, "island", 12);
 }
 
 int
@@ -337,6 +336,6 @@ main(void)
     rc |= test_batch_sequence();
     rc |= test_batch_false_twins();
     rc |= test_batch_mixed();
-    rc |= test_batch_convex_island();
+    rc |= test_batch_island();
     return rc;
 }

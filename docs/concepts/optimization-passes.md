@@ -31,23 +31,19 @@ This heuristic ensures that removing the node (and connecting all predecessors t
 ### Batching (batch)
 
 Groups **islands** of same-device nodes into `COMMAND_TYPE_BATCH` nodes. An island
-is a *maximal, convex* set of nodes on one device: convex meaning no node outside the
-island lies on a path between two members, so the island can be replayed as one
-atomic sub-graph without deadlock.
+is a connected region of nodes on one device, found by a **flood-fill**
+(union-find):
+- **Edges**: two same-device nodes joined by an edge are in the same island.
+- **False twins**: two same-device islands with the same neighborhood (identical
+  predecessor and successor islands) are folded together — this catches
+  independent same-device ops that share their dependencies.
 
-Islands are grown to a fixpoint on a scratch quotient graph by contracting two
-same-device relations:
-- **Convex-safe edge** `u -> v`: the direct edge is the only `u..v` path (no
-  alternate path through another successor). Contracting it never creates a cycle
-  nor traps an external node. This generalizes a plain sequential pair (single
-  successor `u` / single predecessor `v`) to any non-bypassed edge.
-- **False twins**: identical predecessor and successor sets (parallel, unconnected).
-
-Each island with at least two `COMMAND` members is materialized into a single fresh
-top-level BATCH node whose `cgir::command_batch_t` sub-graph is the island's induced
-sub-graph (internal branches and twins preserved; a single entry/exit added). External
-edges are rewired to/from the batch node and deduplicated; cross-island edges become
-batch-to-batch edges. The sub-graph's `is_sequence` flag is set when the island is a
+Each island with at least two `COMMAND` members is materialized **in place** into a
+single fresh top-level BATCH node whose `cgir::command_batch_t` sub-graph reuses the
+very same node objects and their internal edges. Only the island boundary is rewired:
+external edges are moved to/from the batch node (deduplicated; cross-island edges
+become batch-to-batch edges), and the sub-graph's entry/exit are connected to the
+island's sources/sinks. The sub-graph's `is_sequence` flag is set when the island is a
 linear chain of task-spawn programs.
 
 This enables mapping to vendor-specific batching mechanisms (e.g. CUDA Graphs, HIP Graphs, Level Zero command lists).
