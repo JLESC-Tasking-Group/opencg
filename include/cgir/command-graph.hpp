@@ -245,28 +245,52 @@ struct command_graph_node_t
     inline void
     walk(std::function<void(command_graph_node_t * node)> f)
     {
-        // BFS not supported
-        static_assert(search == COMMAND_GRAPH_WALK_SEARCH_DFS);
-
-        std::function<void(command_graph_node_t *)> reach = [&] (command_graph_node_t * node)
+        if (search == COMMAND_GRAPH_WALK_SEARCH_DFS)
         {
-            assert(node->walk_id == this->walk_id);
-
-            if constexpr(order == COMMAND_GRAPH_WALK_ORDER_PRE)
-                f(node);
-
-            for (command_graph_node_t * succ : node->successors)
+            std::function<void(command_graph_node_t *)> reach = [&] (command_graph_node_t * node)
             {
-                if (succ->walk_id == this->walk_id)
-                    continue ;
-                succ->walk_id = this->walk_id;
-                reach(succ);
-            }
+                assert(node->walk_id == this->walk_id);
 
-            if constexpr(order == COMMAND_GRAPH_WALK_ORDER_POST)
+                if constexpr(order == COMMAND_GRAPH_WALK_ORDER_PRE)
+                    f(node);
+
+                for (command_graph_node_t * succ : node->successors)
+                {
+                    if (succ->walk_id == this->walk_id)
+                        continue ;
+                    succ->walk_id = this->walk_id;
+                    reach(succ);
+                }
+
+                if constexpr(order == COMMAND_GRAPH_WALK_ORDER_POST)
+                    f(node);
+            };
+            reach(this);
+        }
+        else
+        {
+            static_assert(search == COMMAND_GRAPH_WALK_SEARCH_DFS);
+            static_assert(order  == COMMAND_GRAPH_WALK_ORDER_PRE);
+
+            std::queue<command_graph_node_t *> q;
+            q.push(this);
+
+            while (!q.empty())
+            {
+                command_graph_node_t * node = q.front();
+                q.pop();
+
+                assert(node->walk_id == this->walk_id);
                 f(node);
-        };
-        reach(this);
+
+                for (command_graph_node_t * succ : node->successors)
+                {
+                    if (succ->walk_id == this->walk_id)
+                        continue ;
+                    q.push(succ);
+                }
+            }
+        }
     }
 };
 
