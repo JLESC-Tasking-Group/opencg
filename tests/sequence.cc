@@ -99,6 +99,20 @@ count_nodes(command_graph_t * cg)
     return n;
 }
 
+/* Count the COMMAND nodes of `cg` (entry/exit included). A sequence sub-graph
+ * reuses the chain head/tail as entry/exit, so its commands are NOT all
+ * "interior" -- count by type instead of excluding entry/exit. */
+static size_t
+count_command_nodes(command_graph_t * cg)
+{
+    size_t n = 0;
+    cg->walk([&](command_graph_node_t * node) {
+        if (node->type == COMMAND_GRAPH_NODE_TYPE_COMMAND)
+            ++n;
+    });
+    return n;
+}
+
 /* Count the top-level BATCH nodes of `cg` (and, via `inner`, the size of the
  * unique one's is_sequence sub-graph when there is exactly one). */
 static size_t
@@ -164,7 +178,7 @@ test_sequence_chain(void)
                 batch->device_unique_id, task_device);
         return 1;
     }
-    size_t inner = count_nodes(batch->command->batch.cg);
+    size_t inner = count_command_nodes(batch->command->batch.cg);
     if (inner != 3)
     {
         fprintf(stderr, "FAIL [chain]: expected 3 commands in the sequence, got %zu\n", inner);
@@ -242,7 +256,7 @@ test_sequence_device_split(void)
     }
     if (batch->command->batch.cg == NULL ||
         !batch->command->batch.cg->is_sequence ||
-        count_nodes(batch->command->batch.cg) != 2)
+        count_command_nodes(batch->command->batch.cg) != 2)
     {
         fprintf(stderr, "FAIL [device-split]: batch is not an is_sequence of 2\n");
         return 1;

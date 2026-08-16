@@ -54,20 +54,22 @@ command_graph_node_new(
 }
 
 static command_graph_t *
-command_graph_new(command_graph_t * original_cg)
+command_graph_new(command_graph_t * original_cg, command_graph_node_t * entry, command_graph_node_t * exit)
 {
     command_graph_t * cg = new command_graph_t();
-    /* When invoked as the allocator callback for a *sub*-graph (e.g. a batch),
-     * initialize it so it has entry/exit nodes and allocator callbacks. The
-     * top-level graph is created with original_cg == NULL and is initialized
-     * explicitly by the caller via cg->init(...). */
+    /* When invoked as the allocator callback for a *sub*-graph (e.g. a batch or a
+     * sequence), initialize it so it has entry/exit nodes and allocator
+     * callbacks. If entry/exit are provided (e.g. a sequence's head/tail), reuse
+     * them; otherwise fresh EMPTY entry/exit are allocated. The top-level graph
+     * is created with original_cg == NULL and is initialized explicitly by the
+     * caller via cg->init(...). */
     if (original_cg)
-        cg->init(command_new, command_graph_node_new, command_graph_new);
+        cg->init(command_new, command_graph_node_new, command_graph_new, entry, exit);
     return cg;
 }
 
 static command_graph_t *
 command_graph_new(void)
 {
-    return command_graph_new(NULL);
+    return command_graph_new(NULL, nullptr, nullptr);
 }

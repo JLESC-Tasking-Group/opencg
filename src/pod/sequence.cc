@@ -81,18 +81,16 @@ using node_t = command_graph_t::node_iterator_t<pls_t>;
 /* Contract the chain [head .. tail] into the fresh BATCH node 'B' whose
  * sub-graph is 'sub'. The chain's internal edges are left untouched; only the
  * two boundaries move onto 'B', and the sub-graph entry/exit wrap head/tail. */
+/* Move the chain's external boundary onto the batch node 'B': the head's
+ * predecessors and the tail's successors (all external). Leaves the head with no
+ * predecessor and the tail with no successor, so they can be reused as the sub
+ * command-graph's entry/exit. The internal chain edges are untouched. */
 static inline void
-command_graph_pass_sequence_materialize(
-    command_graph_t *      sub,
+command_graph_pass_sequence_detach_boundary(
     command_graph_node_t * B,
     command_graph_node_t * head,
     command_graph_node_t * tail
 ) {
-    command_graph_node_t * s_entry = sub->node_get_entry();
-    command_graph_node_t * s_exit  = sub->node_get_exit();
-    s_entry->successors.clear();     /* drop the default entry->exit edge */
-    s_exit->predecessors.clear();
-
     /* head's predecessors (all external) now precede the batch node */
     for (command_graph_node_t * p : head->predecessors)
     {
@@ -105,7 +103,6 @@ command_graph_pass_sequence_materialize(
     }
     B->predecessors = std::move(head->predecessors);
     head->predecessors.clear();
-    s_entry->precedes(head);
 
     /* tail's successors (all external) now succeed the batch node */
     for (command_graph_node_t * s : tail->successors)
@@ -119,7 +116,6 @@ command_graph_pass_sequence_materialize(
     }
     B->successors = std::move(tail->successors);
     tail->successors.clear();
-    tail->precedes(s_exit);
 }
 
 void
@@ -176,24 +172,27 @@ command_graph_t::pass_sequence(void)
 
         if (ncmd < 2)
             continue ;
-
-        /* fresh BATCH command + its (initialized) is_sequence sub command-graph */
+        /* fresh BATCH command + batch node */
         assert(this->command_new && this->command_graph_new && this->command_graph_node_new);
         command_t * cmd = this->command_new(this, COMMAND_TYPE_BATCH);
         assert(cmd);
         cmd->batch.driver_handle = NULL;
-
-        command_graph_t * sub = this->command_graph_new(this);
-        assert(sub);
-        cmd->batch.cg    = sub;
-        sub->is_sequence = true;
 
         command_graph_node_t * B =
             this->command_graph_node_new(this, u->device_unique_id, COMMAND_GRAPH_NODE_TYPE_COMMAND);
         assert(B);
         B->command = cmd;
 
-        command_graph_pass_sequence_materialize(sub, B, u, tail);
+        /* move the chain's external boundary onto B, leaving the head (u) with no
+         * predecessor and the tail with no successor */
+        command_graph_pass_sequence_detach_boundary(B, u, tail);
+
+        /* the sub command-graph reuses the chain head/tail as entry/exit (no
+         * extra empty control nodes); the internal chain edges are kept as-is */
+        command_graph_t * sub = this->command_graph_new(this, u, tail);
+        assert(sub);
+        cmd->batch.cg    = sub;
+        sub->is_sequence = true;
     }
 
 # ifndef NDEBUG

@@ -297,7 +297,7 @@ struct command_graph_node_t
 /* Allocator types */
 typedef command_t *             (*command_constructor_t)           (command_graph_t * cg, const command_type_t type);
 typedef command_graph_node_t *  (*command_graph_node_constructor_t)(command_graph_t * cg, const device_unique_id_t device_unique_id, const command_graph_node_type_t type);
-typedef command_graph_t *       (*command_graph_constructor_t)     (command_graph_t * cg);
+typedef command_graph_t *       (*command_graph_constructor_t)     (command_graph_t * cg, command_graph_node_t * entry, command_graph_node_t * exit);
 
 /**
  *  Represent a graph of commands to execute.
@@ -327,22 +327,40 @@ struct command_graph_t
     /* Create a new command graph */
     command_graph_constructor_t command_graph_new;
 
-    /* allocate initial entry/exit nodes */
+    /* Initialize the graph and its entry/exit nodes.
+     *
+     * If 'entry' and 'exit' are both provided, they are used as-is as the graph's
+     * source/sink (no allocation, no entry->exit edge) -- e.g. the sequence pass
+     * reuses a chain's head/tail. Otherwise (both null) fresh EMPTY control nodes
+     * are allocated and linked, as usual. */
     inline void
     init(
         command_constructor_t command_new,
         command_graph_node_constructor_t command_graph_node_new,
-        command_graph_constructor_t command_graph_new
+        command_graph_constructor_t command_graph_new,
+        command_graph_node_t * entry = nullptr,
+        command_graph_node_t * exit  = nullptr
     ) {
         this->command_new = command_new;
         this->command_graph_node_new = command_graph_node_new;
         this->command_graph_new = command_graph_new;
 
-        this->entry = this->command_graph_node_new(this, CGIR_UNSPECIFIED_DEVICE_UNIQUE_ID, COMMAND_GRAPH_NODE_TYPE_EMPTY);
-        this->exit  = this->command_graph_node_new(this, CGIR_UNSPECIFIED_DEVICE_UNIQUE_ID, COMMAND_GRAPH_NODE_TYPE_EMPTY);
-        assert(this->entry);
-        assert(this->exit);
-        this->entry->precedes(this->exit);
+        assert((entry == nullptr) == (exit == nullptr)); /* both or neither */
+        if (entry)
+        {
+            assert(entry->predecessors.size() == 0);
+            assert(exit->successors.size()    == 0);
+            this->entry = entry;
+            this->exit  = exit;
+        }
+        else
+        {
+            this->entry = this->command_graph_node_new(this, CGIR_UNSPECIFIED_DEVICE_UNIQUE_ID, COMMAND_GRAPH_NODE_TYPE_EMPTY);
+            this->exit  = this->command_graph_node_new(this, CGIR_UNSPECIFIED_DEVICE_UNIQUE_ID, COMMAND_GRAPH_NODE_TYPE_EMPTY);
+            assert(this->entry);
+            assert(this->exit);
+            this->entry->precedes(this->exit);
+        }
         this->walk_id = 0;
         this->is_sequence = false;
     }
