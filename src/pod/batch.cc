@@ -220,7 +220,7 @@ command_graph_t::pass_batch(void)
         assert(cmd);
         cmd->batch.driver_handle = NULL;
 
-        command_graph_t * sub = this->command_graph_new(this);
+        command_graph_t * sub = this->command_graph_new(this, nullptr, nullptr);
         assert(sub);
         cmd->batch.cg = sub;
 
