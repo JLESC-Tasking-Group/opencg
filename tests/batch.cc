@@ -270,6 +270,66 @@ test_batch_mixed(void)
     return check_batch(cg, "mixed", 3);
 }
 
+/*
+ *  Convex island: a branchy, same-device DAG that is neither a plain sequence
+ *  nor a set of false twins, but whose whole body is one maximal convex region
+ *  on a single device (entry/exit are the only other nodes and, being the unique
+ *  source/sink, never lie between two members). The pass must collapse ALL 12
+ *  commands into a single BATCH.
+ *
+ *  Topology (all c* on batch_device):
+ *      entry -> c1, c7, c13
+ *      c1 -> c2 ; c2 -> c3 ; c3 -> c4, c6 ; c4 -> exit ; c6 -> exit
+ *      c7 -> c8 ; c8 -> c9 ; c9 -> c10, c12
+ *      c10 -> c11 ; c11 -> c2 ; c12 -> c6 ; c13 -> c8
+ */
+static int
+test_batch_convex_island(void)
+{
+    command_graph_node_t * entry;
+    command_graph_node_t * exit;
+    command_graph_t * cg = make_graph(&entry, &exit);
+
+    command_graph_node_t * c1  = make_command_node(cg);
+    command_graph_node_t * c2  = make_command_node(cg);
+    command_graph_node_t * c3  = make_command_node(cg);
+    command_graph_node_t * c4  = make_command_node(cg);
+    command_graph_node_t * c6  = make_command_node(cg);
+    command_graph_node_t * c7  = make_command_node(cg);
+    command_graph_node_t * c8  = make_command_node(cg);
+    command_graph_node_t * c9  = make_command_node(cg);
+    command_graph_node_t * c10 = make_command_node(cg);
+    command_graph_node_t * c11 = make_command_node(cg);
+    command_graph_node_t * c12 = make_command_node(cg);
+    command_graph_node_t * c13 = make_command_node(cg);
+
+    entry->precedes(c1);
+    entry->precedes(c7);
+    entry->precedes(c13);
+
+    c1->precedes(c2);
+    c2->precedes(c3);
+    c3->precedes(c4);
+    c3->precedes(c6);
+    c4->precedes(exit);
+    c6->precedes(exit);
+
+    c7->precedes(c8);
+    c8->precedes(c9);
+    c9->precedes(c10);
+    c9->precedes(c12);
+    c10->precedes(c11);
+    c11->precedes(c2);
+    c12->precedes(c6);
+    c13->precedes(c8);
+
+    cg->dump("cg-pre-batch-convex-island.dot");
+    cg->optimize(COMMAND_GRAPH_PASS_BATCH);
+    cg->dump("cg-post-batch-convex-island.dot");
+
+    return check_batch(cg, "convex-island", 12);
+}
+
 int
 main(void)
 {
@@ -277,5 +337,6 @@ main(void)
     rc |= test_batch_sequence();
     rc |= test_batch_false_twins();
     rc |= test_batch_mixed();
+    rc |= test_batch_convex_island();
     return rc;
 }

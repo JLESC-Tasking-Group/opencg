@@ -30,12 +30,26 @@ This heuristic ensures that removing the node (and connecting all predecessors t
 
 ### Batching (batch)
 
-Contracts nodes that execute on the same device into `COMMAND_TYPE_BATCH` nodes.
-The pass detects two patterns:
-- **False twins**: nodes with identical predecessor and successor sets
-- **Sequential pairs**: `u -> v` where `u` has a single successor and `v` has a single predecessor
+Groups **islands** of same-device nodes into `COMMAND_TYPE_BATCH` nodes. An island
+is a *maximal, convex* set of nodes on one device: convex meaning no node outside the
+island lies on a path between two members, so the island can be replayed as one
+atomic sub-graph without deadlock.
 
-Contracted nodes become a `cgir::command_batch_t` containing a sub-command-graph.
+Islands are grown to a fixpoint on a scratch quotient graph by contracting two
+same-device relations:
+- **Convex-safe edge** `u -> v`: the direct edge is the only `u..v` path (no
+  alternate path through another successor). Contracting it never creates a cycle
+  nor traps an external node. This generalizes a plain sequential pair (single
+  successor `u` / single predecessor `v`) to any non-bypassed edge.
+- **False twins**: identical predecessor and successor sets (parallel, unconnected).
+
+Each island with at least two `COMMAND` members is materialized into a single fresh
+top-level BATCH node whose `cgir::command_batch_t` sub-graph is the island's induced
+sub-graph (internal branches and twins preserved; a single entry/exit added). External
+edges are rewired to/from the batch node and deduplicated; cross-island edges become
+batch-to-batch edges. The sub-graph's `is_sequence` flag is set when the island is a
+linear chain of task-spawn programs.
+
 This enables mapping to vendor-specific batching mechanisms (e.g. CUDA Graphs, HIP Graphs, Level Zero command lists).
 
 ### Copy Fusion (copy-fuse)
