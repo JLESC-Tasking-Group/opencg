@@ -248,22 +248,25 @@ struct command_graph_node_t
         // BFS not supported
         static_assert(search == COMMAND_GRAPH_WALK_SEARCH_DFS);
 
-        auto reach = [&] (command_graph_node_t * node)
+        std::function<void(command_graph_node_t *)> reach = [&] (command_graph_node_t * node)
         {
-            if (node->walk_id == this->walk_id)
-                return ;
-            node->walk_id = this->walk_id;
+            assert(node->walk_id == this->walk_id);
 
             if constexpr(order == COMMAND_GRAPH_WALK_ORDER_PRE)
                 f(node);
 
             for (command_graph_node_t * succ : node->successors)
+            {
+                if (succ->walk_id == this->walk_id)
+                    continue ;
+                succ->walk_id = this->walk_id;
                 reach(succ);
+            }
 
             if constexpr(order == COMMAND_GRAPH_WALK_ORDER_POST)
                 f(node);
         };
-        reach(this->node_get_entry());
+        reach(this);
     }
 };
 
