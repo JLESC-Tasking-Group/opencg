@@ -46,13 +46,6 @@ The graph supports DFS and BFS walks in both forward and backward directions:
 cg.walk([](command_graph_node_t * node) {
     // process node
 });
-
-// Backward BFS walk
-cg.walk<COMMAND_GRAPH_WALK_DIRECTION_BACKWARD,
-        COMMAND_GRAPH_WALK_SEARCH_BFS>(
-    [](command_graph_node_t * node) {
-        // process node
-    }
 );
 ```
 

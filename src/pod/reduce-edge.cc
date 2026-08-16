@@ -59,9 +59,8 @@ command_graph_t::pass_reduce_edge(void)
     command_graph_reachability_t r(n);
 
     /* compute reachability */
-    command_graph_node_t * exit = this->node_get_exit();
-    this->walk<COMMAND_GRAPH_WALK_DIRECTION_BACKWARD, COMMAND_GRAPH_WALK_SEARCH_BFS>(
-        exit,
+    this->walk<COMMAND_GRAPH_WALK_SEARCH_DFS,
+               COMMAND_GRAPH_WALK_ORDER_POST>(
         [&] (command_graph_node_t * node)
         {
             r.set(node->iterator_index, node->iterator_index);

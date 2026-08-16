@@ -79,16 +79,16 @@ typedef size_t command_graph_node_index_t;
 /* Integer type to use for walk ids */
 typedef int8_t command_graph_walk_id_t;
 
-enum command_graph_walk_direction_t
-{
-    COMMAND_GRAPH_WALK_DIRECTION_FORWARD,
-    COMMAND_GRAPH_WALK_DIRECTION_BACKWARD
-};
-
 enum command_graph_walk_search_t
 {
     COMMAND_GRAPH_WALK_SEARCH_DFS,
     COMMAND_GRAPH_WALK_SEARCH_BFS
+};
+
+enum command_graph_walk_order_t
+{
+    COMMAND_GRAPH_WALK_ORDER_PRE,
+    COMMAND_GRAPH_WALK_ORDER_POST
 };
 
 /* Optimize contractions with hints */
@@ -240,69 +240,30 @@ struct command_graph_node_t
         }
     }
 
-    template <command_graph_walk_direction_t direction = COMMAND_GRAPH_WALK_DIRECTION_FORWARD,
-              command_graph_walk_search_t    search    = COMMAND_GRAPH_WALK_SEARCH_DFS>
+    template <command_graph_walk_search_t    search    = COMMAND_GRAPH_WALK_SEARCH_DFS,
+              command_graph_walk_order_t     order     = COMMAND_GRAPH_WALK_ORDER_PRE>
     inline void
     walk(std::function<void(command_graph_node_t * node)> f)
     {
-        /* lambda to enqueue unvisited neighbors into the frontier,
-         * traversing successors (FORWARD) or predecessors (BACKWARD) */
-        auto visit_neighbors = [&] (auto & frontier, command_graph_node_t * node)
-        {
-            auto enqueue = [&] (command_graph_node_t * neighbor)
-            {
-                /* skip already-visited nodes */
-                if (neighbor->walk_id == this->walk_id)
-                    return ;
-                neighbor->walk_id = this->walk_id;
-                frontier.push(neighbor);
-            };
+        // BFS not supported
+        static_assert(search == COMMAND_GRAPH_WALK_SEARCH_DFS);
 
-            if constexpr (direction == COMMAND_GRAPH_WALK_DIRECTION_FORWARD)
-                node->foreach_successor(enqueue);
-            else
-            {
-                static_assert(direction == COMMAND_GRAPH_WALK_DIRECTION_BACKWARD);
-                node->foreach_predecessor(enqueue);
-            }
+        auto reach = [&] (command_graph_node_t * node)
+        {
+            if (node->walk_id == this->walk_id)
+                return ;
+            node->walk_id = this->walk_id;
+
+            if constexpr(order == COMMAND_GRAPH_WALK_ORDER_PRE)
+                f(node);
+
+            for (command_graph_node_t * succ : node->successors)
+                reach(succ);
+
+            if constexpr(order == COMMAND_GRAPH_WALK_ORDER_POST)
+                f(node);
         };
-
-        if constexpr (search == COMMAND_GRAPH_WALK_SEARCH_DFS)
-        {
-            /* DFS: last-in, first-out via std::stack */
-            std::stack<command_graph_node_t *> frontier;
-            frontier.push(this);
-
-            while (!frontier.empty())
-            {
-                command_graph_node_t * node = frontier.top();
-                frontier.pop();
-
-                assert(node->walk_id == this->walk_id);
-                f(node);
-
-                visit_neighbors(frontier, node);
-            }
-        }
-        else
-        {
-            static_assert(search == COMMAND_GRAPH_WALK_SEARCH_BFS);
-
-            /* BFS: first-in, first-out via std::queue */
-            std::queue<command_graph_node_t *> frontier;
-            frontier.push(this);
-
-            while (!frontier.empty())
-            {
-                command_graph_node_t * node = frontier.front();
-                frontier.pop();
-
-                assert(node->walk_id == this->walk_id);
-                f(node);
-
-                visit_neighbors(frontier, node);
-            }
-        }
+        reach(this->node_get_entry());
     }
 };
 
@@ -707,33 +668,23 @@ struct command_graph_t
         }
     }
 
-    template <command_graph_walk_direction_t direction = COMMAND_GRAPH_WALK_DIRECTION_FORWARD,
-              command_graph_walk_search_t    search    = COMMAND_GRAPH_WALK_SEARCH_DFS>
+    template <command_graph_walk_search_t    search    = COMMAND_GRAPH_WALK_SEARCH_DFS,
+              command_graph_walk_order_t     order     = COMMAND_GRAPH_WALK_ORDER_PRE>
     inline void
     walk(
         command_graph_node_t * node,
         std::function<void(command_graph_node_t * node)> f
     ) {
         node->walk_id = ++this->walk_id;
-        node->walk<direction, search>(f);
+        node->walk<search, order>(f);
     }
 
-    template <command_graph_walk_direction_t direction = COMMAND_GRAPH_WALK_DIRECTION_FORWARD,
-              command_graph_walk_search_t    search    = COMMAND_GRAPH_WALK_SEARCH_DFS>
+    template <command_graph_walk_search_t    search    = COMMAND_GRAPH_WALK_SEARCH_DFS,
+              command_graph_walk_order_t     order     = COMMAND_GRAPH_WALK_ORDER_PRE>
     inline void
     walk(std::function<void(command_graph_node_t * node)> f)
     {
-        command_graph_node_t * node;
-        if constexpr (direction == COMMAND_GRAPH_WALK_DIRECTION_FORWARD)
-        {
-            node = this->node_get_entry();
-        }
-        else
-        {
-            static_assert(direction == COMMAND_GRAPH_WALK_DIRECTION_BACKWARD);
-            node = this->node_get_exit();
-        }
-        return this->walk<direction, search>(node, f);
+        return this->walk<search, order>(this->node_get_entry(), f);
     }
 
     /* Dump the command graph */
@@ -756,10 +707,10 @@ struct command_graph_t
         node_iterator_t(command_graph_node_t * node) : node(node), data() {}
     };
 
-    template<typename T,
-             bool include_entry_exit = false,
-             command_graph_walk_direction_t direction = COMMAND_GRAPH_WALK_DIRECTION_FORWARD,
-             command_graph_walk_search_t    search    = COMMAND_GRAPH_WALK_SEARCH_DFS>
+    template <typename T,
+              bool include_entry_exit = false,
+              command_graph_walk_search_t    search    = COMMAND_GRAPH_WALK_SEARCH_DFS,
+              command_graph_walk_order_t     order     = COMMAND_GRAPH_WALK_ORDER_PRE>
     inline std::vector<node_iterator_t<T>>
     create_node_iterators(const command_graph_node_index_t initial_capacity = 2048)
     {
@@ -768,7 +719,7 @@ struct command_graph_t
         vec.reserve(initial_capacity);
 
         /* walk through the graph */
-        this->walk<direction, search>(
+        this->walk<search, order>(
             [&] (command_graph_node_t * node)
             {
                 if constexpr (!include_entry_exit)
