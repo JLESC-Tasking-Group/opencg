@@ -40,8 +40,11 @@
 
 # include <cgir/command.hpp>
 # include <cgir/command-graph.hpp>
+# include <cgir/command-type.hpp>
 
 # include <atomic>
+# include <chrono>
+# include <mutex>
 # include <string>
 
 # include <errno.h>
@@ -208,6 +211,162 @@ optimize_dump_graph(
     fclose(f);
 }
 
+/* ------------------------------------------------------------------------- *
+ * Machine-readable per-pass statistics (CGIR_STATS_CSV).                     *
+ *                                                                           *
+ * When CGIR_STATS_CSV is set (to a path other than "" or "0"), every pass    *
+ * run through the dispatcher appends one CSV row measuring the pass's effect  *
+ * on the command graph: its wall-clock time and the graph's node/edge and    *
+ * per-command-type counts BEFORE and AFTER the transformation. This is the    *
+ * data source for the paper's evaluation (graph reduction, copy/prog fusion,  *
+ * batching). It is independent of CGIR_OPTIMIZE_DUMP (which writes .dot).     *
+ *                                                                           *
+ * Rows are tagged with CGIR_STATS_TAG (a caller-provided run identifier, set  *
+ * per run by the benchmark harness) so a single appended file can hold every  *
+ * run of a sweep and be joined back to the harness' runs.csv on that tag.     *
+ *                                                                           *
+ * Counts are taken over the top-level graph (a forward walk from entry): the  *
+ * batch pass collapses a device's commands into a single BATCH node whose     *
+ * sub-graph is not descended into, so after batching nodes_after drops and    *
+ * batch_after rises -- exactly the signal we want to report.                  *
+ * ------------------------------------------------------------------------- */
+static const char *
+stats_csv_path(void)
+{
+    static const char * path   = nullptr;
+    static int          inited = 0;
+    if (!inited)
+    {
+        const char * s = getenv("CGIR_STATS_CSV");
+        path   = (s && s[0] != '\0' && strcmp(s, "0") != 0) ? s : nullptr;
+        inited = 1;
+    }
+    return path;
+}
+
+/* Node-type and command-type counts of a command graph. */
+struct cg_metrics_t
+{
+    size_t nodes, edges;                    /* totals */
+    size_t empty, command, graph, condition;/* by node type */
+    size_t prog, copy1d, copy2d, batch;     /* by command type (COMMAND nodes) */
+};
+
+/* Count nodes, edges and command types over the top-level graph. */
+static cg_metrics_t
+stats_compute_metrics(command_graph_t * cg)
+{
+    cg_metrics_t m;
+    memset(&m, 0, sizeof(m));
+
+    cg->walk([&] (command_graph_node_t * node)
+    {
+        m.nodes += 1;
+        m.edges += node->successors.size();
+
+        switch (node->type)
+        {
+            case COMMAND_GRAPH_NODE_TYPE_EMPTY:
+                m.empty += 1;
+                break;
+
+            case COMMAND_GRAPH_NODE_TYPE_COMMAND:
+                m.command += 1;
+                if (node->command)
+                {
+                    switch (node->command->type)
+                    {
+                        case COMMAND_TYPE_PROG:
+                            m.prog += 1;
+                            break;
+                        case COMMAND_TYPE_COPY_H2H_1D:
+                        case COMMAND_TYPE_COPY_H2D_1D:
+                        case COMMAND_TYPE_COPY_D2H_1D:
+                        case COMMAND_TYPE_COPY_D2D_1D:
+                            m.copy1d += 1;
+                            break;
+                        case COMMAND_TYPE_COPY_H2H_2D:
+                        case COMMAND_TYPE_COPY_H2D_2D:
+                        case COMMAND_TYPE_COPY_D2H_2D:
+                        case COMMAND_TYPE_COPY_D2D_2D:
+                            m.copy2d += 1;
+                            break;
+                        case COMMAND_TYPE_BATCH:
+                            m.batch += 1;
+                            break;
+                        default:
+                            break;
+                    }
+                }
+                break;
+
+            case COMMAND_GRAPH_NODE_TYPE_COMMAND_GRAPH:
+                m.graph += 1;
+                break;
+
+            case COMMAND_GRAPH_NODE_TYPE_CONDITION:
+                m.condition += 1;
+                break;
+        }
+    });
+
+    return m;
+}
+
+/* Append one row for a completed pass. Serialized so appends stay atomic even
+ * if two graphs are optimized concurrently. */
+static void
+stats_emit(
+    command_graph_pass_t pass,
+    unsigned seq,
+    double pass_ms,
+    const cg_metrics_t & b,
+    const cg_metrics_t & a
+) {
+    const char * path = stats_csv_path();
+    if (!path)
+        return ;
+
+    static std::mutex mtx;
+    std::lock_guard<std::mutex> lock(mtx);
+
+    struct stat st;
+    const bool need_header = (stat(path, &st) != 0 || st.st_size == 0);
+
+    FILE * f = fopen(path, "a");
+    if (!f)
+    {
+        fprintf(stderr, "cgir: cannot write '%s': %s\n", path, strerror(errno));
+        return ;
+    }
+
+    if (need_header)
+        fprintf(f,
+            "tag,seq,pass,pass_ms,"
+            "nodes_before,nodes_after,edges_before,edges_after,"
+            "empty_before,empty_after,command_before,command_after,"
+            "graph_before,graph_after,"
+            "prog_before,prog_after,copy1d_before,copy1d_after,"
+            "copy2d_before,copy2d_after,batch_before,batch_after\n");
+
+    const char * tag = getenv("CGIR_STATS_TAG");
+    fprintf(f,
+        "%s,%u,%s,%.6f,"
+        "%zu,%zu,%zu,%zu,"
+        "%zu,%zu,%zu,%zu,"
+        "%zu,%zu,"
+        "%zu,%zu,%zu,%zu,"
+        "%zu,%zu,%zu,%zu\n",
+        tag ? tag : "", seq, command_graph_pass_to_str(pass), pass_ms,
+        b.nodes, a.nodes, b.edges, a.edges,
+        b.empty, a.empty, b.command, a.command,
+        b.graph, a.graph,
+        b.prog, a.prog, b.copy1d, a.copy1d,
+        b.copy2d, a.copy2d, b.batch, a.batch);
+
+    fclose(f);
+}
+
 void
 CGIR_NAMESPACE::command_graph_optimize(
     command_graph_t * cg,
@@ -216,10 +375,18 @@ CGIR_NAMESPACE::command_graph_optimize(
     /* Optional command-graph dumping for debugging (CGIR_OPTIMIZE_DUMP). When
      * enabled, the graph is written as .dot before and after the pass. A single
      * per-pass sequence number ties the before/after pair together. */
-    const bool     dump = optimize_dump_enabled();
-    const unsigned seq  = dump ? optimize_dump_make_seq() : 0u;
+    const bool     dump  = optimize_dump_enabled();
+    const bool     stats = (stats_csv_path() != nullptr);
+    const unsigned seq   = (dump || stats) ? optimize_dump_make_seq() : 0u;
     if (dump)
         optimize_dump_graph(cg, seq, pass, "before");
+
+    /* Snapshot graph metrics before the pass (stats only). */
+    cg_metrics_t before;
+    if (stats)
+        before = stats_compute_metrics(cg);
+
+    const auto t0 = std::chrono::steady_clock::now();
 
     # if CGIR_USE_MLIR
     if (command_graph_use_mlir_optimizer())
@@ -228,6 +395,15 @@ CGIR_NAMESPACE::command_graph_optimize(
     # endif /* CGIR_USE_MLIR */
         /* legacy C++ passes */
         cg->optimize_legacy(pass);
+
+    const auto t1 = std::chrono::steady_clock::now();
+
+    if (stats)
+    {
+        const cg_metrics_t after   = stats_compute_metrics(cg);
+        const double       pass_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        stats_emit(pass, seq, pass_ms, before, after);
+    }
 
     if (dump)
         optimize_dump_graph(cg, seq, pass, "after");

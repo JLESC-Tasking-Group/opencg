@@ -48,6 +48,15 @@ You may set the following environment variables
   other than `0` to write under `~/.cgir/tmp/`, or to an absolute path to
   override the output directory. Render a dump with e.g.
   `dot -Tpng optimize-0-copy-fuse-after.dot -o after.png`.
+- `CGIR_STATS_CSV` to append one machine-readable CSV row per optimization pass,
+  recording the pass wall-clock time and the command-graph node/edge and
+  per-command-type counts *before* and *after* the pass (nodes, edges, empty
+  control nodes, commands, PROG, 1D/2D copies, batches). Set it to a file path;
+  rows accumulate across passes and processes. This is the data source for the
+  evaluation harness (`bench/`). Independent of `CGIR_OPTIMIZE_DUMP`.
+- `CGIR_STATS_TAG` an arbitrary string written verbatim in the `tag` column of
+  every `CGIR_STATS_CSV` row, so a caller (e.g. the benchmark runner) can join
+  the per-pass stats back to a specific run.
 
 
 # Example
