@@ -48,6 +48,7 @@ SET(SOURCE_FILES
     # POD interface implementation
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/command-graph.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/batch.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/sequence.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/copy-fuse.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/copy-normalize.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/prog-fuse.cc

@@ -72,15 +72,6 @@ struct pls_t
 };
 using node_t = command_graph_t::node_iterator_t<pls_t>;
 
-/* A node is "sequence-able" (may belong to an OpenMP-task sequence) if it is a
- * control node, or a PROG command whose launch mode is TASK_SPAWN (a recorded
- * OpenMP task body). Only a linear chain of such nodes yields is_sequence. */
-# define NODE_IS_SEQABLE(N)                                             \
-    ((N)->type == COMMAND_GRAPH_NODE_TYPE_EMPTY ||                      \
-     ((N)->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && (N)->command &&   \
-      (N)->command->type == COMMAND_TYPE_PROG &&                        \
-      (N)->command->prog.launch_mode == CGIR_COMMAND_PROG_LAUNCH_MODE_TASK_SPAWN))
-
 void
 command_graph_t::pass_batch(void)
 {
@@ -114,7 +105,8 @@ command_graph_t::pass_batch(void)
      * Detect islands: union-find flood-fill.                               *
      * -------------------------------------------------------------------- */
 
-    auto find = [&] (int x) {
+    auto find = [&] (int x)
+    {
         while (nodes[x].data.parent != x)
         {
             nodes[x].data.parent = nodes[nodes[x].data.parent].data.parent;
@@ -122,9 +114,13 @@ command_graph_t::pass_batch(void)
         }
         return x;
     };
-    auto unite = [&] (int a, int b) {
-        a = find(a); b = find(b);
-        if (a != b) nodes[a].data.parent = b;
+
+    auto unite = [&] (int a, int b)
+    {
+        a = find(a);
+        b = find(b);
+        if (a != b)
+            nodes[a].data.parent = b;
     };
 
     /* 1. flood-fill along same-device edges */
@@ -272,28 +268,18 @@ command_graph_t::pass_batch(void)
 
     /* Connect each sub-graph's entry/exit to the island's sources/sinks. After
      * boundary removal a member's remaining edges are all internal, so a source
-     * has no predecessor and a sink no successor. */
+     * has no predecessor and a sink no successor. (is_sequence stays false here;
+     * linear task chains are handled by the dedicated 'sequence' pass.) */
     for (auto & kv : mat)
     {
         island_mat_t & M       = kv.second;
         auto &         members = island[kv.first];
 
-        bool seq     = true;
-        int  sources = 0;
-        int  sinks   = 0;
         for (command_graph_node_t * m : members)
         {
-            const size_t iin  = m->predecessors.size();
-            const size_t iout = m->successors.size();
-
-            if (iin == 0)  { M.s_entry->precedes(m); ++sources; }
-            if (iout == 0) { m->precedes(M.s_exit);  ++sinks;   }
-            if (iin > 1 || iout > 1)
-                seq = false;
-            if (!NODE_IS_SEQABLE(m))
-                seq = false;
+            if (m->predecessors.empty()) M.s_entry->precedes(m);
+            if (m->successors.empty())   m->precedes(M.s_exit);
         }
-        M.sub->is_sequence = seq && (sources == 1) && (sinks == 1);
     }
 
 # ifndef NDEBUG

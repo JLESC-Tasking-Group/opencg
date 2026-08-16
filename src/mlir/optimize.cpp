@@ -51,6 +51,14 @@ create_jit_pass(void)
     return nullptr;
 }
 
+/* The `sequence` pass is only implemented as a legacy POD pass; returning
+ * nullptr makes the dispatcher fall back to command_graph_t::pass_sequence. */
+std::unique_ptr<mlir::Pass>
+create_sequence_pass(void)
+{
+    return nullptr;
+}
+
 std::unique_ptr<mlir::Pass>
 create_pass(command_graph_pass_t pass)
 {

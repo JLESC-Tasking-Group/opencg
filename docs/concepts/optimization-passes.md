@@ -43,10 +43,30 @@ single fresh top-level BATCH node whose `cgir::command_batch_t` sub-graph reuses
 very same node objects and their internal edges. Only the island boundary is rewired:
 external edges are moved to/from the batch node (deduplicated; cross-island edges
 become batch-to-batch edges), and the sub-graph's entry/exit are connected to the
-island's sources/sinks. The sub-graph's `is_sequence` flag is set when the island is a
-linear chain of task-spawn programs.
+island's sources/sinks.
 
 This enables mapping to vendor-specific batching mechanisms (e.g. CUDA Graphs, HIP Graphs, Level Zero command lists).
+
+### Sequence (sequence)
+
+Collapses a maximal **linear chain** `u -> v -> ... -> w` of same-device
+`TASK_SPAWN` PROG commands (a recorded OpenMP-task chain) into a single
+`COMMAND_TYPE_BATCH` node whose sub-graph is flagged `is_sequence`. The runtime
+replays such a batch as one "super" task (running each recorded task body serially
+on one thread) instead of spawning and scheduling one task per command.
+
+Chains are grown by union-find over *sequence edges* — an edge `u -> v` where `u`
+has exactly one successor (`v`) and `v` exactly one predecessor (`u`), both on the
+same device and both sequence-able (a `TASK_SPAWN` PROG or a control node). Since a
+sequence edge cannot branch, each detected island is inherently a linear chain.
+Materialization is identical to the batch pass (reuse the node objects and internal
+edges in place; rewire only the boundary), and only chains with at least two
+`COMMAND` members are batched.
+
+`sequence` and `batch` both create `COMMAND_TYPE_BATCH` nodes but for different
+runtime mechanisms (OpenMP super-task replay vs. vendor command graphs) and are
+typically enabled independently. When both run, `sequence` runs first (its batches
+are then opaque boundaries to `batch`).
 
 ### Copy Fusion (copy-fuse)
 
@@ -76,7 +96,7 @@ cg.optimize(
     | COMMAND_GRAPH_PASS_BATCH_BIT);
 ```
 
-Enabled passes always run in a fixed *canonical order* — the order in which they are declared in `CGIR_FORALL_COMMAND_GRAPH_PASS` (`copy-normalize`, `copy-fuse`, `reduce-node`, `reduce-edge`, `prog-fuse`, `batch`) — regardless of the order of the bits. This guarantees the reduction passes run before batching, so the graph is simplified before it is contracted.
+Enabled passes always run in a fixed *canonical order* — the order in which they are declared in `CGIR_FORALL_COMMAND_GRAPH_PASS` (`copy-normalize`, `copy-fuse`, `reduce-node`, `reduce-edge`, `prog-fuse`, `jit`, `sequence`, `batch`) — regardless of the order of the bits. This guarantees the reduction passes run before batching, so the graph is simplified before it is contracted.
 
 A single pass can still be run on its own with the `command_graph_pass_t` overload:
 
