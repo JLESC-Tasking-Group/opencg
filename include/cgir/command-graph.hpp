@@ -245,7 +245,7 @@ struct command_graph_node_t
     inline void
     walk(std::function<void(command_graph_node_t * node)> f)
     {
-        if (search == COMMAND_GRAPH_WALK_SEARCH_DFS)
+        if constexpr(search == COMMAND_GRAPH_WALK_SEARCH_DFS)
         {
             std::function<void(command_graph_node_t *)> reach = [&] (command_graph_node_t * node)
             {
@@ -269,7 +269,7 @@ struct command_graph_node_t
         }
         else
         {
-            static_assert(search == COMMAND_GRAPH_WALK_SEARCH_DFS);
+            static_assert(search == COMMAND_GRAPH_WALK_SEARCH_BFS);
             static_assert(order  == COMMAND_GRAPH_WALK_ORDER_PRE);
 
             std::queue<command_graph_node_t *> q;
@@ -287,6 +287,7 @@ struct command_graph_node_t
                 {
                     if (succ->walk_id == this->walk_id)
                         continue ;
+                    succ->walk_id = this->walk_id;
                     q.push(succ);
                 }
             }
