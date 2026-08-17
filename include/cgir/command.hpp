@@ -232,9 +232,6 @@ struct command_batch_t
     /* the command graph of that batch (its `is_sequence` flag marks a linear
      * chain of TASK_SPAWN PROG commands, see command_graph_t) */
     command_graph_t * cg;
-
-    /* driver specific handle */
-    void * driver_handle;
 };
 
 struct command_graph_node_t;

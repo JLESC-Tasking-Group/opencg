@@ -229,8 +229,7 @@ build_batch_node(command_graph_t * cg, BatchOp batch)
 
     /* build the BATCH command + node in the parent graph */
     command_t * batch_cmd = cg->command_new(cg, COMMAND_TYPE_BATCH);
-    batch_cmd->batch.cg            = sub;
-    batch_cmd->batch.driver_handle = NULL;
+    batch_cmd->batch.cg = sub;
 
     command_graph_node_t * batch_node = cg->command_graph_node_new(cg, duid, COMMAND_GRAPH_NODE_TYPE_COMMAND);
     batch_node->command = batch_cmd;

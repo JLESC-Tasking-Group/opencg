@@ -181,7 +181,6 @@ command_graph_t::pass_sequence(void)
         assert(this->command_new && this->command_graph_new && this->command_graph_node_new);
         command_t * cmd = this->command_new(this, COMMAND_TYPE_BATCH);
         assert(cmd);
-        cmd->batch.driver_handle = NULL;
 
         command_graph_node_t * B =
             this->command_graph_node_new(this, u->device_unique_id, COMMAND_GRAPH_NODE_TYPE_COMMAND);

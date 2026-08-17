@@ -218,7 +218,6 @@ command_graph_t::pass_batch(void)
         assert(this->command_new && this->command_graph_new && this->command_graph_node_new);
         command_t * cmd = this->command_new(this, COMMAND_TYPE_BATCH);
         assert(cmd);
-        cmd->batch.driver_handle = NULL;
 
         command_graph_t * sub = this->command_graph_new(this, nullptr, nullptr);
         assert(sub);
