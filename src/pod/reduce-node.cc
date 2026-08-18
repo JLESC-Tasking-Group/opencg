@@ -40,21 +40,16 @@
 
 CGIR_NAMESPACE_USE;
 
-/* pass local storage */
-struct pls_t {};
-using node_t = command_graph_t::node_iterator_t<pls_t>;
-
 void
 command_graph_t::pass_reduce_node(void)
 {
     /* Iterate through all nodes */
     constexpr bool include_entry_exit = false;
-    std::vector<node_t> nodes = this->create_node_iterators<pls_t, include_entry_exit>();
+    auto nodes = this->create_node_iterators<include_entry_exit>();
 
     for (command_graph_node_index_t i = 0 ; i < nodes.size() ; ++i)
     {
-        node_t & node = nodes[i];
-        command_graph_node_t * u = node.node;
+        command_graph_node_t * u = nodes[i].node;
         assert(u);
 
         # if 0

@@ -45,15 +45,13 @@
 CGIR_NAMESPACE_USE;
 
 /* pass local storage */
-struct pls_t
+struct copy_fuse_pls_t
 {
     bool contracted;
 
-    pls_t(void) : contracted(false) {}
-    ~pls_t(void) {}
+    copy_fuse_pls_t(void) : contracted(false) {}
+    ~copy_fuse_pls_t(void) {}
 };
-
-using node_t = command_graph_t::node_iterator_t<pls_t>;
 
 static inline bool
 command_graph_pass_batch_try_fuse_copy(
@@ -243,22 +241,22 @@ command_graph_t::pass_copy_fuse(void)
 {
     /* Iterate through all nodes, and fuse contiguous copies occuring in sibling nodes */
     constexpr bool include_entry_exit = false;
-    std::vector<node_t> nodes = this->create_node_iterators<pls_t, include_entry_exit>();
+    auto nodes = this->create_node_iterators<include_entry_exit, copy_fuse_pls_t>();
 
     /* iterate through each original nodes */
     for (command_graph_node_index_t i = 0 ; i < nodes.size() ; ++i)
     {
-        node_t & node = nodes[i];
-        command_graph_node_t * u = node.node;
+        auto & it = nodes[i];
+        command_graph_node_t * u = it.node;
         assert(u);
 
         /* if the node was already contracted, ignore it */
-        if (node.data.contracted)
+        if (it.data.contracted)
         {
             // LOGGER_DEBUG("Skipping %zu: already contracted", u->index);
             continue ;
         }
-        assert(!node.data.contracted);
+        assert(!it.data.contracted);
 
 retry_node:
 

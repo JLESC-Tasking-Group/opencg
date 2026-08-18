@@ -53,31 +53,22 @@ CGIR_NAMESPACE_USE;
  * BATCH PASS - group same-device "islands" into COMMAND_TYPE_BATCH sub-graphs so
  * a driver can capture each island as a single vendor graph (CUDA/HIP graph,
  * Level-Zero command list, ...).
- *
- * A command graph is just a DAG whose nodes carry a device id. An island is a
- * connected region of same-device nodes: it is found by a flood-fill
- * (union-find) that unites same-device nodes joined by an edge, then folds in
- * same-device false twins (identical neighborhood, e.g. two independent ops with
- * the same dependencies). Each island with >= 2 COMMAND nodes is materialized
- * IN PLACE into a fresh BATCH node whose sub-graph reuses the very same node
- * objects and their internal edges; only the island boundary is rewired.
  */
 
 /* per-node pass storage (the device stays on the node: node->device_unique_id) */
-struct pls_t
+struct batch_pls_t
 {
-    bool                   cand;    /* batching candidate (not entry/exit, not an opaque batch/graph node) */
-    int                    parent;  /* union-find parent index (island detection) */
+    bool candidate;                 /* batching candidate (not entry/exit, not an opaque batch/graph node) */
+    int parent;                     /* union-find parent index (island detection) */
     command_graph_node_t * rep;     /* representative top-level node after batching */
 };
-using node_t = command_graph_t::node_iterator_t<pls_t>;
 
 void
 command_graph_t::pass_batch(void)
 {
     /* Index every top-level node; node->iterator_index is its index in [0, n). */
     constexpr bool include_entry_exit = true;
-    std::vector<node_t> nodes = this->create_node_iterators<pls_t, include_entry_exit>();
+    auto nodes = this->create_node_iterators<include_entry_exit, batch_pls_t>();
     const int n = (int) nodes.size();
     if (n <= 2)   /* only entry/exit: nothing to batch */
         return ;
@@ -94,9 +85,8 @@ command_graph_t::pass_batch(void)
         const bool boundary =
             (u == g_entry) || (u == g_exit) ||
             (u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND_GRAPH) ||
-            (u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && u->command &&
-             u->command->type == COMMAND_TYPE_BATCH);
-        nodes[i].data.cand   = !boundary;
+            (u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && u->command && u->command->type == COMMAND_TYPE_BATCH);
+        nodes[i].data.candidate   = !boundary;
         nodes[i].data.parent = i;
         nodes[i].data.rep    = u;
     }
@@ -126,13 +116,13 @@ command_graph_t::pass_batch(void)
     /* 1. flood-fill along same-device edges */
     for (int i = 0 ; i < n ; ++i)
     {
-        if (!nodes[i].data.cand)
+        if (!nodes[i].data.candidate)
             continue ;
         const device_unique_id_t di = nodes[i].node->device_unique_id;
         for (command_graph_node_t * s : nodes[i].node->successors)
         {
             const int j = (int) s->iterator_index;
-            if (nodes[j].data.cand && di == s->device_unique_id)
+            if (nodes[j].data.candidate && di == s->device_unique_id)
                 unite(i, j);
         }
     }
@@ -164,7 +154,7 @@ command_graph_t::pass_batch(void)
         std::map<std::tuple<device_unique_id_t, std::set<int>, std::set<int>>, int> seen;
         for (int i = 0 ; i < n ; ++i)
         {
-            if (!nodes[i].data.cand || find(i) != i)   /* candidate island roots only */
+            if (!nodes[i].data.candidate || find(i) != i)   /* candidate island roots only */
                 continue ;
             auto key = std::make_tuple(nodes[i].node->device_unique_id, rpred[i], rsucc[i]);
             auto it  = seen.find(key);
@@ -181,7 +171,7 @@ command_graph_t::pass_batch(void)
     /* group members by island root (candidates only) */
     std::unordered_map<int, std::vector<command_graph_node_t *>> island;
     for (int i = 0 ; i < n ; ++i)
-        if (nodes[i].data.cand)
+        if (nodes[i].data.candidate)
             island[find(i)].push_back(nodes[i].node);
 
     /* -------------------------------------------------------------------- *
@@ -205,12 +195,14 @@ command_graph_t::pass_batch(void)
         int                ncmd = 0;
         device_unique_id_t gdev = nodes[kv.first].node->device_unique_id;
         for (command_graph_node_t * m : members)
+        {
             if (m->type == COMMAND_GRAPH_NODE_TYPE_COMMAND)
             {
                 if (ncmd == 0)
                     gdev = m->device_unique_id;
                 ++ncmd;
             }
+        }
         if (ncmd < 2)
             continue ;
 
@@ -241,28 +233,31 @@ command_graph_t::pass_batch(void)
     /* Rewire boundaries only: every original edge whose endpoints map to
      * different representatives is moved onto the batch node(s); internal edges
      * (both endpoints in the same island) are left physically untouched. */
-    std::vector<std::pair<command_graph_node_t *, command_graph_node_t *>> edges;
     for (int i = 0 ; i < n ; ++i)
-        for (command_graph_node_t * s : nodes[i].node->successors)
-            edges.emplace_back(nodes[i].node, s);
-
-    for (auto & e : edges)
     {
-        command_graph_node_t * u  = e.first;
-        command_graph_node_t * v  = e.second;
-        command_graph_node_t * ru = nodes[u->iterator_index].data.rep;
-        command_graph_node_t * rv = nodes[v->iterator_index].data.rep;
+        command_graph_node_t * u  = nodes[i].node;
+        assert(u);
 
-        if (ru == rv)
-            continue ;              /* internal to one island: keep as-is */
-        if (ru == u && rv == v)
-            continue ;              /* neither endpoint batched: keep as-is */
+        /* for each edge u->v */
+        for (auto it = u->successors.begin(); it != u->successors.end(); )
+        {
+            command_graph_node_t * v = *it;
+            assert(v);
 
-        /* boundary edge: detach the original, add the mapped one (deduplicated) */
-        u->successors.erase(std::find(u->successors.begin(), u->successors.end(), v));
-        v->predecessors.erase(std::find(v->predecessors.begin(), v->predecessors.end(), u));
-        if (std::find(ru->successors.begin(), ru->successors.end(), rv) == ru->successors.end())
-            ru->precedes(rv);
+            command_graph_node_t * ru = nodes[u->iterator_index].data.rep;
+            command_graph_node_t * rv = nodes[v->iterator_index].data.rep;
+            assert(ru);
+            assert(rv);
+
+            if (ru == rv)           { ++it; continue; } /* internal to one island: keep as-is */
+            if (ru == u && rv == v) { ++it; continue; } /* neither endpoint batched: keep as-is */
+
+            /* boundary edge: detach the original, add the mapped one (deduplicated) */
+            it = u->successors.erase(it);
+            v->predecessors.erase(std::find(v->predecessors.begin(), v->predecessors.end(), u));
+            if (std::find(ru->successors.begin(), ru->successors.end(), rv) == ru->successors.end())
+                ru->precedes(rv);
+        }
     }
 
     /* Connect each sub-graph's entry/exit to the island's sources/sinks. After

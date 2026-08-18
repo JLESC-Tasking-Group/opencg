@@ -741,7 +741,9 @@ struct command_graph_t
      * Iterators *
      *************/
 
-    template<typename T>
+    struct empty_pls_t {};
+
+    template<typename T = empty_pls_t>
     struct node_iterator_t
     {
         /* the node */
@@ -753,10 +755,10 @@ struct command_graph_t
         node_iterator_t(command_graph_node_t * node) : node(node), data() {}
     };
 
-    template <typename T,
-              bool include_entry_exit = false,
-              command_graph_walk_search_t    search    = COMMAND_GRAPH_WALK_SEARCH_DFS,
-              command_graph_walk_order_t     order     = COMMAND_GRAPH_WALK_ORDER_PRE>
+    template <bool include_entry_exit            = false,
+              typename T                         = empty_pls_t,
+              command_graph_walk_search_t search = COMMAND_GRAPH_WALK_SEARCH_DFS,
+              command_graph_walk_order_t  order  = COMMAND_GRAPH_WALK_ORDER_PRE>
     inline std::vector<node_iterator_t<T>>
     create_node_iterators(const command_graph_node_index_t initial_capacity = 2048)
     {
@@ -769,8 +771,10 @@ struct command_graph_t
             [&] (command_graph_node_t * node)
             {
                 if constexpr (!include_entry_exit)
+                {
                     if (node == this->node_get_entry() || node == this->node_get_exit())
                         return ;
+                }
                 node->iterator_index = vec.size();
                 vec.push_back(node);
             }

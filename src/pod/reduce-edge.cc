@@ -40,10 +40,6 @@
 
 CGIR_NAMESPACE_USE;
 
-/* pass local storage */
-struct pls_t {};
-using node_t = command_graph_t::node_iterator_t<pls_t>;
-
 /* reachability matrix */
 typedef bitset2d_t<uint64_t, command_graph_node_index_t> command_graph_reachability_t;
 
@@ -52,15 +48,14 @@ command_graph_t::pass_reduce_edge(void)
 {
     /* Iterate through all nodes */
     constexpr bool include_entry_exit = true;
-    std::vector<node_t> nodes = this->create_node_iterators<pls_t, include_entry_exit>();
+    auto nodes = this->create_node_iterators<include_entry_exit>();
     const int n = nodes.size();
 
     /* allocate reachability */
     command_graph_reachability_t r(n);
 
     /* compute reachability */
-    this->walk<COMMAND_GRAPH_WALK_SEARCH_DFS,
-               COMMAND_GRAPH_WALK_ORDER_POST>(
+    this->walk<COMMAND_GRAPH_WALK_SEARCH_DFS, COMMAND_GRAPH_WALK_ORDER_POST>(
         [&] (command_graph_node_t * node)
         {
             r.set(node->iterator_index, node->iterator_index);
@@ -71,8 +66,7 @@ command_graph_t::pass_reduce_edge(void)
 
     for (command_graph_node_index_t i = 0 ; i < n ; ++i)
     {
-        node_t & node = nodes[i];
-        command_graph_node_t * u = node.node;
+        command_graph_node_t * u = nodes[i].node;
         assert(u);
 
         # if 0
@@ -95,30 +89,34 @@ command_graph_t::pass_reduce_edge(void)
             command_graph_node_t * v = *itv;
             assert(u != v);
 
-            /* for each successor 'w' of 'u' */
+            bool is_redundant = false;
+
+            /* test if 'v' is reachable from any other successor 'w' of 'u' */
             for (command_graph_node_t * w : u->successors)
             {
-                assert(u != w);
-                if (v == w)
-                    continue ;
+                if (v == w) continue;
 
-                /* test if 'v' is reachable from any other successors 'w' of 'u' */
                 if (r.test(w->iterator_index, v->iterator_index))
                 {
-                    /* remove 'v' from 'u' successors list, because we can reach it from 'w' */
-                    itv = u->successors.erase(itv);
-
-                    /* also remove 'u' from 'v' predecessors list */
-                    assert(std::count(v->predecessors.begin(), v->predecessors.end(), u) == 1);
-                    v->predecessors.erase(std::find(v->predecessors.begin(), v->predecessors.end(), u));
-                    goto skip_increment;
+                    is_redundant = true;
+                    break; /* Stop searching 'w' as soon as reachability is proven */
                 }
             }
 
-            /* process next successors */
-            ++itv;
-skip_increment:
-            ;
+            if (is_redundant)
+            {
+                /* remove 'v' from 'u' successors (erase returns the next valid iterator) */
+                itv = u->successors.erase(itv);
+
+                /* remove 'u' from 'v' predecessors */
+                auto it_pred = std::find(v->predecessors.begin(), v->predecessors.end(), u);
+                if (it_pred != v->predecessors.end())
+                    v->predecessors.erase(it_pred);
+            }
+            else
+            {
+                ++itv;
+            }
         }
     }
 }

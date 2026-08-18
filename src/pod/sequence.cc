@@ -52,27 +52,15 @@ CGIR_NAMESPACE_USE;
  * `is_sequence`. Such a batch is a plain sequence of OpenMP task bodies, which
  * the runtime replays as a single "super" task instead of one task per command
  * (see command_graph_t::is_sequence and xkrt's command_graph_replay_sequence).
- *
- * Detection is a single DFS-order scan: nodes are visited head-before-interior
- * (create_node_iterators walks a forward DFS pre-order from entry), so the first
- * node of a chain that is reached is its head. Starting there, we walk forward
- * across "sequence edges" (the current node has a single successor and that
- * successor has a single predecessor, both same-device and sequence-able) until
- * the chain ends, marking every member `contracted` so the outer scan skips the
- * chain's interior.
- *
- * Materialization is in place: the chain's external boundary is moved onto a
- * fresh top-level BATCH node, and the chain's head/tail are reused as the sub
- * command-graph's entry/exit (no extra empty control nodes), keeping the
- * internal chain edges as-is.
  */
 
 /* per-node pass storage */
-struct pls_t
+struct sequence_pls_t
 {
-    bool contracted = false;   /* already absorbed into a materialized sequence */
+    bool contracted;
+    sequence_pls_t(void) : contracted(false) {}
+    ~sequence_pls_t(void) {}
 };
-using node_t = command_graph_t::node_iterator_t<pls_t>;
 
 /* A node is "sequence-able" (may belong to an OpenMP-task sequence) if it is a
  * control node, or a PROG command whose launch mode is TASK_SPAWN (a recorded
@@ -128,7 +116,7 @@ command_graph_t::pass_sequence(void)
 {
     /* forward DFS pre-order from entry: a chain's head precedes its interior */
     constexpr bool include_entry_exit = true;
-    std::vector<node_t> nodes = this->create_node_iterators<pls_t, include_entry_exit>();
+    auto nodes = this->create_node_iterators<include_entry_exit, sequence_pls_t>();
     const int n = (int) nodes.size();
     if (n <= 2)   /* only entry/exit: nothing to sequence */
         return ;

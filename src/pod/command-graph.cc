@@ -56,10 +56,8 @@ command_graph_dump_interior(
     FILE * f
 ) {
     // Check that there is a unique source and sink
-    struct pls_t {};
-    using node_t = command_graph_t::node_iterator_t<pls_t>;
     constexpr bool include_entry_exit = true;
-    std::vector<node_t> nodes = cg->create_node_iterators<pls_t, include_entry_exit>();
+    auto nodes = cg->create_node_iterators<include_entry_exit>();
     for (command_graph_node_index_t i = 0 ; i < nodes.size() ; ++i)
     {
         command_graph_node_t * node = nodes[i].node;
@@ -143,14 +141,11 @@ command_graph_t::coherence_checks(void)
     assert( exit->successors.size()   == 0);
 
     // Check that there is a unique source and sink
-    struct pls_t {};
-    using node_t = command_graph_t::node_iterator_t<pls_t>;
     constexpr bool include_entry_exit = true;
-    std::vector<node_t> nodes = this->create_node_iterators<pls_t, include_entry_exit>();
+    auto nodes = this->create_node_iterators<include_entry_exit>();
     for (command_graph_node_index_t i = 0 ; i < nodes.size() ; ++i)
     {
-        node_t & node = nodes[i];
-        command_graph_node_t * u = node.node;
+        command_graph_node_t * u = nodes[i].node;
         assert(u);
         assert(u == this->node_get_entry() || u->predecessors.size());
         assert(u == this->node_get_exit()  || u->successors.size());
