@@ -11,6 +11,8 @@ Please open issues at [https://github.com/JLESC-Tasking-Group/cgir/issues](https
 
 We strongly recommend any external contributors to reach-out with the team first ([Contact](#contact)).
 
+The TODO.md file lists pending tasks.
+
 ## Testing
 The repository includes a few minimal [tests](https://github.com/anlsys/XK.jl/blob/main/test/runtests.jl) that can be extended, and run via `julia --project -e 'using Pkg; Pkg.test()'`
 
