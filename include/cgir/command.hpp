@@ -130,7 +130,14 @@ typedef enum   command_prog_function_prototype_t
      * buffer is command_prog_t::args and its size command_prog_t::args_size. Used
      * by JIT'd/fused programs compiled in the packed ABI and by device kernels
      * launched via the CUDA/HIP parameter-buffer form. */
-    CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED
+    CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED,
+
+    /* launcher.nanos6.fn(args_v, dev_v, transl_v) — a fused chain of nanos6
+     * (NODES/OmpSs-2) task outlines (see CGIR_COMMAND_PROG_SOURCE_PROTO_NANOS6_OUTLINE).
+     * The three arguments are arrays of `n_args` pointers (one entry per fused
+     * task instance): the args blocks, device environments/loop bounds, and
+     * translation tables. Produced by the jit pass from an outline chain. */
+    CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_NANOS6
 
 }              command_prog_function_prototype_t;
 
@@ -170,6 +177,13 @@ struct command_prog_t
         struct {
             void (*fn)(void * args, size_t args_size);
         } packed;
+
+        /* Fused chain of nanos6 (NODES/OmpSs-2) task outlines:
+         * fn(args_v, dev_v, transl_v), where each argument is an array of
+         * command_prog_t::n_args pointers (one per fused task instance). */
+        struct {
+            void (*fn)(void ** args_v, void ** dev_v, void ** transl_v);
+        } nanos6;
 
     } launcher;
 

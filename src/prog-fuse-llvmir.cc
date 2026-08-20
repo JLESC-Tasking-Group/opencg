@@ -222,6 +222,19 @@ is_void_ptr_size(const llvm::FunctionType * fty)
            fty->getParamType(1)->isIntegerTy();
 }
 
+/* True iff `fty` is the nanos6 outline shape `void(void*, void*, void*)`: a
+ * void-returning function taking (args block, device env, translation table).
+ * See CGIR_COMMAND_PROG_SOURCE_PROTO_NANOS6_OUTLINE. */
+static bool
+is_void_ptr_ptr_ptr(const llvm::FunctionType * fty)
+{
+    return fty->getReturnType()->isVoidTy() &&
+           fty->getNumParams() == 3 &&
+           fty->getParamType(0)->isPointerTy() &&
+           fty->getParamType(1)->isPointerTy() &&
+           fty->getParamType(2)->isPointerTy();
+}
+
 /**
  *  Return the first externally-linked `void(ptr)` definition in the module.
  *  This is the packed-args entry of a program whose launcher consumes a single
@@ -739,6 +752,10 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     {
         std::string          fused_name;  /* entry name after prefixing */
         bool                 is_wrapper;  /* true if entry is void(void**) */
+        /* true if entry is a nanos6 outline void(void*, void*, void*): fused at
+         * the program level. Each constituent is called with its per-instance
+         * (args, dev, translation); no per-slot args are consumed (no dedup). */
+        bool                 is_outline;
         /* true if entry is a packed self-contained body void(void*, size_t): its
          * arg slots (&value) come from the params table (one per capture), not the
          * IR parameters (which are just the buffer pointer + size). Fusion
@@ -774,6 +791,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
 
         llvm::Function * entry = nullptr;
         bool is_wrapper = false;
+        bool is_outline = false;
         bool is_packed_leaf = false;
         size_t buf_size = 0;
         unsigned arity = 0;
@@ -810,7 +828,21 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
 
             llvm::FunctionType * fty = entry->getFunctionType();
             const command_prog_param_t * params = progs[i]->source.content.llvmir.params;
-            if (is_void_voidptr(fty))
+            if (progs[i]->source.content.llvmir.proto == CGIR_COMMAND_PROG_SOURCE_PROTO_NANOS6_OUTLINE)
+            {
+                /* nanos6 outline void(args, dev, translation): fused at the program
+                 * level (each constituent called with its per-instance pointers),
+                 * so it consumes no per-slot args and needs no value dedup. */
+                if (!is_void_ptr_ptr_ptr(fty))
+                {
+                    fprintf(stderr, "prog-fuse: nanos6 outline program %zu entry '%s' is not "
+                                    "void(void*,void*,void*)\n", i, entry->getName().str().c_str());
+                    abort();
+                }
+                is_outline = true;
+                arity      = 0;
+            }
+            else if (is_void_voidptr(fty))
             {
                 is_wrapper = true;
                 arity      = (unsigned) progs[i]->n_args;
@@ -907,6 +939,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
 
         inputs[i].fused_name     = std::string(prefix) + name;
         inputs[i].is_wrapper     = is_wrapper;
+        inputs[i].is_outline     = is_outline;
         inputs[i].is_packed_leaf = is_packed_leaf;
         inputs[i].buf_size       = buf_size;
         inputs[i].arity          = arity;
@@ -956,6 +989,20 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             {
                 fprintf(stderr, "prog-fuse: cannot mix packed and non-packed task "
                                 "bodies in one fused chain (program %zu)\n", i);
+                abort();
+            }
+
+    /* nanos6 outline fusion is likewise homogeneous: the fused entry has the
+     * 3-array outline ABI, which cannot also express leaf/wrapper inputs. */
+    bool any_outline = false;
+    for (size_t i = 0 ; i < n ; ++i)
+        any_outline |= inputs[i].is_outline;
+    if (any_outline)
+        for (size_t i = 0 ; i < n ; ++i)
+            if (!inputs[i].is_outline)
+            {
+                fprintf(stderr, "prog-fuse: cannot mix nanos6 outline and non-outline "
+                                "task bodies in one fused chain (program %zu)\n", i);
                 abort();
             }
 
@@ -1188,6 +1235,9 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      * never the host void** packed byte-buffer shapes. */
     if (device)
         packed_output = false;
+    /* nanos6 outline fusion has its own 3-array entry (not a packed byte buffer). */
+    if (any_outline)
+        packed_output = false;
 
     std::vector<size_t> slot_offset(total_args, 0);
     size_t packed_size = 0;
@@ -1326,6 +1376,69 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             fprintf(stderr, "prog-fuse: device kernels are not fusible "
                             "(non-SPMD or differing launch configuration)\n");
             abort();
+        }
+    }
+    else if (any_outline)
+    {
+        /* nanos6 outline chain (program-level fusion): build
+         *   void __fused_wrapper(void** args_v, void** dev_v, void** transl_v)
+         * that calls each constituent outline i with its per-instance triple
+         *   (args_v[i], dev_v[i], transl_v[i])
+         * then inlines them so the O3 pipeline can merge the bodies and fuse
+         * loops where dependence analysis proves it legal. No argument dedup:
+         * outlines consume whole per-instance pointers, not per-value slots. */
+        llvm::FunctionType * wfty = llvm::FunctionType::get(
+            void_ty, { ptr_ty, ptr_ty, ptr_ty }, false);
+        llvm::Function * wrapper = llvm::Function::Create(
+            wfty, llvm::GlobalValue::ExternalLinkage, "__fused_wrapper", mod_u.get());
+
+        /* the three arrays are distinct allocations (from each other and from the
+         * task data), so mark them noalias to free the per-instance slot loads. */
+        wrapper->addParamAttr(0, llvm::Attribute::NoAlias);
+        wrapper->addParamAttr(1, llvm::Attribute::NoAlias);
+        wrapper->addParamAttr(2, llvm::Attribute::NoAlias);
+
+        llvm::BasicBlock * bb = llvm::BasicBlock::Create(llvmctx, "entry", wrapper);
+        llvm::IRBuilder<> builder(bb);
+
+        auto load_slot = [&] (llvm::Value * base, size_t idx) -> llvm::Value *
+        {
+            llvm::Value * p = builder.CreateGEP(
+                ptr_ty, base, llvm::ConstantInt::get(i64_ty, idx), "slot");
+            return builder.CreateLoad(ptr_ty, p, "inst");
+        };
+
+        std::vector<llvm::CallInst *> kernel_calls;
+        kernel_calls.reserve(n);
+        for (size_t i = 0 ; i < n ; ++i)
+        {
+            llvm::Function * fn = mod_u->getFunction(inputs[i].fused_name);
+            llvm::Value * a = load_slot(wrapper->getArg(0), i);
+            llvm::Value * d = load_slot(wrapper->getArg(1), i);
+            llvm::Value * t = load_slot(wrapper->getArg(2), i);
+            kernel_calls.push_back(builder.CreateCall(fn->getFunctionType(), fn, { a, d, t }));
+        }
+        builder.CreateRetVoid();
+
+        /* inline the outlines (they are AlwaysInline internal defs) so O3 sees one
+         * body; O3's inliner then pulls in their single-use internal callees. */
+        for (llvm::CallInst * ci : kernel_calls)
+        {
+            llvm::InlineFunctionInfo ifi;
+            llvm::InlineResult ir = llvm::InlineFunction(*ci, ifi);
+            if (!ir.isSuccess())
+            {
+                fprintf(stderr, "prog-fuse: failed to inline a nanos6 outline: %s\n",
+                        ir.getFailureReason());
+                abort();
+            }
+        }
+
+        for (size_t i = 0 ; i < n ; ++i)
+        {
+            llvm::Function * F = mod_u->getFunction(inputs[i].fused_name);
+            if (F && F->use_empty())
+                F->eraseFromParent();
         }
     }
     else
@@ -1655,12 +1768,15 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      * so clear the per-input symbol; device chains must name it so the driver can
      * cuModuleGetFunction the PTX entry. (dst may alias progs[0] whose triple/arch
      * are preserved here, driving the jit pass's PTX codegen.) */
-    dst->source.content.llvmir.symbol = device ? "__fused_wrapper" : nullptr;
-    /* the fused entry is void(void**) (or void(void*,size_t) when packed); it
-     * carries no per-parameter table (a re-fusion detects its shape by signature). */
-    dst->source.content.llvmir.proto        = packed_output
-        ? CGIR_COMMAND_PROG_SOURCE_PROTO_PACKED_BUFFER
-        : CGIR_COMMAND_PROG_SOURCE_PROTO_VOID_PTRPTR;
+    dst->source.content.llvmir.symbol = (device || any_outline) ? "__fused_wrapper" : nullptr;
+    /* the fused entry is void(void**), void(void*,size_t) when packed, or
+     * void(void**,void**,void**) for a nanos6 outline chain; it carries no
+     * per-parameter table (a re-fusion detects its shape by signature). */
+    dst->source.content.llvmir.proto        = any_outline
+        ? CGIR_COMMAND_PROG_SOURCE_PROTO_NANOS6_OUTLINE
+        : (packed_output
+            ? CGIR_COMMAND_PROG_SOURCE_PROTO_PACKED_BUFFER
+            : CGIR_COMMAND_PROG_SOURCE_PROTO_VOID_PTRPTR);
     dst->source.content.llvmir.params       = nullptr;
     dst->source.content.llvmir.param_count  = 0;
     dst->source.content.llvmir._params_owned = false;
@@ -1773,12 +1889,17 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      * JIT-compiled (the `jit` pass fills the launcher fn). It is either a uniform
      * void(void**) VARIADIC program or, under CGIR_PROG_FUSE_PACKED, a
      * void(void*, size_t) PACKED program over the packed byte buffer. */
-    dst->prototype             = packed_output
-        ? CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED
-        : CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC;
+    dst->prototype             = any_outline
+        ? CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_NANOS6
+        : (packed_output
+            ? CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED
+            : CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC);
     dst->launcher.variadic.fn  = nullptr;  /* compiled by the `jit` pass */
     dst->args                  = args_buf;
-    dst->n_args                = n_args;
+    /* For a nanos6 outline chain, n_args is the fused-instance count (the runtime
+     * passes args/dev/translation arrays of this length); the compacted args
+     * buffer is unused by the nanos6 launcher. */
+    dst->n_args                = any_outline ? n : n_args;
     dst->args_size             = packed_output ? packed_size : 0;
     dst->_args_owned           = true;  /* heap (calloc/malloc) — the pass owns it */
 
@@ -2005,8 +2126,13 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
     /* Skip (do not abort) commands whose entry is not externally JIT-resolvable
      * - e.g. a not-yet-externalized internal task body, or a fixed-launcher
      * command that carries a source but is not a JIT target. Leaves the
-     * launcher untouched. */
-    if (entry == nullptr || entry->isDeclaration() || entry->hasLocalLinkage())
+     * launcher untouched. A nanos6 outline is exempt from the local-linkage
+     * check: an unfused (single-instance) outline may be internal in its module
+     * and is JIT'd by wrapping it in an external __fused_wrapper below. */
+    const bool proto_is_nanos6 =
+        (prog->source.content.llvmir.proto == CGIR_COMMAND_PROG_SOURCE_PROTO_NANOS6_OUTLINE);
+    if (entry == nullptr || entry->isDeclaration() ||
+        (entry->hasLocalLinkage() && !proto_is_nanos6))
         return ;
 
     /* Device (GPU) target: compile the (fused) device kernel to PTX for the
@@ -2060,7 +2186,47 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
     llvm::FunctionType * efty = entry->getFunctionType();
     std::string lookup_name;
     const bool entry_is_packed = is_void_ptr_size(efty);
-    if (is_void_voidptr(efty) || entry_is_packed)
+    const bool entry_is_nanos6 = proto_is_nanos6;
+    if (entry_is_nanos6)
+    {
+        /* nanos6 outline chain: the runtime launches it as
+         *   void(void** args_v, void** dev_v, void** transl_v).
+         * A fused chain (>= 2) already exposes that 3-array __fused_wrapper; a
+         * standalone (unfused, single-instance) outline is the raw
+         * void(args, dev, translation) body, so wrap it in a 1-instance
+         * __fused_wrapper here for a uniform launch ABI. Both `void(void**,...)`
+         * and `void(void*,...)` have the same opaque-pointer type, so we
+         * distinguish the fused wrapper by its name. */
+        if (entry->getName() == "__fused_wrapper" && is_void_ptr_ptr_ptr(efty))
+        {
+            lookup_name = entry->getName().str();
+        }
+        else
+        {
+            llvm::LLVMContext & C = mod->getContext();
+            llvm::Type * void_ty = llvm::Type::getVoidTy(C);
+            llvm::Type * ptr_ty  = llvm::PointerType::getUnqual(C);
+            llvm::Type * i64_ty  = llvm::Type::getInt64Ty(C);
+
+            llvm::FunctionType * wfty = llvm::FunctionType::get(
+                void_ty, { ptr_ty, ptr_ty, ptr_ty }, false);
+            llvm::Function * wrapper = llvm::Function::Create(
+                wfty, llvm::GlobalValue::ExternalLinkage, "__fused_wrapper", mod.get());
+            llvm::BasicBlock * bb = llvm::BasicBlock::Create(C, "entry", wrapper);
+            llvm::IRBuilder<> b(bb);
+            auto load0 = [&] (llvm::Value * base) -> llvm::Value *
+            {
+                llvm::Value * p = b.CreateGEP(
+                    ptr_ty, base, llvm::ConstantInt::get(i64_ty, 0), "slot");
+                return b.CreateLoad(ptr_ty, p, "inst");
+            };
+            b.CreateCall(efty, entry,
+                { load0(wrapper->getArg(0)), load0(wrapper->getArg(1)), load0(wrapper->getArg(2)) });
+            b.CreateRetVoid();
+            lookup_name = "__fused_wrapper";
+        }
+    }
+    else if (is_void_voidptr(efty) || entry_is_packed)
     {
         lookup_name = entry->getName().str();
     }
@@ -2190,11 +2356,17 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
     void * fn_addr = reinterpret_cast<void *>(static_cast<uintptr_t>(sym->getValue()));
     jit.release();
 
-    /* Install the compiled function, overwriting any previous value. A packed
-     * entry keeps the PACKED prototype (launched as fn(args, args_size)); anything
-     * else becomes a uniform void(void**) VARIADIC program over prog->args (a
-     * recorded OpenMP task was KMP before this; its kargs stay in prog->args). */
-    if (entry_is_packed)
+    /* Install the compiled function, overwriting any previous value. A nanos6
+     * outline chain launches as fn(args_v, dev_v, transl_v); a packed entry as
+     * fn(args, args_size); anything else as a uniform void(void**) VARIADIC
+     * program over prog->args (a recorded OpenMP task was KMP before this; its
+     * kargs stay in prog->args). */
+    if (entry_is_nanos6)
+    {
+        prog->prototype          = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_NANOS6;
+        prog->launcher.nanos6.fn = reinterpret_cast<void (*)(void **, void **, void **)>(fn_addr);
+    }
+    else if (entry_is_packed)
     {
         /* A STANDALONE packed leaf (never fused) still carries the recorded
          * per-value &value slots (void** args) plus its params table (prog-fuse
