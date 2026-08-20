@@ -109,6 +109,10 @@
 # include <llvm/Transforms/Scalar/SROA.h>
 # include <llvm/Transforms/Scalar/SimplifyCFG.h>
 # include <llvm/Transforms/InstCombine/InstCombine.h>
+/* OpenMP device optimizations (SPMD-ization, state-machine rewrite, runtime-call
+ * folding + DeviceRTL inlining) run before PTX codegen so a JIT'd device kernel
+ * matches the AOT-compiled one instead of keeping the raw frontend IR. */
+# include <llvm/Transforms/IPO/OpenMPOpt.h>
 
 /* In-process JIT (replaces the former Proteus dependency) */
 # include <llvm/ExecutionEngine/Orc/LLJIT.h>
@@ -513,9 +517,17 @@ static void dump_module(const std::string & dir, const char * name, llvm::Module
  * merged module, so the inlined kernels' loops can vectorize/fuse. `dump_dir` is
  * the (possibly empty) CGIR_PROG_FUSE_DUMP directory: when set, the wrapper is
  * dumped after the SROA+noalias cleanup and BEFORE loop-fusion, so the exact IR
- * LoopFuse operates on can be inspected. */
+ * LoopFuse operates on can be inspected.
+ *
+ * `run_o3` controls the final O3 pipeline. Host chains run it here (the host JIT
+ * does no further optimization). DEVICE chains pass run_o3=false: only the
+ * fusion-specific loop work (SROA cleanup + noalias + loop-fuse) happens here,
+ * and the O3 pipeline is deferred to emit_device_ptx (optimize_device_module) so
+ * it runs AFTER the DeviceRTL bitcode is linked -- otherwise O3 cannot inline the
+ * device runtime and the __kmpc_* calls survive into the emitted PTX. */
 static void
-optimize_module(llvm::Module & M, llvm::TargetMachine * tm, const std::string & dump_dir)
+optimize_module(llvm::Module & M, llvm::TargetMachine * tm, const std::string & dump_dir,
+                bool run_o3 = true)
 {
     llvm::PassBuilder PB(tm);
 
@@ -594,8 +606,11 @@ optimize_module(llvm::Module & M, llvm::TargetMachine * tm, const std::string & 
         MPM2.run(M, MAM);
     }
 
-    llvm::ModulePassManager MPM = PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3);
-    MPM.run(M, MAM);
+    if (run_o3)
+    {
+        llvm::ModulePassManager MPM = PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3);
+        MPM.run(M, MAM);
+    }
 }
 
 /* ------------------------------------------------------------------------- *
@@ -1612,9 +1627,16 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
 
     /* ------------------------------------------------------------------ *
      * 8. Optimize (inline the kernels into the wrapper, vectorize, fuse).  *
+     *                                                                      *
+     * Device chains defer the O3 pipeline to the jit pass                  *
+     * (optimize_device_module in emit_device_ptx): it must run AFTER the    *
+     * DeviceRTL is linked (done there), otherwise O3 cannot inline the      *
+     * device runtime. Here we only run the fusion-specific loop work so the *
+     * constituent kernels' loops are fused before that later O3 vectorizes  *
+     * them. Host chains run the full pipeline here (no later optimization). *
      * ------------------------------------------------------------------ */
     if (tm)
-        optimize_module(*mod_u, tm.get(), dump_dir);
+        optimize_module(*mod_u, tm.get(), dump_dir, /* run_o3 = */ !device);
 
     /* dump the final fused/optimized module */
     if (dump)
@@ -1901,6 +1923,52 @@ link_device_runtime(llvm::Module & M, const char * bc_path, std::string & err)
     return true;
 }
 
+/* Optimize a device (GPU) module the way clang's offload backend does, BEFORE PTX
+ * codegen. The device IR forwarded by the frontend is a raw pre-optimization
+ * snapshot (serializeClosureToBitcode, OptimizeClone=false): generic runtime use,
+ * un-inlined __kmpc_* calls, no vectorization. Emitting PTX straight from it (the
+ * former behavior) yields a kernel that runs several times slower than the AOT
+ * kernel the non-JIT path launches. So run:
+ *   1. OpenMPOpt in the post-link phase (SPMD-ization, custom state-machine
+ *      rewrite, omp_target_* attribute folding) -- the OpenMP-specific transforms
+ *      the offload backend applies at link time; and
+ *   2. the standard O3 pipeline, which inlines the just-linked DeviceRTL, folds
+ *      the remaining runtime calls, and vectorizes the loops.
+ * MUST be called AFTER the DeviceRTL bitcode is linked into `M` (so the inliner
+ * can absorb it). `tm` is the device TargetMachine (nvptx) so TTI/cost modeling
+ * matches the emitted target. */
+static void
+optimize_device_module(llvm::Module & M, llvm::TargetMachine * tm)
+{
+    /* OpenMPOpt is a no-op unless the module is flagged as an OpenMP device module
+     * (omp::containsOpenMP / omp::isOpenMPDevice test exactly these flags). The
+     * frontend snapshot carries them and CloneModule preserves them, but set them
+     * defensively so the OpenMP-specific transforms always fire. The value is only
+     * tested for presence, not magnitude. */
+    if (!M.getModuleFlag("openmp"))
+        M.addModuleFlag(llvm::Module::Max, "openmp", 51);
+    if (!M.getModuleFlag("openmp-device"))
+        M.addModuleFlag(llvm::Module::Max, "openmp-device", 51);
+
+    llvm::PassBuilder PB(tm);
+
+    llvm::LoopAnalysisManager     LAM;
+    llvm::FunctionAnalysisManager FAM;
+    llvm::CGSCCAnalysisManager    CGAM;
+    llvm::ModuleAnalysisManager   MAM;
+
+    PB.registerModuleAnalyses(MAM);
+    PB.registerCGSCCAnalyses(CGAM);
+    PB.registerFunctionAnalyses(FAM);
+    PB.registerLoopAnalyses(LAM);
+    PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+    llvm::ModulePassManager MPM;
+    MPM.addPass(llvm::OpenMPOptPass(llvm::ThinOrFullLTOPhase::FullLTOPostLink));
+    MPM.addPass(PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3));
+    MPM.run(M, MAM);
+}
+
 /* Emit PTX for a device (GPU) module: build a device TargetMachine for `triple`
  * (e.g. "nvptx64-nvidia-cuda") + `arch` (target-cpu, e.g. "sm_80"), stamp the
  * module's triple/DataLayout, and run codegen to a PTX assembly string. Returns
@@ -1937,6 +2005,11 @@ emit_device_ptx(llvm::Module & M, const char * triple, const char * arch,
         if (!link_device_runtime(M, rtl_bc, err))
             return {};
     }
+
+    /* Optimize the (now DeviceRTL-linked) module to AOT quality before codegen:
+     * OpenMPOpt (post-link) + O3, inlining the runtime and vectorizing. Without
+     * this the raw frontend snapshot is emitted as-is and the kernel is slow. */
+    optimize_device_module(M, TM.get());
 
     llvm::SmallString<0> out;
     llvm::raw_svector_ostream os(out);
