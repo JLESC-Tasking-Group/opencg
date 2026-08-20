@@ -113,6 +113,10 @@
  * folding + DeviceRTL inlining) run before PTX codegen so a JIT'd device kernel
  * matches the AOT-compiled one instead of keeping the raw frontend IR. */
 # include <llvm/Transforms/IPO/OpenMPOpt.h>
+/* LTO-style internalization: after linking the DeviceRTL, internalize everything
+ * except the kernel entries so its weak config globals (__omp_rtl_debug_kind = 0,
+ * ...) become foldable and the unused runtime can be DCE'd. */
+# include <llvm/Transforms/IPO/Internalize.h>
 
 /* In-process JIT (replaces the former Proteus dependency) */
 # include <llvm/ExecutionEngine/Orc/LLJIT.h>
@@ -2129,6 +2133,27 @@ optimize_device_module_o3(llvm::Module & M, llvm::TargetMachine * tm)
      * relies on isOpenMPDevice(M) to force-inline the linked DeviceRTL so the
      * kernel-environment config folds; keep it robust to linking side-effects. */
     prepare_device_module_for_openmp(M);
+
+    /* LTO-style internalization (matches the AOT offload backend). The DeviceRTL
+     * is linked as weak/hidden definitions, so:
+     *  - its config globals (@__omp_rtl_debug_kind = 0, @__omp_rtl_assume_*) are
+     *    'weak' and thus NOT constant-foldable, leaving the runtime's debug/assert
+     *    machinery (loads + guard branches + ICV/team-state checks) live in every
+     *    kernel -- per-launch overhead the AOT (release) kernel does not have; and
+     *  - unused runtime functions keep external linkage, so globalDCE cannot drop
+     *    them (the ~MB of dead __kmpc_* code that bloats the PTX / slows the load).
+     * Internalizing everything except the GPU kernel entry points turns those
+     * globals into 'internal' constants (O3 folds __omp_rtl_debug_kind == 0, so the
+     * asserts fold away) and lets globalDCE remove the now-unused runtime.
+     * llvm.used members (e.g. @__omp_rtl_device_environment) are auto-preserved. */
+    llvm::internalizeModule(M, [] (const llvm::GlobalValue & GV) -> bool {
+        /* preserve GPU kernel entries: the driver resolves them by name via
+         * cuModuleGetFunction, so they must keep external linkage. */
+        if (const auto * F = llvm::dyn_cast<llvm::Function>(&GV))
+            return F->hasKernelCallingConv();
+        return false;
+    });
+
     run_module_passes(M, tm, [] (llvm::PassBuilder & PB, llvm::ModulePassManager & MPM) {
         MPM.addPass(PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3));
     });
