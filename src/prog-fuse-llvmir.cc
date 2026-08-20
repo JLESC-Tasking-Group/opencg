@@ -1940,15 +1940,26 @@ link_device_runtime(llvm::Module & M, const char * bc_path, std::string & err)
 static void
 optimize_device_module(llvm::Module & M, llvm::TargetMachine * tm)
 {
-    /* OpenMPOpt is a no-op unless the module is flagged as an OpenMP device module
-     * (omp::containsOpenMP / omp::isOpenMPDevice test exactly these flags). The
-     * frontend snapshot carries them and CloneModule preserves them, but set them
-     * defensively so the OpenMP-specific transforms always fire. The value is only
-     * tested for presence, not magnitude. */
+    /* The frontend serializes this snapshot mid-CodeGen (emitTargetKernelSourceIR),
+     * BEFORE finalization adds the markers OpenMPOpt keys on. Reconstruct them:
+     *
+     *  - Module flags "openmp"/"openmp-device": added in CodeGenModule::Release().
+     *    Without them OpenMPOpt early-exits (omp::containsOpenMP / isOpenMPDevice),
+     *    so nothing -- including removeRuntimeSymbols -- runs.
+     *  - The "kernel" fn attribute on each device kernel: added later in
+     *    createOffloadEntry (OMPIRBuilder). getDeviceKernels() = kernel-CC +
+     *    "kernel" attr; without it the entry is NOT in the kernel set, so OpenMPOpt
+     *    (a) will not preserve it -- it becomes an internalization + globalDCE
+     *    candidate and the kernel is deleted -- and (b) skips its kernel-specific
+     *    transforms. Re-add it for every kernel-CC definition (matches AOT).
+     * The flag value is only tested for presence, not magnitude. */
     if (!M.getModuleFlag("openmp"))
         M.addModuleFlag(llvm::Module::Max, "openmp", 51);
     if (!M.getModuleFlag("openmp-device"))
         M.addModuleFlag(llvm::Module::Max, "openmp-device", 51);
+    for (llvm::Function & F : M)
+        if (F.hasKernelCallingConv() && !F.isDeclaration() && !F.hasFnAttribute("kernel"))
+            F.addFnAttr("kernel");
 
     llvm::PassBuilder PB(tm);
 
