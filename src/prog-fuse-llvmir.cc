@@ -2159,6 +2159,36 @@ optimize_device_module_o3(llvm::Module & M, llvm::TargetMachine * tm)
     });
 }
 
+/* Optimize a JIT'd HOST task/program module before codegen (the host analogue of
+ * optimize_device_module_o3). Two purposes:
+ *  1. The forwarded closure is a pre-optimization frontend snapshot, so a
+ *     standalone (unfused) host task would otherwise be emitted unoptimized --
+ *     buildPerModuleDefaultPipeline(O3) inlines + optimizes it (fused host chains
+ *     already get O3 via prog-fuse's optimize_module).
+ *  2. Inline callees the closure keeps only for inlining arrive as
+ *     'available_externally' (e.g. an OpenMP `declare target` inline SQRT). LLVM
+ *     codegen DROPS available_externally bodies -> they become unresolved externals
+ *     and, being inline, are in no dynamic symbol table, so the ORC process-symbol
+ *     generator cannot find them. Promoting them to internal forces emission (O3
+ *     then inlines the small ones and DCEs the rest).
+ * Externalized globals (mutable app globals the JIT binds by address via the
+ * externs table) are external DECLARATIONS, not available_externally, so they are
+ * left untouched. `tm` is the host TargetMachine (for TTI/cost modeling). */
+static void
+optimize_host_module(llvm::Module & M, llvm::TargetMachine * tm)
+{
+    for (llvm::Function & F : M)
+        if (F.hasAvailableExternallyLinkage() && !F.isDeclaration())
+            F.setLinkage(llvm::GlobalValue::InternalLinkage);
+    for (llvm::GlobalVariable & G : M.globals())
+        if (G.hasAvailableExternallyLinkage() && G.hasInitializer())
+            G.setLinkage(llvm::GlobalValue::InternalLinkage);
+
+    run_module_passes(M, tm, [] (llvm::PassBuilder & PB, llvm::ModulePassManager & MPM) {
+        MPM.addPass(PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3));
+    });
+}
+
 /* Emit PTX for a device (GPU) module: build a device TargetMachine for `triple`
  * (e.g. "nvptx64-nvidia-cuda") + `arch` (target-cpu, e.g. "sm_80"), stamp the
  * module's triple/DataLayout, and run codegen to a PTX assembly string. Returns
@@ -2417,11 +2447,8 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
      * the module (flag) and the JIT target machine so codegen honors it. */
     mod->setCodeModel(llvm::CodeModel::Large);
 
-    /* dump the final IR handed to the JIT (with wrapper synthesis, if any) */
-    if (dump)
-        dump_module(dump_dir, "final.ll", *mod);
-
-    /* JIT-compile in-process (large code model, see above) */
+    /* JIT-compile in-process (large code model, see above). The target machine
+     * also drives the optimization pipeline below. */
     auto jtmb = llvm::orc::JITTargetMachineBuilder::detectHost();
     if (!jtmb)
     {
@@ -2430,6 +2457,25 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
         abort();
     }
     jtmb->setCodeModel(llvm::CodeModel::Large);
+
+    /* Optimize the host closure BEFORE codegen (the forwarded closure is a
+     * pre-optimization frontend snapshot; also promotes+inlines available_externally
+     * inline callees that codegen would otherwise drop -- see optimize_host_module).
+     * createTargetMachine() only reads jtmb's config, so jtmb stays usable below. */
+    {
+        auto otm = jtmb->createTargetMachine();
+        if (!otm)
+        {
+            llvm::logAllUnhandledErrors(otm.takeError(), llvm::errs(), "jit: ");
+            fprintf(stderr, "jit: failed to create host target machine for optimization\n");
+            abort();
+        }
+        optimize_host_module(*mod, otm->get());
+    }
+
+    /* dump the final IR handed to the JIT (post wrapper synthesis + optimization) */
+    if (dump)
+        dump_module(dump_dir, "final.ll", *mod);
 
     auto jit_exp = llvm::orc::LLJITBuilder()
         .setJITTargetMachineBuilder(std::move(*jtmb))
