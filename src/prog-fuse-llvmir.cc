@@ -1990,43 +1990,42 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
 }
 
 # if CGIR_SUPPORT_LLVM
-/* Link the OpenMP device runtime (DeviceRTL) bitcode at `bc_path` into `M` so the
- * device-runtime externs the kernel references (e.g. __kmpc_target_init) become
- * defined. Without this the CUDA driver cannot JIT the emitted PTX -- ptxas fails
- * on the unresolved externs (CUDA_ERROR_INVALID_PTX / 218). Only the referenced
- * symbols and their transitive dependencies are imported (LinkOnlyNeeded), so the
- * rest of the (large) runtime is not pulled in. Returns false + sets `err`. */
+/* Link the device bitcode at `bc_path` into `M` so the externs the kernel
+ * references (e.g. __kmpc_target_init, __nv_cbrt) become defined. Without this the
+ * CUDA driver cannot JIT the emitted PTX -- ptxas fails on the unresolved externs.
+ * Only referenced symbols and their transitive deps are imported (LinkOnlyNeeded),
+ * so the rest of the (large) library is not pulled in. Returns false + sets `err`. */
 static bool
-link_device_runtime(llvm::Module & M, const char * bc_path, std::string & err)
+link_device_bitcode(llvm::Module & M, const char * bc_path, std::string & err)
 {
     llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buf =
         llvm::MemoryBuffer::getFile(bc_path);
     if (!buf)
     {
-        err = "cannot read CGIR_DEVICE_RTL_BC '" + std::string(bc_path) + "': " +
+        err = "cannot read device bitcode '" + std::string(bc_path) + "': " +
               buf.getError().message();
         return false;
     }
 
     llvm::SMDiagnostic diag;
-    std::unique_ptr<llvm::Module> rtl =
+    std::unique_ptr<llvm::Module> lib =
         llvm::parseIR((*buf)->getMemBufferRef(), diag, M.getContext());
-    if (!rtl)
+    if (!lib)
     {
-        err = "parse DeviceRTL bitcode '" + std::string(bc_path) + "' failed: " +
+        err = "parse device bitcode '" + std::string(bc_path) + "' failed: " +
               diag.getMessage().str();
         return false;
     }
 
     /* Align triple/DataLayout with the destination so the linker does not refuse
-     * on a mismatch (the RTL is already nvptx64, same as M). */
-    rtl->setTargetTriple(M.getTargetTriple());
-    rtl->setDataLayout(M.getDataLayout());
+     * on a mismatch (the library is already nvptx64, same as M). */
+    lib->setTargetTriple(M.getTargetTriple());
+    lib->setDataLayout(M.getDataLayout());
 
     llvm::Linker linker(M);
-    if (linker.linkInModule(std::move(rtl), llvm::Linker::Flags::LinkOnlyNeeded))
+    if (linker.linkInModule(std::move(lib), llvm::Linker::Flags::LinkOnlyNeeded))
     {
-        err = "linking DeviceRTL bitcode '" + std::string(bc_path) + "' failed";
+        err = "linking device bitcode '" + std::string(bc_path) + "' failed";
         return false;
     }
     return true;
@@ -2144,7 +2143,8 @@ optimize_host_module(llvm::Module & M, llvm::TargetMachine * tm)
  * to SASS at cuModuleLoadData (see the xkrt driver). */
 static std::string
 emit_device_ptx(llvm::Module & M, const char * triple, const char * arch,
-                const char * runtime_bc, const std::string & dump_dir, std::string & err)
+                const char * const * libs, size_t nlibs,
+                const std::string & dump_dir, std::string & err)
 {
     llvm::Triple TT(triple);
     std::string terr;
@@ -2163,16 +2163,15 @@ emit_device_ptx(llvm::Module & M, const char * triple, const char * arch,
     /* 1. Pre-link: SPMD-ize the generic-mode snapshot (must precede the link). */
     spmdize_device_module(M, TM.get());
 
-    /* 2. Link the device runtime the kernel references (runtime_bc, overridable by
-     * CGIR_DEVICE_RTL_BC), so ptxas can JIT the PTX at cuModuleLoadData. */
-    const char * rtl_bc = getenv("CGIR_DEVICE_RTL_BC");
-    if (!rtl_bc || !rtl_bc[0])
-        rtl_bc = runtime_bc;
-    if (rtl_bc && rtl_bc[0])
-    {
-        if (!link_device_runtime(M, rtl_bc, err))
+    /* 2. Link the device bitcode libraries the kernel references (in order, so a
+     * later library can resolve externs of an earlier one), so ptxas can JIT the
+     * PTX at cuModuleLoadData. CGIR_DEVICE_EXTRA_BC adds one more for debugging. */
+    for (size_t i = 0 ; i < nlibs ; ++i)
+        if (libs[i] && libs[i][0] && !link_device_bitcode(M, libs[i], err))
             return {};
-    }
+    if (const char * extra = getenv("CGIR_DEVICE_EXTRA_BC"); extra && extra[0])
+        if (!link_device_bitcode(M, extra, err))
+            return {};
 
     /* 3. Post-link: O3 to AOT quality (inline runtime, fold config, DCE, vectorize). */
     optimize_device_module_o3(M, TM.get());
@@ -2266,7 +2265,8 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
         std::string perr;
         std::string ptx = emit_device_ptx(*mod, dtriple,
                                            prog->source.content.llvmir.arch,
-                                           prog->source.content.llvmir.runtime_bc,
+                                           prog->source.content.llvmir.device_libs,
+                                           prog->source.content.llvmir.device_libs_count,
                                            dump ? dump_dir : std::string(), perr);
         if (ptx.empty())
         {

@@ -182,12 +182,13 @@ typedef struct  cgir_command_prog_source_t
             const char * triple;
             const char * arch;
 
-            /* Optional extra bitcode module linked into the device program before
-             * codegen (see emit_device_ptx). Resolves externs `raw` references but
-             * does not define -- e.g. a device runtime library. CGIR is agnostic to
-             * its contents; the producer (which knows the toolchain layout) supplies
-             * the path. NULL => nothing extra to link. Non-owning (stable string). */
-            const char * runtime_bc;
+            /* Extra bitcode modules linked into the device program before codegen
+             * (see emit_device_ptx), in order: they define externs `raw` references
+             * -- e.g. a device runtime and a math library. CGIR is agnostic to their
+             * contents; the producer (which knows the toolchain layout) supplies the
+             * paths. NULL/0 => nothing extra to link. Non-owning (stable array/strings). */
+            const char * const * device_libs;
+            size_t               device_libs_count;
 
             /* prototype (ABI) of the entry function within `raw` (see enum). */
             cgir_command_prog_source_proto_t proto;

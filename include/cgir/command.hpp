@@ -315,7 +315,8 @@ struct command_t
             prog.source.content.llvmir._externs_owned = false;
             prog.source.content.llvmir.triple         = nullptr;
             prog.source.content.llvmir.arch           = nullptr;
-            prog.source.content.llvmir.runtime_bc     = nullptr;
+            prog.source.content.llvmir.device_libs       = nullptr;
+            prog.source.content.llvmir.device_libs_count = 0;
             prog.source.content.llvmir.proto          = CGIR_COMMAND_PROG_SOURCE_PROTO_UNPACKED_PARAMS;
             prog.source.content.llvmir.params         = nullptr;
             prog.source.content.llvmir.param_count    = 0;
