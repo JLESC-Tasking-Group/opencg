@@ -2222,17 +2222,21 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
     if (dump)
         dump_module(dump_dir, "input.ll", *mod);
 
-    /* Resolve the entry function: prefer the explicit symbol (e.g. a device
-     * kernel sub-module with several definitions); else a fused program exposes
-     * __fused_wrapper(void**); else the first externally-linked definition (the
-     * task/kernel entry externalized for JIT); else the first void definition. */
+    /* Resolve the entry function, each step a fallback for the previous: the
+     * explicit symbol (host tasks and device kernels name their closure entry);
+     * else a fused program's __fused_wrapper(void**); else the first externally-
+     * linked definition (the task/kernel entry externalized for JIT); else the
+     * first void definition. Falling through when a named symbol is absent keeps
+     * a stale/wrong name from silently skipping the command. */
     llvm::Function * entry = nullptr;
     if (const char * sym = prog->source.content.llvmir.symbol)
         entry = mod->getFunction(sym);
-    else if (llvm::Function * w = mod->getFunction("__fused_wrapper"); w && !w->isDeclaration())
-        entry = w;
-    else
+    if (entry == nullptr || entry->isDeclaration())
+        if (llvm::Function * w = mod->getFunction("__fused_wrapper"); w && !w->isDeclaration())
+            entry = w;
+    if (entry == nullptr || entry->isDeclaration())
     {
+        entry = nullptr;
         for (llvm::Function & F : *mod)
             if (!F.isDeclaration() && F.hasExternalLinkage())
             {
