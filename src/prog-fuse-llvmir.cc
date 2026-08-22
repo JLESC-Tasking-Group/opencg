@@ -109,14 +109,8 @@
 # include <llvm/Transforms/Scalar/SROA.h>
 # include <llvm/Transforms/Scalar/SimplifyCFG.h>
 # include <llvm/Transforms/InstCombine/InstCombine.h>
-/* OpenMP device optimizations (SPMD-ization, state-machine rewrite, runtime-call
- * folding + DeviceRTL inlining) run before PTX codegen so a JIT'd device kernel
- * matches the AOT-compiled one instead of keeping the raw frontend IR. */
-# include <llvm/Transforms/IPO/OpenMPOpt.h>
-/* LTO-style internalization: after linking the DeviceRTL, internalize everything
- * except the kernel entries so its weak config globals (__omp_rtl_debug_kind = 0,
- * ...) become foldable and the unused runtime can be DCE'd. */
-# include <llvm/Transforms/IPO/Internalize.h>
+# include <llvm/Transforms/IPO/OpenMPOpt.h>    /* device SPMD-ization before PTX codegen */
+# include <llvm/Transforms/IPO/Internalize.h> /* LTO-style internalize before O3 */
 
 /* In-process JIT (replaces the former Proteus dependency) */
 # include <llvm/ExecutionEngine/Orc/LLJIT.h>
@@ -536,12 +530,9 @@ static void dump_module(const std::string & dir, const char * name, llvm::Module
  * dumped after the SROA+noalias cleanup and BEFORE loop-fusion, so the exact IR
  * LoopFuse operates on can be inspected.
  *
- * `run_o3` controls the final O3 pipeline. Host chains run it here (the host JIT
- * does no further optimization). DEVICE chains pass run_o3=false: only the
- * fusion-specific loop work (SROA cleanup + noalias + loop-fuse) happens here,
- * and the O3 pipeline is deferred to emit_device_ptx (optimize_device_module_o3),
- * which runs AFTER the DeviceRTL bitcode is linked -- otherwise O3 cannot inline
- * the device runtime and the __kmpc_* calls survive into the emitted PTX. */
+ * `run_o3`: host chains run the final O3 here; DEVICE chains pass false and keep
+ * only the fusion-specific loop work, deferring O3 to emit_device_ptx (which runs
+ * after the DeviceRTL is linked, so O3 can inline the runtime). */
 static void
 optimize_module(llvm::Module & M, llvm::TargetMachine * tm, const std::string & dump_dir,
                 bool run_o3 = true)
@@ -1742,16 +1733,9 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     if (dump)
         dump_module(dump_dir, "merged.ll", *mod_u);
 
-    /* ------------------------------------------------------------------ *
-     * 8. Optimize (inline the kernels into the wrapper, vectorize, fuse).  *
-     *                                                                      *
-     * Device chains defer the O3 pipeline to the jit pass                  *
-     * (optimize_device_module_o3 in emit_device_ptx): it must run AFTER the *
-     * DeviceRTL is linked (done there), otherwise O3 cannot inline the      *
-     * device runtime. Here we only run the fusion-specific loop work so the *
-     * constituent kernels' loops are fused before that later O3 vectorizes  *
-     * them. Host chains run the full pipeline here (no later optimization). *
-     * ------------------------------------------------------------------ */
+    /* 8. Optimize (inline the kernels into the wrapper, vectorize, fuse). Device
+     * chains defer the final O3 to emit_device_ptx (post DeviceRTL link); host
+     * chains run the full pipeline here. */
     if (tm)
         optimize_module(*mod_u, tm.get(), dump_dir, /* run_o3 = */ !device);
 
