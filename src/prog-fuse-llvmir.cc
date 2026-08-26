@@ -94,6 +94,11 @@
 # include <llvm/Target/TargetMachine.h>
 # include <llvm/TargetParser/Host.h>
 # include <llvm/TargetParser/Triple.h>
+# include <llvm/Config/llvm-config.h>      /* LLVM_VERSION_STRING (disk cache salt) */
+
+/* Lazy device-bitcode materialization (libdevice/DeviceRTL): parse only the
+ * referenced functions instead of the whole (large) library. */
+# include <llvm/Bitcode/BitcodeReader.h>
 
 /* Optimization pipeline (inline + loop-fuse + vectorize) run on the fused
  * module before JIT, so noalias/dedup actually translate into fused loops. */
@@ -144,6 +149,8 @@
 # include <utility>
 # include <vector>
 
+# include <unistd.h>   /* getpid (atomic temp-file names for the on-disk cache) */
+
 # endif /* CGIR_SUPPORT_LLVM */
 
 CGIR_NAMESPACE_USE;
@@ -169,10 +176,10 @@ struct jit_profiler_t
     std::unordered_map<std::string, double>   phase_secs;    // bucket -> seconds
     std::unordered_map<std::string, uint64_t> phase_calls;   // bucket -> count
 
-    // per-body content hashes, split [0]=host [1]=device, for would-be-hit count
-    std::unordered_map<uint64_t, uint32_t>    body_seen[2];
-    uint64_t                                  body_calls[2] = {0, 0};
-    uint64_t                                  body_bytes[2] = {0, 0};
+    // real cache outcomes, split [0]=host [1]=device
+    uint64_t                                  compiled[2] = {0, 0};  // full compiles (misses)
+    uint64_t                                  disk_reuse[2] = {0, 0}; // loaded from on-disk cache
+    uint64_t                                  mem_reuse[2] = {0, 0};  // reused in-process artifact
 
     jit_profiler_t()
     {
@@ -189,13 +196,14 @@ struct jit_profiler_t
         phase_calls[name] += 1;
     }
 
-    void add_body(bool device, uint64_t hash, size_t bytes)
+    // outcome: 0 = full compile, 1 = disk reuse, 2 = in-process reuse
+    void cache_event(bool device, int outcome)
     {
         std::lock_guard<std::mutex> lk(mtx);
         const int d = device ? 1 : 0;
-        body_seen[d][hash] += 1;
-        body_calls[d]      += 1;
-        body_bytes[d]      += (uint64_t) bytes;
+        if      (outcome == 0) compiled[d]++;
+        else if (outcome == 1) disk_reuse[d]++;
+        else                   mem_reuse[d]++;
     }
 
     ~jit_profiler_t()
@@ -212,23 +220,20 @@ struct jit_profiler_t
                         p.first.c_str(), (unsigned long long) phase_calls[p.first], p.second);
             fprintf(stderr, "[cgir jit timing] (buckets nest: e.g. jit-total covers the rest)\n");
         }
-        if (stats_on && (body_calls[0] || body_calls[1]))
+        if (stats_on)
         {
             for (int d = 0 ; d < 2 ; ++d)
             {
-                if (!body_calls[d])
+                const uint64_t total = compiled[d] + disk_reuse[d] + mem_reuse[d];
+                if (!total)
                     continue ;
-                const uint64_t calls    = body_calls[d];
-                const uint64_t distinct = (uint64_t) body_seen[d].size();
-                const uint64_t hits     = calls - distinct;
                 fprintf(stderr,
-                    "[cgir jit cache-stats] %-6s: %llu bodies, %llu distinct, "
-                    "%llu redundant (%.1f%% reused unless CGIR_JIT_CACHE=0), %llu IR bytes\n",
+                    "[cgir jit cache-stats] %-6s: %llu total, %llu compiled, "
+                    "%llu disk-reuse, %llu mem-reuse (%.1f%% reused)\n",
                     d ? "device" : "host",
-                    (unsigned long long) calls, (unsigned long long) distinct,
-                    (unsigned long long) hits,
-                    100.0 * (double) hits / (double) calls,
-                    (unsigned long long) body_bytes[d]);
+                    (unsigned long long) total, (unsigned long long) compiled[d],
+                    (unsigned long long) disk_reuse[d], (unsigned long long) mem_reuse[d],
+                    100.0 * (double) (disk_reuse[d] + mem_reuse[d]) / (double) total);
             }
         }
     }
@@ -283,12 +288,66 @@ jit_fnv1a(const void * data, size_t n)
     return jit_fnv1a_seed(1469598103934665603ULL, data, n);
 }
 
-/* Content key for the in-process JIT result cache: every byte/attribute a cached
- * artifact depends on. Two task instances of the same construct share the same IR
- * pointer, externs, proto and symbol, so they collide here (the intended reuse).
- * Anything a recompile would fold in (constant-propagated or not) is part of the
- * IR bytes, so a hit is always byte-identical to recompiling -- caching never
- * changes generated code, it only skips reproducing it. */
+/* Salt folded into every disk key so an incompatible toolchain/codegen change
+ * never reads a stale artifact: LLVM version + this TU's build timestamp (so any
+ * rebuild of the cgir JIT codegen auto-invalidates the on-disk cache) + a manual
+ * format version. Computed once. (clang task-IR changes alter the hashed IR bytes,
+ * so they invalidate on their own.) */
+static uint64_t
+jit_static_salt(void)
+{
+    static const int      CGIR_JIT_CACHE_FORMAT = 1;          // bump to force-invalidate
+    static const char     build_id[] = __DATE__ " " __TIME__; // cgir codegen rebuild
+    static const uint64_t s = jit_fnv1a_seed(
+        jit_fnv1a_seed(
+            jit_fnv1a(LLVM_VERSION_STRING, strlen(LLVM_VERSION_STRING)),
+            build_id, sizeof(build_id)),
+        &CGIR_JIT_CACHE_FORMAT, sizeof(CGIR_JIT_CACHE_FORMAT));
+    return s;
+}
+
+/* Host codegen depends on the host CPU; a cached object is only valid on a
+ * matching CPU. Computed once. */
+static uint64_t
+jit_host_salt(void)
+{
+    static const uint64_t s = [] {
+        const std::string cpu = llvm::sys::getHostCPUName().str();
+        return jit_fnv1a_seed(jit_static_salt(), cpu.data(), cpu.size());
+    }();
+    return s;
+}
+
+/* Device PTX depends on the linked device libraries (DeviceRTL/libdevice); fold
+ * each lib's identity (path + size + mtime) into the key. Stat is cached per path. */
+static uint64_t
+jit_device_lib_salt(const char * path)
+{
+    static std::mutex m;
+    static std::unordered_map<std::string, uint64_t> cache;
+    std::lock_guard<std::mutex> lk(m);
+    auto it = cache.find(path);
+    if (it != cache.end()) return it->second;
+    uint64_t h = jit_fnv1a(path, strlen(path));
+    llvm::sys::fs::file_status st;
+    if (!llvm::sys::fs::status(path, st))
+    {
+        const uint64_t sz = st.getSize();
+        const auto     mt = st.getLastModificationTime().time_since_epoch().count();
+        h = jit_fnv1a_seed(h, &sz, sizeof(sz));
+        h = jit_fnv1a_seed(h, &mt, sizeof(mt));
+    }
+    cache[path] = h;
+    return h;
+}
+
+/* Content key for the JIT result cache: every byte/attribute a cached artifact
+ * depends on. Two task instances of the same construct share the same IR bytes,
+ * externs, proto and symbol, so they collide here (the intended reuse). Anything a
+ * recompile would fold in (constant-propagated or not) is part of the IR bytes, so
+ * a hit is byte-identical to recompiling -- caching never changes generated code.
+ * The salt (LLVM/format version, host CPU, device-lib identity) makes disk keys
+ * self-invalidating across incompatible toolchains. */
 static uint64_t
 jit_cache_key(const command_prog_t * prog)
 {
@@ -304,31 +363,94 @@ jit_cache_key(const command_prog_t * prog)
             h = jit_fnv1a_seed(h, L.externs[i].name, strlen(L.externs[i].name) + 1);
         h = jit_fnv1a_seed(h, &L.externs[i].addr, sizeof(L.externs[i].addr));
     }
+    if (L.triple)   // device: fold device-lib identity + static salt
+    {
+        for (size_t i = 0 ; L.device_libs && i < L.device_libs_count ; ++i)
+            if (L.device_libs[i] && L.device_libs[i][0])
+            {
+                const uint64_t d = jit_device_lib_salt(L.device_libs[i]);
+                h = jit_fnv1a_seed(h, &d, sizeof(d));
+            }
+        const uint64_t s = jit_static_salt();
+        h = jit_fnv1a_seed(h, &s, sizeof(s));
+    }
+    else            // host: fold host-CPU salt
+    {
+        const uint64_t s = jit_host_salt();
+        h = jit_fnv1a_seed(h, &s, sizeof(s));
+    }
     return h;
 }
 
-/* Process-global in-process JIT result cache (Phase 1). Host: the compiled
- * function pointer + prototype (the code stays mapped for the process via the
- * leaked LLJIT). Device: the emitted PTX. A hit reuses the artifact and skips
- * parse/optimize/codegen (host) or the whole spmdize/link/O3/emit pipeline
- * (device) for every further instance of the same construct. Disable with
- * CGIR_JIT_CACHE=0. Guarded for a future parallel jit pass. */
+/* Process-global JIT result cache. In-process (Phase 1): host compiled function
+ * pointer + prototype (code kept mapped by the leaked LLJIT), device emitted PTX.
+ * On-disk (Phase 2): host relocatable object (.o) and device PTX, so a later run
+ * skips optimize/codegen. A hit reuses the artifact and skips the whole pipeline
+ * for further instances of the same construct.
+ *   CGIR_JIT_CACHE=0        disable all caching (mem + disk)
+ *   CGIR_JIT_CACHE_DIR=DIR  enable the on-disk cache at DIR (opt-in; off by
+ *                           default so a stale build is never silently reused
+ *                           while the toolchain is under development)
+ * Guarded by a mutex for a future parallel jit pass. */
 struct jit_cache_t
 {
     struct host_entry_t { int proto; void * fn; };
 
     bool                                       enabled;
+    bool                                       disk_enabled = false;
+    std::string                                dir;
     std::mutex                                 mtx;
-    std::unordered_map<uint64_t, host_entry_t> host;
-    std::unordered_map<uint64_t, std::string>  device_ptx;
+    std::unordered_map<uint64_t, host_entry_t> host;        // in-process fn ptr
+    std::unordered_map<uint64_t, std::string>  device_ptx;  // in-process PTX
 
     jit_cache_t()
     {
         const char * e = getenv("CGIR_JIT_CACHE");
         enabled = !(e && e[0] == '0' && e[1] == '\0');
+        if (!enabled) return ;
+
+        // on-disk cache is opt-in: only when CGIR_JIT_CACHE_DIR is set
+        if (const char * cd = getenv("CGIR_JIT_CACHE_DIR"); cd && cd[0] &&
+            !llvm::sys::fs::create_directories(cd))
+        {
+            dir = cd;
+            disk_enabled = true;
+        }
     }
 
-    bool host_get(uint64_t k, host_entry_t & out)
+    std::string path_for(uint64_t k, const char * ext) const
+    {
+        char name[40];
+        snprintf(name, sizeof(name), "/%016llx.%s", (unsigned long long) k, ext);
+        return dir + name;
+    }
+
+    static bool read_file(const std::string & p, std::string & out)
+    {
+        auto buf = llvm::MemoryBuffer::getFile(p, /*IsText*/ false);
+        if (!buf) return false;
+        out.assign((*buf)->getBufferStart(), (*buf)->getBufferSize());
+        return true;
+    }
+
+    static void write_file_atomic(const std::string & p, const std::string & data)
+    {
+        static std::atomic<unsigned> seq{0};
+        std::string tmp = p + ".tmp." + std::to_string((long) getpid()) + "." +
+                          std::to_string(seq.fetch_add(1));
+        {
+            std::error_code ec;
+            llvm::raw_fd_ostream f(tmp, ec, llvm::sys::fs::OF_None);
+            if (ec) return ;
+            f.write(data.data(), data.size());
+            f.close();
+            if (f.has_error()) { llvm::sys::fs::remove(tmp); return ; }
+        }
+        if (llvm::sys::fs::rename(tmp, p)) llvm::sys::fs::remove(tmp);
+    }
+
+    // ---- host: in-process compiled function pointer ----
+    bool host_get_fn(uint64_t k, host_entry_t & out)
     {
         if (!enabled) return false;
         std::lock_guard<std::mutex> lk(mtx);
@@ -337,26 +459,47 @@ struct jit_cache_t
         out = it->second;
         return true;
     }
-    void host_put(uint64_t k, int proto, void * fn)
+    void host_put_fn(uint64_t k, int proto, void * fn)
     {
         if (!enabled) return ;
         std::lock_guard<std::mutex> lk(mtx);
         host[k] = host_entry_t{proto, fn};
     }
-    bool device_get(uint64_t k, std::string & out)
+
+    // ---- host: on-disk relocatable object (.o) ----
+    bool host_get_obj(uint64_t k, std::string & obj)
     {
-        if (!enabled) return false;
-        std::lock_guard<std::mutex> lk(mtx);
-        auto it = device_ptx.find(k);
-        if (it == device_ptx.end()) return false;
-        out = it->second;
-        return true;
+        if (!enabled || !disk_enabled) return false;
+        return read_file(path_for(k, "o"), obj);
+    }
+    void host_put_obj(uint64_t k, const std::string & obj)
+    {
+        if (!enabled || !disk_enabled) return ;
+        write_file_atomic(path_for(k, "o"), obj);
+    }
+
+    // ---- device: PTX (in-process, then disk). Returns 2=mem, 1=disk, 0=miss. ----
+    int device_get(uint64_t k, std::string & out)
+    {
+        if (!enabled) return 0;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            auto it = device_ptx.find(k);
+            if (it != device_ptx.end()) { out = it->second; return 2; }
+        }
+        if (disk_enabled && read_file(path_for(k, "ptx"), out))
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            device_ptx[k] = out;
+            return 1;
+        }
+        return 0;
     }
     void device_put(uint64_t k, const std::string & ptx)
     {
         if (!enabled) return ;
-        std::lock_guard<std::mutex> lk(mtx);
-        device_ptx[k] = ptx;
+        { std::lock_guard<std::mutex> lk(mtx); device_ptx[k] = ptx; }
+        if (disk_enabled) write_file_atomic(path_for(k, "ptx"), ptx);
     }
 };
 
@@ -2233,16 +2376,39 @@ link_device_bitcode(llvm::Module & M, const char * bc_path, std::string & err)
         return false;
     }
 
-    llvm::SMDiagnostic diag;
-    std::unique_ptr<llvm::Module> lib = [&] {
-        scoped_phase_t _p("dev-link-parse");
-        return llvm::parseIR((*buf)->getMemBufferRef(), diag, M.getContext());
-    }();
-    if (!lib)
+    /* Parse the library. For bitcode (libdevice/DeviceRTL are .bc), load it LAZILY:
+     * function bodies are materialized on demand, so the following LinkOnlyNeeded
+     * link only deserializes the referenced functions instead of the whole (large)
+     * library. getOwningLazyBitcodeModule takes ownership of the buffer (kept alive
+     * for on-demand materialization). Fall back to eager parseIR for textual IR. */
+    std::unique_ptr<llvm::Module> lib;
     {
-        err = "parse device bitcode '" + std::string(bc_path) + "' failed: " +
-              diag.getMessage().str();
-        return false;
+        scoped_phase_t _p("dev-link-parse");
+        const unsigned char * s = (const unsigned char *) (*buf)->getBufferStart();
+        const unsigned char * e = (const unsigned char *) (*buf)->getBufferEnd();
+        if (llvm::isBitcode(s, e))
+        {
+            auto m = llvm::getOwningLazyBitcodeModule(std::move(*buf), M.getContext(),
+                                                      /* ShouldLazyLoadMetadata */ true);
+            if (!m)
+            {
+                err = "lazy-parse device bitcode '" + std::string(bc_path) + "' failed: " +
+                      llvm::toString(m.takeError());
+                return false;
+            }
+            lib = std::move(*m);
+        }
+        else
+        {
+            llvm::SMDiagnostic diag;
+            lib = llvm::parseIR((*buf)->getMemBufferRef(), diag, M.getContext());
+            if (!lib)
+            {
+                err = "parse device bitcode '" + std::string(bc_path) + "' failed: " +
+                      diag.getMessage().str();
+                return false;
+            }
+        }
     }
 
     /* Align triple/DataLayout with the destination so the linker does not refuse
@@ -2483,6 +2649,69 @@ install_host_jit_result(command_prog_t * prog, void * fn_addr,
         prog->launcher.variadic.fn = reinterpret_cast<void (*)(void **)>(fn_addr);
     }
 }
+
+/* Replace a device prog's source IR with emitted/cached PTX (owned copy), keeping
+ * the entry symbol so the driver can cuModuleGetFunction it. Shared by the fresh
+ * emit and the cache-hit paths; leaves launcher null (the driver fills it). */
+static void
+restore_device_ptx(command_prog_t * prog, const std::string & ptx)
+{
+    if (prog->source.content.llvmir._owned && prog->source.content.llvmir.raw)
+        free(prog->source.content.llvmir.raw);
+    char * buf = static_cast<char *>(malloc(ptx.size() + 1));
+    if (!buf) { fprintf(stderr, "jit(device): malloc failed\n"); abort(); }
+    memcpy(buf, ptx.data(), ptx.size());
+    buf[ptx.size()] = '\0';
+    prog->source.type                  = COMMAND_PROG_SOURCE_TYPE_PTX;
+    prog->source.content.llvmir.raw    = buf;
+    prog->source.content.llvmir.size   = ptx.size() + 1; /* incl. NUL */
+    prog->source.content.llvmir._owned = true;
+    prog->prototype            = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC;
+    prog->launcher.variadic.fn = nullptr;
+}
+
+/* Resolve the symbols a host program references but does not define: externalized
+ * globals as absolute symbols (their real runtime addresses, so compiled code
+ * binds to the process's objects) + a generator over the process's dynamic symbols
+ * (libc printf, ...). Shared by the fresh-compile and disk-object load paths. */
+static void
+setup_host_jit_symbols(llvm::orc::LLJIT & jit, const command_prog_t * prog)
+{
+    llvm::orc::JITDylib & jd = jit.getMainJITDylib();
+
+    const cgir_command_prog_extern_t * externs = prog->source.content.llvmir.externs;
+    const size_t n_externs = prog->source.content.llvmir.externs_count;
+    if (externs && n_externs)
+    {
+        llvm::orc::SymbolMap syms;
+        for (size_t i = 0 ; i < n_externs ; ++i)
+        {
+            if (externs[i].name == nullptr)
+                continue ;
+            syms[jit.mangleAndIntern(externs[i].name)] =
+                llvm::orc::ExecutorSymbolDef(
+                    llvm::orc::ExecutorAddr::fromPtr(externs[i].addr),
+                    llvm::JITSymbolFlags::Exported);
+        }
+        if (!syms.empty())
+            if (auto err = jd.define(llvm::orc::absoluteSymbols(std::move(syms))))
+            {
+                llvm::logAllUnhandledErrors(std::move(err), llvm::errs(), "jit: ");
+                fprintf(stderr, "jit: failed to install externalized-global symbols\n");
+                abort();
+            }
+    }
+
+    auto gen = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+        jit.getDataLayout().getGlobalPrefix());
+    if (!gen)
+    {
+        llvm::logAllUnhandledErrors(gen.takeError(), llvm::errs(), "jit: ");
+        fprintf(stderr, "jit: failed to create process symbol generator\n");
+        abort();
+    }
+    jd.addGenerator(std::move(*gen));
+}
 # endif /* CGIR_SUPPORT_LLVM */
 
 void
@@ -2499,6 +2728,39 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
     assert(prog->source.content.llvmir.raw != nullptr);
 
     scoped_phase_t _jit_total("jit-total");
+
+    /* Result-cache key from the source bytes/attributes (no parse needed): a hit
+     * reuses a prior instance's artifact, skipping parse + the compile pipeline.
+     * The key covers everything a recompile would reproduce, so a hit is
+     * byte-identical to recompiling. */
+    const uint64_t cache_key = jit_cache_key(prog);
+    const bool     is_device = (prog->source.content.llvmir.triple != nullptr);
+
+    /* Fast path (pre-parse): reuse a cached artifact directly. Device PTX (from
+     * this process or a prior run on disk); host compiled function pointer (this
+     * process only -- disk objects are loaded further down, needing the entry). */
+    if (is_device)
+    {
+        std::string ptx;
+        if (const int hit = jit_cache().device_get(cache_key, ptx))
+        {
+            restore_device_ptx(prog, ptx);
+            if (jit_prof().stats_on) jit_prof().cache_event(true, hit == 1 ? 1 : 2);
+            return ;
+        }
+    }
+    else
+    {
+        jit_cache_t::host_entry_t e;
+        if (jit_cache().host_get_fn(cache_key, e))
+        {
+            install_host_jit_result(prog, e.fn,
+                e.proto == (int) CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_NANOS6,
+                e.proto == (int) CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED);
+            if (jit_prof().stats_on) jit_prof().cache_event(false, 2);
+            return ;
+        }
+    }
 
     ensure_llvm_initialized();
 
@@ -2559,46 +2821,25 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
         (entry->hasLocalLinkage() && !proto_is_nanos6))
         return ;
 
-    /* Cache-stat estimate (after the skip, so only actually-compiled bodies
-     * count): hash the pre-compile body -- the exact bytes a content cache would
-     * key on -- and record it as host/device (device iff a triple is set).
-     * Reports distinct-vs-total compiles at exit under CGIR_JIT_CACHE_STATS. */
-    if (jit_prof().stats_on)
-        jit_prof().add_body(prog->source.content.llvmir.triple != nullptr,
-                            jit_fnv1a(prog->source.content.llvmir.raw,
-                                      prog->source.content.llvmir.size),
-                            prog->source.content.llvmir.size);
-
-    /* In-process result cache key (shared by the device and host paths). A hit
-     * reuses a prior instance's artifact; the key covers everything a recompile
-     * would reproduce, so a hit is byte-identical to recompiling. */
-    const uint64_t cache_key = jit_cache_key(prog);
-
-    /* Device (GPU) target: compile the (fused) device kernel to PTX for the
-     * device's triple/arch instead of the in-process host JIT. The PTX is stored
-     * back in the source; the driver JIT-loads it (cuModuleLoadData) and resolves
-     * the entry (source.symbol) at launch. The launcher fn is left null (the
-     * driver fills it once the module is loaded). */
-    if (const char * dtriple = prog->source.content.llvmir.triple)
+    /* Device (GPU) miss: emit the (fused) device kernel to PTX for the device's
+     * triple/arch, cache it (in-process + on-disk), and store it back in the
+     * source; the driver JIT-loads it (cuModuleLoadData) and resolves the entry
+     * (source.symbol) at launch. The fast path above already handled cache hits. */
+    if (is_device)
     {
-        /* Cache hit: reuse a prior instance's PTX and skip the whole
-         * spmdize/link/O3/emit pipeline (dev-emit-total). */
-        std::string ptx;
-        if (!jit_cache().device_get(cache_key, ptx))
+        const char * dtriple = prog->source.content.llvmir.triple;
+        std::string perr;
+        std::string ptx = emit_device_ptx(*mod, dtriple,
+                                          prog->source.content.llvmir.arch,
+                                          prog->source.content.llvmir.device_libs,
+                                          prog->source.content.llvmir.device_libs_count,
+                                          dump ? dump_dir : std::string(), perr);
+        if (ptx.empty())
         {
-            std::string perr;
-            ptx = emit_device_ptx(*mod, dtriple,
-                                  prog->source.content.llvmir.arch,
-                                  prog->source.content.llvmir.device_libs,
-                                  prog->source.content.llvmir.device_libs_count,
-                                  dump ? dump_dir : std::string(), perr);
-            if (ptx.empty())
-            {
-                fprintf(stderr, "jit(device): PTX emission failed: %s\n", perr.c_str());
-                abort();
-            }
-            jit_cache().device_put(cache_key, ptx);
+            fprintf(stderr, "jit(device): PTX emission failed: %s\n", perr.c_str());
+            abort();
         }
+        jit_cache().device_put(cache_key, ptx);
         if (dump)
         {
             std::string path = dump_dir + "/final.ptx";
@@ -2606,39 +2847,9 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
             llvm::raw_fd_ostream f(path, ec, llvm::sys::fs::OF_Text);
             if (!ec) f << ptx;
         }
-
-        /* replace the source IR with the emitted PTX (owned); keep the entry symbol
-         * so the driver can cuModuleGetFunction it. */
-        if (prog->source.content.llvmir._owned && prog->source.content.llvmir.raw)
-            free(prog->source.content.llvmir.raw);
-        char * buf = static_cast<char *>(malloc(ptx.size() + 1));
-        if (!buf) { fprintf(stderr, "jit(device): malloc failed\n"); abort(); }
-        memcpy(buf, ptx.data(), ptx.size());
-        buf[ptx.size()] = '\0';
-        prog->source.type                  = COMMAND_PROG_SOURCE_TYPE_PTX;
-        prog->source.content.llvmir.raw    = buf;
-        prog->source.content.llvmir.size   = ptx.size() + 1; /* incl. NUL */
-        prog->source.content.llvmir._owned = true;
-        /* device kernels launch through the VARIADIC (kernelParams=args) path; the
-         * driver reinterprets launcher.variadic.fn as the loaded device function,
-         * resolved lazily at launch (null until then). */
-        prog->prototype            = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC;
-        prog->launcher.variadic.fn = nullptr;
+        restore_device_ptx(prog, ptx);
+        if (jit_prof().stats_on) jit_prof().cache_event(true, 0);
         return ;
-    }
-
-    /* Host cache hit: reuse a prior instance's compiled function + prototype,
-     * skipping wrapper synthesis, optimize and ORC codegen. The per-instance
-     * packed-arg buffer is still (re)built by install_host_jit_result. */
-    {
-        jit_cache_t::host_entry_t hit;
-        if (jit_cache().host_get(cache_key, hit))
-        {
-            install_host_jit_result(prog, hit.fn,
-                hit.proto == (int) CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_NANOS6,
-                hit.proto == (int) CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED);
-            return ;
-        }
     }
 
     /* The runtime launches a JIT'd PROG as `void(void**)` (VARIADIC) or, for a
@@ -2716,17 +2927,12 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
         lookup_name = "__cgir_jit_wrapper";
     }
 
-    /* Compile with the LARGE code model. The JIT places compiled code in a fresh
-     * mapping that can be >2GB away from the process objects this program binds
-     * to (externalized globals installed as absolute symbols, libc functions,
-     * ...). Small/medium models reference those via 32-bit PC-relative
-     * relocations (R_X86_64_PC32) that cannot span that distance; the large
-     * model uses 64-bit absolute addressing, reachable anywhere. Set it on both
-     * the module (flag) and the JIT target machine so codegen honors it. */
+    /* Compile with the LARGE code model. JIT'd code maps in a fresh region that
+     * can be >2GB from the process objects this program binds to (externalized
+     * globals as absolute symbols, libc, ...); small/medium 32-bit PC-relative
+     * relocations (R_X86_64_PC32) cannot span that -- large uses 64-bit absolute. */
     mod->setCodeModel(llvm::CodeModel::Large);
 
-    /* JIT-compile in-process (large code model, see above). The target machine
-     * also drives the optimization pipeline below. */
     auto jtmb = llvm::orc::JITTargetMachineBuilder::detectHost();
     if (!jtmb)
     {
@@ -2736,26 +2942,44 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
     }
     jtmb->setCodeModel(llvm::CodeModel::Large);
 
-    /* Optimize the host closure BEFORE codegen (the forwarded closure is a
-     * pre-optimization frontend snapshot; also promotes+inlines available_externally
-     * inline callees that codegen would otherwise drop -- see optimize_host_module).
-     * createTargetMachine() only reads jtmb's config, so jtmb stays usable below. */
+    /* Obtain the relocatable object for `lookup_name`: reuse it from the on-disk
+     * cache if a prior run compiled this exact body (skips optimize + codegen),
+     * else optimize + emit it and cache it. ORC's SimpleCompiler emits the object
+     * via the same addPassesToEmitFile, so a self-emitted object loads identically
+     * through addObjectFile -- externs/libc are bound at link time either way. */
+    std::string obj;
+    const bool obj_from_disk = jit_cache().host_get_obj(cache_key, obj);
+    if (!obj_from_disk)
     {
         auto otm = jtmb->createTargetMachine();
         if (!otm)
         {
             llvm::logAllUnhandledErrors(otm.takeError(), llvm::errs(), "jit: ");
-            fprintf(stderr, "jit: failed to create host target machine for optimization\n");
+            fprintf(stderr, "jit: failed to create host target machine\n");
             abort();
         }
-        scoped_phase_t _p("host-optimize");
-        optimize_host_module(*mod, otm->get());
+        {
+            scoped_phase_t _p("host-optimize");
+            optimize_host_module(*mod, otm->get());
+        }
+        if (dump)
+            dump_module(dump_dir, "final.ll", *mod);
+        {
+            scoped_phase_t _p("host-codegen");
+            llvm::SmallString<0> objbuf;
+            llvm::raw_svector_ostream os(objbuf);
+            llvm::legacy::PassManager pm;
+            if (otm->get()->addPassesToEmitFile(pm, os, /* DwoOut */ nullptr,
+                                                llvm::CodeGenFileType::ObjectFile))
+            { fprintf(stderr, "jit: host object emission not supported\n"); abort(); }
+            pm.run(*mod);
+            obj.assign(objbuf.begin(), objbuf.end());
+        }
+        jit_cache().host_put_obj(cache_key, obj);
     }
 
-    /* dump the final IR handed to the JIT (post wrapper synthesis + optimization) */
-    if (dump)
-        dump_module(dump_dir, "final.ll", *mod);
-
+    /* Load the object into a fresh LLJIT, bind the program's symbols, resolve the
+     * entry. addObjectFile skips IR codegen (the object is already compiled). */
     auto jit_exp = [&] {
         scoped_phase_t _p("host-orc-create");
         return llvm::orc::LLJITBuilder()
@@ -2770,65 +2994,16 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
     }
     std::unique_ptr<llvm::orc::LLJIT> jit = std::move(*jit_exp);
 
-    /* Resolve symbols the program references but does not define:
-     *
-     *  1. Externalized globals — the producer turned the program's shared data
-     *     globals into external declarations and recorded their real runtime
-     *     addresses (source.content.llvmir.externs). Install them as absolute
-     *     symbols so the compiled code binds to the process's real objects
-     *     instead of module-local copies.
-     *
-     *  2. Everything else (e.g. libc `printf`, other exported process symbols)
-     *     via a generator over the current process's dynamic symbols. */
-    {
-        llvm::orc::JITDylib & jd = jit->getMainJITDylib();
-
-        const cgir_command_prog_extern_t * externs = prog->source.content.llvmir.externs;
-        const size_t n_externs = prog->source.content.llvmir.externs_count;
-        if (externs && n_externs)
-        {
-            llvm::orc::SymbolMap syms;
-            for (size_t i = 0 ; i < n_externs ; ++i)
-            {
-                if (externs[i].name == nullptr)
-                    continue ;
-                syms[jit->mangleAndIntern(externs[i].name)] =
-                    llvm::orc::ExecutorSymbolDef(
-                        llvm::orc::ExecutorAddr::fromPtr(externs[i].addr),
-                        llvm::JITSymbolFlags::Exported);
-            }
-            if (!syms.empty())
-            {
-                if (auto err = jd.define(llvm::orc::absoluteSymbols(std::move(syms))))
-                {
-                    llvm::logAllUnhandledErrors(std::move(err), llvm::errs(), "jit: ");
-                    fprintf(stderr, "jit: failed to install externalized-global symbols\n");
-                    abort();
-                }
-            }
-        }
-
-        auto gen = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
-            jit->getDataLayout().getGlobalPrefix());
-        if (!gen)
-        {
-            llvm::logAllUnhandledErrors(gen.takeError(), llvm::errs(), "jit: ");
-            fprintf(stderr, "jit: failed to create process symbol generator\n");
-            abort();
-        }
-        jd.addGenerator(std::move(*gen));
-    }
-
-    llvm::orc::ThreadSafeModule tsm(std::move(mod), std::move(ctx));
-    if (auto err = jit->addIRModule(std::move(tsm)))
-    {
-        llvm::logAllUnhandledErrors(std::move(err), llvm::errs(), "jit: ");
-        fprintf(stderr, "jit: failed to add IR module to LLJIT\n");
-        abort();
-    }
+    setup_host_jit_symbols(*jit, prog);
 
     auto sym = [&] {
-        scoped_phase_t _p("host-orc-codegen");
+        scoped_phase_t _p("host-link");
+        if (auto err = jit->addObjectFile(llvm::MemoryBuffer::getMemBufferCopy(obj)))
+        {
+            llvm::logAllUnhandledErrors(std::move(err), llvm::errs(), "jit: ");
+            fprintf(stderr, "jit: failed to add object to LLJIT\n");
+            abort();
+        }
         return jit->lookup(lookup_name);
     }();
     if (!sym)
@@ -2841,14 +3016,15 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
     void * fn_addr = reinterpret_cast<void *>(static_cast<uintptr_t>(sym->getValue()));
     jit.release();
 
-    /* Cache the compiled function (+ prototype) so further instances of this
-     * construct reuse it, then install it. A nanos6 outline chain launches as
-     * fn(args_v, dev_v, transl_v); a packed entry as fn(args, args_size);
+    /* Cache the compiled function (+ prototype) for further instances of this
+     * construct, record the outcome, and install it. A nanos6 outline chain
+     * launches as fn(args_v, dev_v, transl_v); a packed entry as fn(args, size);
      * anything else as a uniform void(void**) VARIADIC over prog->args. */
     const int proto = entry_is_nanos6 ? (int) CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_NANOS6
                     : entry_is_packed ? (int) CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED
                                       : (int) CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC;
-    jit_cache().host_put(cache_key, proto, fn_addr);
+    jit_cache().host_put_fn(cache_key, proto, fn_addr);
+    if (jit_prof().stats_on) jit_prof().cache_event(false, obj_from_disk ? 1 : 0);
     install_host_jit_result(prog, fn_addr, entry_is_nanos6, entry_is_packed);
     # endif /* CGIR_SUPPORT_LLVM */
 }

@@ -58,6 +58,30 @@ You may set the following environment variables
   every `CGIR_STATS_CSV` row, so a caller (e.g. the benchmark runner) can join
   the per-pass stats back to a specific run.
 
+JIT compilation caching and profiling (the `jit` pass compiles each program's
+LLVM IR to a host function or device PTX):
+- `CGIR_JIT_CACHE` gates the JIT **result cache**, which is **on by default**.
+  Set it to `0` to disable all caching (in-process and on-disk). The in-process
+  cache is content-addressed: task instances of the same construct (identical IR,
+  externs, prototype and target) reuse the already-compiled host function pointer
+  or emitted device PTX instead of recompiling. A hit is byte-identical to
+  recompiling, so it never changes generated code.
+- `CGIR_JIT_CACHE_DIR` enables the **persistent on-disk cache** at the given
+  directory (opt-in; disabled unless set). It stores compiled host objects
+  (`<hash>.o`) and device PTX (`<hash>.ptx`) so a later run skips
+  optimization/codegen. Keys fold a toolchain salt (LLVM version, the cgir build
+  timestamp, the host CPU, and the device libraries' identity), so entries
+  self-invalidate on a cgir rebuild, an LLVM change, or a different CPU/target;
+  host objects rebind their external symbols per run (robust to ASLR).
+- `CGIR_JIT_TIMING` set to any non-empty value other than `0` to print, at
+  process exit, a per-phase wall-clock breakdown of JIT compilation accumulated
+  across all compiles (`jit-parse`, `host-optimize`/`host-codegen`/`host-link`,
+  device `dev-spmdize`/`dev-link-parse`/`dev-o3`/`dev-ptx-emit`, ...). The buckets
+  nest under `jit-total`.
+- `CGIR_JIT_CACHE_STATS` set to any non-empty value other than `0` to print, at
+  process exit, the JIT result-cache outcomes split host/device: total programs,
+  `compiled` (full compiles), `disk-reuse`, `mem-reuse`, and the overall reuse %.
+
 
 # Example
 CGIR is integrated into the [XKRT](https://github.com/anlsys/xkrt) runtime system.
