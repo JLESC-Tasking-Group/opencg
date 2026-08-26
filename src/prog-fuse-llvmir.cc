@@ -128,8 +128,10 @@
 # include <llvm/IR/LegacyPassManager.h>
 # include <llvm/ADT/SmallString.h>
 
+# include <algorithm>
 # include <atomic>
 # include <cassert>
+# include <chrono>
 # include <cstdint>
 # include <cstdio>
 # include <cstdlib>
@@ -139,6 +141,7 @@
 # include <optional>
 # include <string>
 # include <unordered_map>
+# include <utility>
 # include <vector>
 
 # endif /* CGIR_SUPPORT_LLVM */
@@ -146,6 +149,136 @@
 CGIR_NAMESPACE_USE;
 
 # if CGIR_SUPPORT_LLVM
+
+/* ---------------------------------------------------------------------------
+ * Phase 0: opt-in JIT profiling / cache-stat instrumentation. Off (and
+ * near-free) unless enabled via env, read once at first use:
+ *   CGIR_JIT_TIMING=1       accumulate per-phase wall time, print at exit
+ *   CGIR_JIT_CACHE_STATS=1  hash each JIT'd body, print distinct-vs-total
+ *                           (how many compiles a content cache would skip)
+ * A single report is emitted to stderr at static destruction.
+ * ------------------------------------------------------------------------- */
+namespace {
+
+struct jit_profiler_t
+{
+    bool timing_on;
+    bool stats_on;
+
+    std::mutex                                mtx;
+    std::unordered_map<std::string, double>   phase_secs;    // bucket -> seconds
+    std::unordered_map<std::string, uint64_t> phase_calls;   // bucket -> count
+
+    // per-body content hashes, split [0]=host [1]=device, for would-be-hit count
+    std::unordered_map<uint64_t, uint32_t>    body_seen[2];
+    uint64_t                                  body_calls[2] = {0, 0};
+    uint64_t                                  body_bytes[2] = {0, 0};
+
+    jit_profiler_t()
+    {
+        const char * t = getenv("CGIR_JIT_TIMING");
+        const char * s = getenv("CGIR_JIT_CACHE_STATS");
+        timing_on = (t && t[0] && strcmp(t, "0") != 0);
+        stats_on  = (s && s[0] && strcmp(s, "0") != 0);
+    }
+
+    void add_phase(const char * name, double secs)
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        phase_secs[name]  += secs;
+        phase_calls[name] += 1;
+    }
+
+    void add_body(bool device, uint64_t hash, size_t bytes)
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        const int d = device ? 1 : 0;
+        body_seen[d][hash] += 1;
+        body_calls[d]      += 1;
+        body_bytes[d]      += (uint64_t) bytes;
+    }
+
+    ~jit_profiler_t()
+    {
+        if (timing_on && !phase_secs.empty())
+        {
+            std::vector<std::pair<std::string, double>> v(phase_secs.begin(), phase_secs.end());
+            std::sort(v.begin(), v.end(),
+                      [] (const auto & a, const auto & b) { return a.second > b.second; });
+            fprintf(stderr, "\n[cgir jit timing] %-24s %10s %14s\n", "phase", "calls", "seconds");
+            fprintf(stderr,   "[cgir jit timing] ------------------------------------------------\n");
+            for (auto & p : v)
+                fprintf(stderr, "[cgir jit timing] %-24s %10llu %14.6f\n",
+                        p.first.c_str(), (unsigned long long) phase_calls[p.first], p.second);
+            fprintf(stderr, "[cgir jit timing] (buckets nest: e.g. jit-total covers the rest)\n");
+        }
+        if (stats_on && (body_calls[0] || body_calls[1]))
+        {
+            for (int d = 0 ; d < 2 ; ++d)
+            {
+                if (!body_calls[d])
+                    continue ;
+                const uint64_t calls    = body_calls[d];
+                const uint64_t distinct = (uint64_t) body_seen[d].size();
+                const uint64_t hits     = calls - distinct;
+                fprintf(stderr,
+                    "[cgir jit cache-stats] %-6s: %llu compiles, %llu distinct bodies, "
+                    "%llu redundant (%.1f%% would hit a content cache), %llu IR bytes\n",
+                    d ? "device" : "host",
+                    (unsigned long long) calls, (unsigned long long) distinct,
+                    (unsigned long long) hits,
+                    100.0 * (double) hits / (double) calls,
+                    (unsigned long long) body_bytes[d]);
+            }
+        }
+    }
+};
+
+static jit_profiler_t &
+jit_prof(void)
+{
+    static jit_profiler_t p;
+    return p;
+}
+
+/* RAII wall-clock timer adding its lifetime to a named bucket. Cost when
+ * disabled: one cached bool test (no clock reads). */
+struct scoped_phase_t
+{
+    const char *                          name;
+    std::chrono::steady_clock::time_point t0;
+    bool                                  on;
+
+    explicit scoped_phase_t(const char * n) : name(n), on(jit_prof().timing_on)
+    {
+        if (on)
+            t0 = std::chrono::steady_clock::now();
+    }
+    ~scoped_phase_t()
+    {
+        if (!on)
+            return ;
+        const auto t1 = std::chrono::steady_clock::now();
+        jit_prof().add_phase(name, std::chrono::duration<double>(t1 - t0).count());
+    }
+};
+
+/* FNV-1a 64-bit over a byte range: cheap content hash for the cache-stat
+ * would-be-hit estimate (and, later, the real cache key). */
+static uint64_t
+jit_fnv1a(const void * data, size_t n)
+{
+    const unsigned char * p = static_cast<const unsigned char *>(data);
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0 ; i < n ; ++i)
+    {
+        h ^= (uint64_t) p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+} // namespace
 
 /**
  *  Parse an LLVM IR (textual .ll, NUL-terminated) or LLVM bitcode (binary) blob
@@ -708,6 +841,8 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     abort();
     # else
     assert(n >= 2);
+
+    scoped_phase_t _fuse_total("fuse-total");
 
     /* ------------------------------------------------------------------ *
      * 0. One-time LLVM global initialisation                             *
@@ -1998,8 +2133,10 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
 static bool
 link_device_bitcode(llvm::Module & M, const char * bc_path, std::string & err)
 {
-    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buf =
-        llvm::MemoryBuffer::getFile(bc_path);
+    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buf = [&] {
+        scoped_phase_t _p("dev-link-read");
+        return llvm::MemoryBuffer::getFile(bc_path);
+    }();
     if (!buf)
     {
         err = "cannot read device bitcode '" + std::string(bc_path) + "': " +
@@ -2008,8 +2145,10 @@ link_device_bitcode(llvm::Module & M, const char * bc_path, std::string & err)
     }
 
     llvm::SMDiagnostic diag;
-    std::unique_ptr<llvm::Module> lib =
-        llvm::parseIR((*buf)->getMemBufferRef(), diag, M.getContext());
+    std::unique_ptr<llvm::Module> lib = [&] {
+        scoped_phase_t _p("dev-link-parse");
+        return llvm::parseIR((*buf)->getMemBufferRef(), diag, M.getContext());
+    }();
     if (!lib)
     {
         err = "parse device bitcode '" + std::string(bc_path) + "' failed: " +
@@ -2023,7 +2162,12 @@ link_device_bitcode(llvm::Module & M, const char * bc_path, std::string & err)
     lib->setDataLayout(M.getDataLayout());
 
     llvm::Linker linker(M);
-    if (linker.linkInModule(std::move(lib), llvm::Linker::Flags::LinkOnlyNeeded))
+    bool link_failed;
+    {
+        scoped_phase_t _p("dev-link-linkin");
+        link_failed = linker.linkInModule(std::move(lib), llvm::Linker::Flags::LinkOnlyNeeded);
+    }
+    if (link_failed)
     {
         err = "linking device bitcode '" + std::string(bc_path) + "' failed";
         return false;
@@ -2160,8 +2304,13 @@ emit_device_ptx(llvm::Module & M, const char * triple, const char * arch,
     M.setTargetTriple(TT);
     M.setDataLayout(TM->createDataLayout());
 
+    scoped_phase_t _emit("dev-emit-total");
+
     /* 1. Pre-link: SPMD-ize the generic-mode snapshot (must precede the link). */
-    spmdize_device_module(M, TM.get());
+    {
+        scoped_phase_t _p("dev-spmdize");
+        spmdize_device_module(M, TM.get());
+    }
 
     /* 2. Link the device bitcode libraries the kernel references (in order, so a
      * later library can resolve externs of an earlier one), so ptxas can JIT the
@@ -2174,7 +2323,10 @@ emit_device_ptx(llvm::Module & M, const char * triple, const char * arch,
             return {};
 
     /* 3. Post-link: O3 to AOT quality (inline runtime, fold config, DCE, vectorize). */
-    optimize_device_module_o3(M, TM.get());
+    {
+        scoped_phase_t _p("dev-o3");
+        optimize_device_module_o3(M, TM.get());
+    }
 
     if (!dump_dir.empty())
         dump_module(dump_dir, "optimized.ll", M);
@@ -2185,7 +2337,10 @@ emit_device_ptx(llvm::Module & M, const char * triple, const char * arch,
     if (TM->addPassesToEmitFile(pm, os, /* DwoOut */ nullptr,
                                 llvm::CodeGenFileType::AssemblyFile))
     { err = "addPassesToEmitFile: PTX (assembly) emission not supported"; return {}; }
-    pm.run(M);
+    {
+        scoped_phase_t _p("dev-ptx-emit");
+        pm.run(M);
+    }
     return std::string(out.begin(), out.end());
 }
 # endif /* CGIR_SUPPORT_LLVM */
@@ -2203,6 +2358,8 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
     assert(prog->source.type == COMMAND_PROG_SOURCE_TYPE_LLVMIR);
     assert(prog->source.content.llvmir.raw != nullptr);
 
+    scoped_phase_t _jit_total("jit-total");
+
     ensure_llvm_initialized();
 
     /* Optional IR dumping for debugging (CGIR_JIT_DUMP). */
@@ -2211,11 +2368,14 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
 
     /* parse the program's IR/bitcode into its own context */
     auto ctx = std::make_unique<llvm::LLVMContext>();
-    std::unique_ptr<llvm::Module> mod = parse_llvmir(
-        static_cast<const char *>(prog->source.content.llvmir.raw),
-        prog->source.content.llvmir.size,
-        *ctx
-    );
+    std::unique_ptr<llvm::Module> mod = [&] {
+        scoped_phase_t _p("jit-parse");
+        return parse_llvmir(
+            static_cast<const char *>(prog->source.content.llvmir.raw),
+            prog->source.content.llvmir.size,
+            *ctx
+        );
+    }();
     if (!mod) { fprintf(stderr, "jit: failed to parse program IR\n"); abort(); }
 
     /* dump the program IR as parsed, before any transform */
@@ -2258,6 +2418,16 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
     if (entry == nullptr || entry->isDeclaration() ||
         (entry->hasLocalLinkage() && !proto_is_nanos6))
         return ;
+
+    /* Cache-stat estimate (after the skip, so only actually-compiled bodies
+     * count): hash the pre-compile body -- the exact bytes a content cache would
+     * key on -- and record it as host/device (device iff a triple is set).
+     * Reports distinct-vs-total compiles at exit under CGIR_JIT_CACHE_STATS. */
+    if (jit_prof().stats_on)
+        jit_prof().add_body(prog->source.content.llvmir.triple != nullptr,
+                            jit_fnv1a(prog->source.content.llvmir.raw,
+                                      prog->source.content.llvmir.size),
+                            prog->source.content.llvmir.size);
 
     /* Device (GPU) target: compile the (fused) device kernel to PTX for the
      * device's triple/arch instead of the in-process host JIT. The PTX is stored
@@ -2412,6 +2582,7 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
             fprintf(stderr, "jit: failed to create host target machine for optimization\n");
             abort();
         }
+        scoped_phase_t _p("host-optimize");
         optimize_host_module(*mod, otm->get());
     }
 
@@ -2419,9 +2590,12 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
     if (dump)
         dump_module(dump_dir, "final.ll", *mod);
 
-    auto jit_exp = llvm::orc::LLJITBuilder()
-        .setJITTargetMachineBuilder(std::move(*jtmb))
-        .create();
+    auto jit_exp = [&] {
+        scoped_phase_t _p("host-orc-create");
+        return llvm::orc::LLJITBuilder()
+            .setJITTargetMachineBuilder(std::move(*jtmb))
+            .create();
+    }();
     if (!jit_exp)
     {
         llvm::logAllUnhandledErrors(jit_exp.takeError(), llvm::errs(), "jit: ");
@@ -2487,7 +2661,10 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
         abort();
     }
 
-    auto sym = jit->lookup(lookup_name);
+    auto sym = [&] {
+        scoped_phase_t _p("host-orc-codegen");
+        return jit->lookup(lookup_name);
+    }();
     if (!sym)
     {
         llvm::logAllUnhandledErrors(sym.takeError(), llvm::errs(), "jit: ");
