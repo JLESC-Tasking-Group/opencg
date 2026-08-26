@@ -81,6 +81,14 @@ LLVM IR to a host function or device PTX):
 - `CGIR_JIT_CACHE_STATS` set to any non-empty value other than `0` to print, at
   process exit, the JIT result-cache outcomes split host/device: total programs,
   `compiled` (full compiles), `disk-reuse`, `mem-reuse`, and the overall reuse %.
+- `CGIR_JIT_STATS_CSV` set to a file path to append, at process exit, one
+  machine-readable row with the full JIT breakdown (mirrors `CGIR_STATS_CSV`):
+  the `tag` (`CGIR_STATS_TAG`, first column, to join back to a caller's run),
+  every timing phase as `<phase>_s`/`<phase>_n` (seconds/calls), and split
+  host/device cache counts (`{host,device}_{total,compiled,disk_reuse,mem_reuse}`).
+  The header is written when the file is new; rows accumulate across processes.
+  Enabling it also turns on the timing/cache collection (without the stderr dump);
+  a row is written only for runs that actually JIT-compiled.
 
 
 # Example

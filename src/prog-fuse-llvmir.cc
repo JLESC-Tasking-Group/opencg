@@ -149,6 +149,7 @@
 # include <utility>
 # include <vector>
 
+# include <sys/stat.h> /* stat (CGIR_JIT_STATS_CSV header-if-new) */
 # include <unistd.h>   /* getpid (atomic temp-file names for the on-disk cache) */
 
 # endif /* CGIR_SUPPORT_LLVM */
@@ -169,8 +170,12 @@ namespace {
 
 struct jit_profiler_t
 {
-    bool timing_on;
-    bool stats_on;
+    bool timing_on;      // collect per-phase timings
+    bool timing_print;   // print the timing table to stderr at exit
+    bool stats_on;       // collect cache outcomes
+    bool stats_print;    // print cache-stats to stderr at exit
+    std::string csv_path;// CGIR_JIT_STATS_CSV: append one machine-readable row at exit
+    std::string tag;     // CGIR_STATS_TAG: joins the row to a caller's run
 
     std::mutex                                mtx;
     std::unordered_map<std::string, double>   phase_secs;    // bucket -> seconds
@@ -185,8 +190,16 @@ struct jit_profiler_t
     {
         const char * t = getenv("CGIR_JIT_TIMING");
         const char * s = getenv("CGIR_JIT_CACHE_STATS");
-        timing_on = (t && t[0] && strcmp(t, "0") != 0);
-        stats_on  = (s && s[0] && strcmp(s, "0") != 0);
+        const char * c = getenv("CGIR_JIT_STATS_CSV");
+        const char * g = getenv("CGIR_STATS_TAG");
+        csv_path = (c && c[0] && strcmp(c, "0") != 0) ? c : "";
+        tag      = g ? g : "";
+        timing_print = (t && t[0] && strcmp(t, "0") != 0);
+        stats_print  = (s && s[0] && strcmp(s, "0") != 0);
+        // the CSV needs the data, so it implies collection (but not the stderr dump)
+        const bool csv_on = !csv_path.empty();
+        timing_on = timing_print || csv_on;
+        stats_on  = stats_print  || csv_on;
     }
 
     void add_phase(const char * name, double secs)
@@ -206,9 +219,71 @@ struct jit_profiler_t
         else                   mem_reuse[d]++;
     }
 
+    /* Canonical phase order for the CSV schema (kept in sync with the scoped_phase_t
+     * bucket names). A phase absent from a run is written as 0. */
+    static const std::vector<const char *> & csv_phases()
+    {
+        static const std::vector<const char *> P = {
+            "jit-total", "jit-parse", "fuse-total",
+            "host-optimize", "host-codegen", "host-link", "host-orc-create",
+            "dev-emit-total", "dev-spmdize", "dev-link-read", "dev-link-parse",
+            "dev-link-linkin", "dev-o3", "dev-ptx-emit",
+        };
+        return P;
+    }
+
+    /* Append one machine-readable row (mirrors CGIR_STATS_CSV): first column the
+     * CGIR_STATS_TAG (joins to the caller's run), then per phase <name>_s seconds
+     * and <name>_n calls, then split host/device cache counts. Header written once
+     * when the file is new/empty. */
+    void write_csv_row()
+    {
+        const auto & phases = csv_phases();
+        static std::mutex io_mtx;
+        std::lock_guard<std::mutex> lk(io_mtx);
+
+        struct stat st;
+        const bool need_header = (stat(csv_path.c_str(), &st) != 0 || st.st_size == 0);
+        FILE * f = fopen(csv_path.c_str(), "a");
+        if (!f) return ;
+
+        if (need_header)
+        {
+            fputs("tag", f);
+            for (const char * p : phases)
+            {
+                std::string col(p);
+                for (char & ch : col) if (ch == '-') ch = '_';
+                fprintf(f, ",%s_s,%s_n", col.c_str(), col.c_str());
+            }
+            for (const char * cls : { "host", "device" })
+                fprintf(f, ",%s_total,%s_compiled,%s_disk_reuse,%s_mem_reuse",
+                        cls, cls, cls, cls);
+            fputc('\n', f);
+        }
+
+        fputs(tag.c_str(), f);
+        for (const char * p : phases)
+        {
+            double        sec   = 0.0;
+            uint64_t      calls = 0;
+            if (auto it = phase_secs.find(p);  it != phase_secs.end())  sec   = it->second;
+            if (auto it = phase_calls.find(p); it != phase_calls.end()) calls = it->second;
+            fprintf(f, ",%.6f,%llu", sec, (unsigned long long) calls);
+        }
+        for (int d = 0 ; d < 2 ; ++d)
+            fprintf(f, ",%llu,%llu,%llu,%llu",
+                    (unsigned long long) (compiled[d] + disk_reuse[d] + mem_reuse[d]),
+                    (unsigned long long) compiled[d],
+                    (unsigned long long) disk_reuse[d],
+                    (unsigned long long) mem_reuse[d]);
+        fputc('\n', f);
+        fclose(f);
+    }
+
     ~jit_profiler_t()
     {
-        if (timing_on && !phase_secs.empty())
+        if (timing_print && !phase_secs.empty())
         {
             std::vector<std::pair<std::string, double>> v(phase_secs.begin(), phase_secs.end());
             std::sort(v.begin(), v.end(),
@@ -220,7 +295,7 @@ struct jit_profiler_t
                         p.first.c_str(), (unsigned long long) phase_calls[p.first], p.second);
             fprintf(stderr, "[cgir jit timing] (buckets nest: e.g. jit-total covers the rest)\n");
         }
-        if (stats_on)
+        if (stats_print)
         {
             for (int d = 0 ; d < 2 ; ++d)
             {
@@ -236,6 +311,11 @@ struct jit_profiler_t
                     100.0 * (double) (disk_reuse[d] + mem_reuse[d]) / (double) total);
             }
         }
+        // write the CSV row only for runs that actually JIT-compiled something
+        if (!csv_path.empty() && !(phase_secs.empty() &&
+            compiled[0] == 0 && disk_reuse[0] == 0 && mem_reuse[0] == 0 &&
+            compiled[1] == 0 && disk_reuse[1] == 0 && mem_reuse[1] == 0))
+            write_csv_row();
     }
 };
 
