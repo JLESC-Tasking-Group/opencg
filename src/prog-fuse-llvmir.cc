@@ -222,8 +222,8 @@ struct jit_profiler_t
                 const uint64_t distinct = (uint64_t) body_seen[d].size();
                 const uint64_t hits     = calls - distinct;
                 fprintf(stderr,
-                    "[cgir jit cache-stats] %-6s: %llu compiles, %llu distinct bodies, "
-                    "%llu redundant (%.1f%% would hit a content cache), %llu IR bytes\n",
+                    "[cgir jit cache-stats] %-6s: %llu bodies, %llu distinct, "
+                    "%llu redundant (%.1f%% reused unless CGIR_JIT_CACHE=0), %llu IR bytes\n",
                     d ? "device" : "host",
                     (unsigned long long) calls, (unsigned long long) distinct,
                     (unsigned long long) hits,
@@ -263,19 +263,108 @@ struct scoped_phase_t
     }
 };
 
-/* FNV-1a 64-bit over a byte range: cheap content hash for the cache-stat
- * would-be-hit estimate (and, later, the real cache key). */
+/* FNV-1a 64-bit over a byte range, chainable via `h` (seed the first call with
+ * jit_fnv1a). Cheap content hash for the cache key and the cache-stat estimate. */
 static uint64_t
-jit_fnv1a(const void * data, size_t n)
+jit_fnv1a_seed(uint64_t h, const void * data, size_t n)
 {
     const unsigned char * p = static_cast<const unsigned char *>(data);
-    uint64_t h = 1469598103934665603ULL;
     for (size_t i = 0 ; i < n ; ++i)
     {
         h ^= (uint64_t) p[i];
         h *= 1099511628211ULL;
     }
     return h;
+}
+
+static uint64_t
+jit_fnv1a(const void * data, size_t n)
+{
+    return jit_fnv1a_seed(1469598103934665603ULL, data, n);
+}
+
+/* Content key for the in-process JIT result cache: every byte/attribute a cached
+ * artifact depends on. Two task instances of the same construct share the same IR
+ * pointer, externs, proto and symbol, so they collide here (the intended reuse).
+ * Anything a recompile would fold in (constant-propagated or not) is part of the
+ * IR bytes, so a hit is always byte-identical to recompiling -- caching never
+ * changes generated code, it only skips reproducing it. */
+static uint64_t
+jit_cache_key(const command_prog_t * prog)
+{
+    const auto & L = prog->source.content.llvmir;
+    uint64_t h = jit_fnv1a(L.raw, L.size);
+    h = jit_fnv1a_seed(h, &L.proto, sizeof(L.proto));
+    if (L.symbol) h = jit_fnv1a_seed(h, L.symbol, strlen(L.symbol) + 1);
+    if (L.triple) h = jit_fnv1a_seed(h, L.triple, strlen(L.triple) + 1);
+    if (L.arch)   h = jit_fnv1a_seed(h, L.arch,   strlen(L.arch)   + 1);
+    for (size_t i = 0 ; L.externs && i < L.externs_count ; ++i)
+    {
+        if (L.externs[i].name)
+            h = jit_fnv1a_seed(h, L.externs[i].name, strlen(L.externs[i].name) + 1);
+        h = jit_fnv1a_seed(h, &L.externs[i].addr, sizeof(L.externs[i].addr));
+    }
+    return h;
+}
+
+/* Process-global in-process JIT result cache (Phase 1). Host: the compiled
+ * function pointer + prototype (the code stays mapped for the process via the
+ * leaked LLJIT). Device: the emitted PTX. A hit reuses the artifact and skips
+ * parse/optimize/codegen (host) or the whole spmdize/link/O3/emit pipeline
+ * (device) for every further instance of the same construct. Disable with
+ * CGIR_JIT_CACHE=0. Guarded for a future parallel jit pass. */
+struct jit_cache_t
+{
+    struct host_entry_t { int proto; void * fn; };
+
+    bool                                       enabled;
+    std::mutex                                 mtx;
+    std::unordered_map<uint64_t, host_entry_t> host;
+    std::unordered_map<uint64_t, std::string>  device_ptx;
+
+    jit_cache_t()
+    {
+        const char * e = getenv("CGIR_JIT_CACHE");
+        enabled = !(e && e[0] == '0' && e[1] == '\0');
+    }
+
+    bool host_get(uint64_t k, host_entry_t & out)
+    {
+        if (!enabled) return false;
+        std::lock_guard<std::mutex> lk(mtx);
+        auto it = host.find(k);
+        if (it == host.end()) return false;
+        out = it->second;
+        return true;
+    }
+    void host_put(uint64_t k, int proto, void * fn)
+    {
+        if (!enabled) return ;
+        std::lock_guard<std::mutex> lk(mtx);
+        host[k] = host_entry_t{proto, fn};
+    }
+    bool device_get(uint64_t k, std::string & out)
+    {
+        if (!enabled) return false;
+        std::lock_guard<std::mutex> lk(mtx);
+        auto it = device_ptx.find(k);
+        if (it == device_ptx.end()) return false;
+        out = it->second;
+        return true;
+    }
+    void device_put(uint64_t k, const std::string & ptx)
+    {
+        if (!enabled) return ;
+        std::lock_guard<std::mutex> lk(mtx);
+        device_ptx[k] = ptx;
+    }
+};
+
+static jit_cache_t &
+jit_cache(void)
+{
+    static jit_cache_t c;
+    return c;
 }
 
 } // namespace
@@ -2343,6 +2432,57 @@ emit_device_ptx(llvm::Module & M, const char * triple, const char * arch,
     }
     return std::string(out.begin(), out.end());
 }
+
+/* Install a compiled host JIT result onto `prog`, shared by the fresh-compile
+ * path and the in-process cache-hit path. For a STANDALONE packed leaf it also
+ * materializes the per-instance packed byte buffer from the recorded &value slots
+ * (params != NULL identifies the standalone case; prog-fuse clears params on a
+ * fused packed program). That packing is per-instance -- each prog has its own
+ * args -- so it runs on cache hits too; it is idempotent (args_size == 0 guard). */
+static void
+install_host_jit_result(command_prog_t * prog, void * fn_addr,
+                        bool entry_is_nanos6, bool entry_is_packed)
+{
+    if (entry_is_nanos6)
+    {
+        prog->prototype          = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_NANOS6;
+        prog->launcher.nanos6.fn = reinterpret_cast<void (*)(void **, void **, void **)>(fn_addr);
+    }
+    else if (entry_is_packed)
+    {
+        const cgir_command_prog_param_t * params = prog->source.content.llvmir.params;
+        const size_t nparams = prog->source.content.llvmir.param_count;
+        if (params != nullptr && nparams > 0 && prog->args_size == 0)
+        {
+            size_t buf_size = 0;
+            for (size_t k = 0 ; k < nparams ; ++k)
+            {
+                const size_t end = params[k].offset + params[k].size;
+                if (end > buf_size) buf_size = end;
+            }
+            if (buf_size == 0) buf_size = 1;
+            char * buf = static_cast<char *>(calloc(buf_size, 1));
+            if (!buf) { fprintf(stderr, "jit: calloc failed\n"); abort(); }
+            void ** slots = prog->args;
+            for (size_t k = 0 ; slots != nullptr && k < nparams ; ++k)
+                if (slots[k] != nullptr)
+                    memcpy(buf + params[k].offset, slots[k], params[k].size);
+            if (prog->_args_owned && prog->args)
+                free(prog->args);
+            prog->args        = reinterpret_cast<void **>(buf);
+            prog->n_args      = nparams;
+            prog->args_size   = buf_size;
+            prog->_args_owned = true;
+        }
+        prog->prototype          = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED;
+        prog->launcher.packed.fn = reinterpret_cast<void (*)(void *, size_t)>(fn_addr);
+    }
+    else
+    {
+        prog->prototype            = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC;
+        prog->launcher.variadic.fn = reinterpret_cast<void (*)(void **)>(fn_addr);
+    }
+}
 # endif /* CGIR_SUPPORT_LLVM */
 
 void
@@ -2429,6 +2569,11 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
                                       prog->source.content.llvmir.size),
                             prog->source.content.llvmir.size);
 
+    /* In-process result cache key (shared by the device and host paths). A hit
+     * reuses a prior instance's artifact; the key covers everything a recompile
+     * would reproduce, so a hit is byte-identical to recompiling. */
+    const uint64_t cache_key = jit_cache_key(prog);
+
     /* Device (GPU) target: compile the (fused) device kernel to PTX for the
      * device's triple/arch instead of the in-process host JIT. The PTX is stored
      * back in the source; the driver JIT-loads it (cuModuleLoadData) and resolves
@@ -2436,16 +2581,23 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
      * driver fills it once the module is loaded). */
     if (const char * dtriple = prog->source.content.llvmir.triple)
     {
-        std::string perr;
-        std::string ptx = emit_device_ptx(*mod, dtriple,
-                                           prog->source.content.llvmir.arch,
-                                           prog->source.content.llvmir.device_libs,
-                                           prog->source.content.llvmir.device_libs_count,
-                                           dump ? dump_dir : std::string(), perr);
-        if (ptx.empty())
+        /* Cache hit: reuse a prior instance's PTX and skip the whole
+         * spmdize/link/O3/emit pipeline (dev-emit-total). */
+        std::string ptx;
+        if (!jit_cache().device_get(cache_key, ptx))
         {
-            fprintf(stderr, "jit(device): PTX emission failed: %s\n", perr.c_str());
-            abort();
+            std::string perr;
+            ptx = emit_device_ptx(*mod, dtriple,
+                                  prog->source.content.llvmir.arch,
+                                  prog->source.content.llvmir.device_libs,
+                                  prog->source.content.llvmir.device_libs_count,
+                                  dump ? dump_dir : std::string(), perr);
+            if (ptx.empty())
+            {
+                fprintf(stderr, "jit(device): PTX emission failed: %s\n", perr.c_str());
+                abort();
+            }
+            jit_cache().device_put(cache_key, ptx);
         }
         if (dump)
         {
@@ -2473,6 +2625,20 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
         prog->prototype            = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC;
         prog->launcher.variadic.fn = nullptr;
         return ;
+    }
+
+    /* Host cache hit: reuse a prior instance's compiled function + prototype,
+     * skipping wrapper synthesis, optimize and ORC codegen. The per-instance
+     * packed-arg buffer is still (re)built by install_host_jit_result. */
+    {
+        jit_cache_t::host_entry_t hit;
+        if (jit_cache().host_get(cache_key, hit))
+        {
+            install_host_jit_result(prog, hit.fn,
+                hit.proto == (int) CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_NANOS6,
+                hit.proto == (int) CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED);
+            return ;
+        }
     }
 
     /* The runtime launches a JIT'd PROG as `void(void**)` (VARIADIC) or, for a
@@ -2675,57 +2841,14 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
     void * fn_addr = reinterpret_cast<void *>(static_cast<uintptr_t>(sym->getValue()));
     jit.release();
 
-    /* Install the compiled function, overwriting any previous value. A nanos6
-     * outline chain launches as fn(args_v, dev_v, transl_v); a packed entry as
-     * fn(args, args_size); anything else as a uniform void(void**) VARIADIC
-     * program over prog->args (a recorded OpenMP task was KMP before this; its
-     * kargs stay in prog->args). */
-    if (entry_is_nanos6)
-    {
-        prog->prototype          = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_NANOS6;
-        prog->launcher.nanos6.fn = reinterpret_cast<void (*)(void **, void **, void **)>(fn_addr);
-    }
-    else if (entry_is_packed)
-    {
-        /* A STANDALONE packed leaf (never fused) still carries the recorded
-         * per-value &value slots (void** args) plus its params table (prog-fuse
-         * clears params on a fused packed program, so params != NULL identifies
-         * the standalone case). The packed launcher expects a single packed byte
-         * buffer, so materialize it here from the slots at the params' offsets --
-         * the same layout the packed body reads. */
-        const cgir_command_prog_param_t * params = prog->source.content.llvmir.params;
-        const size_t nparams = prog->source.content.llvmir.param_count;
-        /* args_size == 0 means the recorded void** slots have not been packed yet
-         * (prog-fuse/a prior jit set args_size > 0), keeping this idempotent. */
-        if (params != nullptr && nparams > 0 && prog->args_size == 0)
-        {
-            size_t buf_size = 0;
-            for (size_t k = 0 ; k < nparams ; ++k)
-            {
-                const size_t end = params[k].offset + params[k].size;
-                if (end > buf_size) buf_size = end;
-            }
-            if (buf_size == 0) buf_size = 1;
-            char * buf = static_cast<char *>(calloc(buf_size, 1));
-            if (!buf) { fprintf(stderr, "jit: calloc failed\n"); abort(); }
-            void ** slots = prog->args;
-            for (size_t k = 0 ; slots != nullptr && k < nparams ; ++k)
-                if (slots[k] != nullptr)
-                    memcpy(buf + params[k].offset, slots[k], params[k].size);
-            if (prog->_args_owned && prog->args)
-                free(prog->args);
-            prog->args        = reinterpret_cast<void **>(buf);
-            prog->n_args      = nparams;
-            prog->args_size   = buf_size;
-            prog->_args_owned = true;
-        }
-        prog->prototype          = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED;
-        prog->launcher.packed.fn = reinterpret_cast<void (*)(void *, size_t)>(fn_addr);
-    }
-    else
-    {
-        prog->prototype            = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC;
-        prog->launcher.variadic.fn = reinterpret_cast<void (*)(void **)>(fn_addr);
-    }
+    /* Cache the compiled function (+ prototype) so further instances of this
+     * construct reuse it, then install it. A nanos6 outline chain launches as
+     * fn(args_v, dev_v, transl_v); a packed entry as fn(args, args_size);
+     * anything else as a uniform void(void**) VARIADIC over prog->args. */
+    const int proto = entry_is_nanos6 ? (int) CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_NANOS6
+                    : entry_is_packed ? (int) CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED
+                                      : (int) CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC;
+    jit_cache().host_put(cache_key, proto, fn_addr);
+    install_host_jit_result(prog, fn_addr, entry_is_nanos6, entry_is_packed);
     # endif /* CGIR_SUPPORT_LLVM */
 }
