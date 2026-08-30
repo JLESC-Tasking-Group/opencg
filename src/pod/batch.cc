@@ -113,6 +113,8 @@ command_graph_t::pass_batch(void)
             nodes[a].data.parent = b;
     };
 
+    // TODO: verify that this detects series formed after merging false-twins ?
+
     /* 1. flood-fill along same-device edges */
     for (int i = 0 ; i < n ; ++i)
     {
