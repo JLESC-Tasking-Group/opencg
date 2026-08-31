@@ -184,7 +184,7 @@ command_graph_t::pass_sequence(void)
         command_graph_t * sub = this->command_graph_new(this, u, tail);
         assert(sub);
         cmd->batch.cg    = sub;
-        sub->is_sequence = true;
+        sub->is_serial = true;
     }
 
 # ifndef NDEBUG

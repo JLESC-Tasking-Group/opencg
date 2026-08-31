@@ -100,8 +100,8 @@ enum command_graph_contraction_hint_t
     /* u,v are a sequence u -> v, with
      *  - 'u' having a single successor   (v)
      *  - 'v' having a single predecessor (u) */
-    COMMAND_GRAPH_CONTRACTION_HINT_U_V_SEQUENCE = (1 << 1),
-    COMMAND_GRAPH_CONTRACTION_HINT_V_U_SEQUENCE = (1 << 2),
+    COMMAND_GRAPH_CONTRACTION_HINT_U_V_SERIAL = (1 << 1),
+    COMMAND_GRAPH_CONTRACTION_HINT_V_U_SERIAL = (1 << 2),
 
     /* Contract {u,v} in place to that u := u (+) v, return u.
      * Else, return a new node w != u */
@@ -317,7 +317,7 @@ struct command_graph_t
      * tasks). Set by the batch pass on a batch's sub-graph; lets the runtime
      * replay the whole graph as a single "super" task instead of one task per
      * command. */
-    bool is_sequence = false;
+    bool is_serial = false;
 
     /** Methods to allocate command, nodes and graphs */
     command_constructor_t command_new;
@@ -363,7 +363,7 @@ struct command_graph_t
             this->entry->precedes(this->exit);
         }
         this->walk_id = 0;
-        this->is_sequence = false;
+        this->is_serial = false;
     }
 
     /* coherence checks */
@@ -458,7 +458,7 @@ struct command_graph_t
     }
 
     inline bool
-    are_sequence(
+    are_serial(
         command_graph_node_t * u,
         command_graph_node_t * v
     ) {
@@ -496,8 +496,8 @@ struct command_graph_t
      *
      *  You may provide these if the nodes {u,v} matches
      *      - COMMAND_GRAPH_CONTRACTION_HINT_FALSE_TWINS    u    v
-     *      - COMMAND_GRAPH_CONTRACTION_HINT_U_V_SEQUENCE   u -> v
-     *      - COMMAND_GRAPH_CONTRACTION_HINT_V_U_SEQUENCE   v -> u
+     *      - COMMAND_GRAPH_CONTRACTION_HINT_U_V_SERIAL   u -> v
+     *      - COMMAND_GRAPH_CONTRACTION_HINT_V_U_SERIAL   v -> u
      *
      *  You may provide
      *      - COMMAND_GRAPH_CONTRACTION_HINT_INPLACE
@@ -574,9 +574,9 @@ struct command_graph_t
             }
         }
         /* u -> v */
-        else if constexpr (hints & COMMAND_GRAPH_CONTRACTION_HINT_U_V_SEQUENCE)
+        else if constexpr (hints & COMMAND_GRAPH_CONTRACTION_HINT_U_V_SERIAL)
         {
-            assert(this->are_sequence(u, v));
+            assert(this->are_serial(u, v));
             if constexpr (hints & COMMAND_GRAPH_CONTRACTION_HINT_INPLACE)
             {
                 /* v successors' predecessors must point to u, not v anymore */
@@ -617,9 +617,9 @@ struct command_graph_t
             }
         }
         /* v -> u */
-        else if constexpr (hints & COMMAND_GRAPH_CONTRACTION_HINT_V_U_SEQUENCE)
+        else if constexpr (hints & COMMAND_GRAPH_CONTRACTION_HINT_V_U_SERIAL)
         {
-            assert(this->are_sequence(v, u));
+            assert(this->are_serial(v, u));
             if constexpr (hints & COMMAND_GRAPH_CONTRACTION_HINT_INPLACE)
             {
                 /* v predecessors' successors must point to u, not v anymore */

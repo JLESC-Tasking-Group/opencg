@@ -34,22 +34,6 @@
 ** knowledge of the CeCILL-C license and that you accept its terms.
 **/
 
-/*
- *  Tests for the `batch` pass (command_graph_t::pass_batch).
- *
- *  The pass groups nodes that share the SAME device into a single
- *  COMMAND_TYPE_BATCH command whose `batch.cg` sub-graph holds the grouped
- *  commands. Two contraction shapes are exercised (plus their combination):
- *
- *    1. sequence    : entry -> u -> v -> exit               (u->v batched)
- *    2. false-twins : entry -> {u, v} -> exit               (u,v independent)
- *    3. mixed       : entry -> u -> v -> exit, entry -> w -> exit
- *                     (u->v sequence, then w joins as a false twin)
- *
- *  Each case must collapse to exactly ONE top-level BATCH node whose inner
- *  graph contains all the original commands.
- */
-
 # include <stdint.h>
 # include <stdlib.h>
 # include <stdio.h>
@@ -60,16 +44,11 @@
 
 # include "cgir-tests.cc"
 
-/* Device shared by every batchable leaf command. The batch pass groups by node
- * device id, and entry/exit use CGIR_UNSPECIFIED_DEVICE_UNIQUE_ID, so giving the
- * leaves a real (identical) device id is what makes them eligible to batch. */
-static constexpr device_unique_id_t batch_device = 1;
-
 /* Allocate a fresh command + command node on `batch_device`. The concrete
  * command type is irrelevant to the batch pass; a cheap 1D copy keeps the node
  * well-formed (e.g. for dumping). */
 static command_graph_node_t *
-make_command_node(command_graph_t * cg)
+make_command_node(command_graph_t * cg, const device_unique_id_t batch_device)
 {
     command_t * cmd = command_new(cg, COMMAND_TYPE_COPY_D2D_1D);
     assert(cmd);
@@ -108,8 +87,7 @@ count_nodes(command_graph_t * cg)
 {
     size_t n = 0;
     cg->walk([&](command_graph_node_t * node) {
-        if (node != cg->node_get_entry() && node != cg->node_get_exit())
-            ++n;
+        ++n;
     });
     return n;
 }
@@ -131,17 +109,22 @@ single_node(command_graph_t * cg)
     return (n == 1) ? found : NULL;
 }
 
-/* Verify that `cg` collapsed to a single top-level BATCH node whose inner graph
- * holds exactly `expected_inner` commands. Returns 0 on success, 1 on failure. */
+/* Verify that `cg` collapsed to `expected_top_level` BATCH nodes whose inner graph
+ * holds exactly each `expected_inner` commands. Returns 0 on success, 1 on failure. */
 static int
-check_batch(command_graph_t * cg, const char * name, size_t expected_inner)
-{
+check_batch(
+    command_graph_t * cg,
+    const char * name,
+    size_t expected_top_level,
+    size_t expected_inner,
+    const device_unique_id_t batch_device
+) {
     cg->coherence_checks();
 
     size_t top = count_nodes(cg);
-    if (top != 1)
+    if (top != expected_top_level)
     {
-        fprintf(stderr, "FAIL [%s]: expected 1 top-level node after batch, got %zu\n", name, top);
+        fprintf(stderr, "FAIL [%s]: expected %zu top-level node after batch, got %zu\n", name, expected_top_level, top);
         return 1;
     }
 
@@ -190,12 +173,14 @@ check_batch(command_graph_t * cg, const char * name, size_t expected_inner)
 static int
 test_batch_sequence(void)
 {
+    constexpr device_unique_id_t device_unique_id = 1;
+
     command_graph_node_t * entry;
     command_graph_node_t * exit;
     command_graph_t * cg = make_graph(&entry, &exit);
 
-    command_graph_node_t * u = make_command_node(cg);
-    command_graph_node_t * v = make_command_node(cg);
+    command_graph_node_t * u = make_command_node(cg, device_unique_id);
+    command_graph_node_t * v = make_command_node(cg, device_unique_id);
 
     /* entry -> u -> v -> exit */
     entry->precedes(u);
@@ -206,7 +191,10 @@ test_batch_sequence(void)
     cg->optimize(COMMAND_GRAPH_PASS_BATCH);
     cg->dump("cg-post-batch-sequence.dot");
 
-    return check_batch(cg, "sequence", 2);
+    constexpr const char * const name     = "sequence";
+    constexpr size_t expected_top_level   = 3;
+    constexpr size_t expected_inner_level = 4;
+    return check_batch(cg, name, expected_top_level, expected_inner_level, device_unique_id);
 }
 
 /*
@@ -217,12 +205,14 @@ test_batch_sequence(void)
 static int
 test_batch_false_twins(void)
 {
+    constexpr device_unique_id_t device_unique_id = 1;
+
     command_graph_node_t * entry;
     command_graph_node_t * exit;
     command_graph_t * cg = make_graph(&entry, &exit);
 
-    command_graph_node_t * u = make_command_node(cg);
-    command_graph_node_t * v = make_command_node(cg);
+    command_graph_node_t * u = make_command_node(cg, device_unique_id);
+    command_graph_node_t * v = make_command_node(cg, device_unique_id);
 
     /* entry -> u -> exit and entry -> v -> exit (u, v independent) */
     entry->precedes(u);
@@ -234,7 +224,10 @@ test_batch_false_twins(void)
     cg->optimize(COMMAND_GRAPH_PASS_BATCH);
     cg->dump("cg-post-batch-false-twins.dot");
 
-    return check_batch(cg, "false-twins", 2);
+    constexpr const char * const name     = "false-twins";
+    constexpr size_t expected_top_level   = 3;
+    constexpr size_t expected_inner_level = 4;
+    return check_batch(cg, name, expected_top_level, expected_inner_level, device_unique_id);
 }
 
 /*
@@ -246,13 +239,15 @@ test_batch_false_twins(void)
 static int
 test_batch_mixed(void)
 {
+    constexpr device_unique_id_t device_unique_id = 1;
+
     command_graph_node_t * entry;
     command_graph_node_t * exit;
     command_graph_t * cg = make_graph(&entry, &exit);
 
-    command_graph_node_t * u = make_command_node(cg);
-    command_graph_node_t * v = make_command_node(cg);
-    command_graph_node_t * w = make_command_node(cg);
+    command_graph_node_t * u = make_command_node(cg, device_unique_id);
+    command_graph_node_t * v = make_command_node(cg, device_unique_id);
+    command_graph_node_t * w = make_command_node(cg, device_unique_id);
 
     /* entry -> u -> v -> exit  (sequence) */
     entry->precedes(u);
@@ -267,7 +262,10 @@ test_batch_mixed(void)
     cg->optimize(COMMAND_GRAPH_PASS_BATCH);
     cg->dump("cg-post-batch-mixed.dot");
 
-    return check_batch(cg, "mixed", 3);
+    constexpr const char * const name     = "mixed";
+    constexpr size_t expected_top_level   = 3;
+    constexpr size_t expected_inner_level = 5;
+    return check_batch(cg, name, expected_top_level, expected_inner_level, device_unique_id);
 }
 
 /*
@@ -285,22 +283,24 @@ test_batch_mixed(void)
 static int
 test_batch_island(void)
 {
+    constexpr device_unique_id_t device_unique_id = 1;
+
     command_graph_node_t * entry;
     command_graph_node_t * exit;
     command_graph_t * cg = make_graph(&entry, &exit);
 
-    command_graph_node_t * c1  = make_command_node(cg);
-    command_graph_node_t * c2  = make_command_node(cg);
-    command_graph_node_t * c3  = make_command_node(cg);
-    command_graph_node_t * c4  = make_command_node(cg);
-    command_graph_node_t * c6  = make_command_node(cg);
-    command_graph_node_t * c7  = make_command_node(cg);
-    command_graph_node_t * c8  = make_command_node(cg);
-    command_graph_node_t * c9  = make_command_node(cg);
-    command_graph_node_t * c10 = make_command_node(cg);
-    command_graph_node_t * c11 = make_command_node(cg);
-    command_graph_node_t * c12 = make_command_node(cg);
-    command_graph_node_t * c13 = make_command_node(cg);
+    command_graph_node_t * c1  = make_command_node(cg, device_unique_id);
+    command_graph_node_t * c2  = make_command_node(cg, device_unique_id);
+    command_graph_node_t * c3  = make_command_node(cg, device_unique_id);
+    command_graph_node_t * c4  = make_command_node(cg, device_unique_id);
+    command_graph_node_t * c6  = make_command_node(cg, device_unique_id);
+    command_graph_node_t * c7  = make_command_node(cg, device_unique_id);
+    command_graph_node_t * c8  = make_command_node(cg, device_unique_id);
+    command_graph_node_t * c9  = make_command_node(cg, device_unique_id);
+    command_graph_node_t * c10 = make_command_node(cg, device_unique_id);
+    command_graph_node_t * c11 = make_command_node(cg, device_unique_id);
+    command_graph_node_t * c12 = make_command_node(cg, device_unique_id);
+    command_graph_node_t * c13 = make_command_node(cg, device_unique_id);
 
     entry->precedes(c1);
     entry->precedes(c7);
@@ -326,7 +326,124 @@ test_batch_island(void)
     cg->optimize(COMMAND_GRAPH_PASS_BATCH);
     cg->dump("cg-post-batch-island.dot");
 
-    return check_batch(cg, "island", 12);
+    constexpr const char * const name     = "island";
+    constexpr size_t expected_top_level   = 3;
+    constexpr size_t expected_inner_level = 14;
+    return check_batch(cg, name, expected_top_level, expected_inner_level, device_unique_id);
+}
+
+/**
+ *         s
+ *        / \
+ *       0   0
+ *        \ /
+ *         0
+ *        / \
+ *       0   0
+ *        \ /
+ *         t
+ *
+ * should become
+ *
+ *         s
+ *         |
+ *       00000
+ *         |
+ *         t
+ */
+static int
+test_batch_false_twins_sequence(void)
+{
+    constexpr device_unique_id_t device_unique_id = 1;
+
+    command_graph_node_t * entry;
+    command_graph_node_t * exit;
+    command_graph_t * cg = make_graph(&entry, &exit);
+
+    command_graph_node_t * c1  = make_command_node(cg, device_unique_id);
+    command_graph_node_t * c2  = make_command_node(cg, device_unique_id);
+    command_graph_node_t * c3  = make_command_node(cg, device_unique_id);
+    command_graph_node_t * c4  = make_command_node(cg, device_unique_id);
+    command_graph_node_t * c5  = make_command_node(cg, device_unique_id);
+
+    entry->precedes(c1);
+    entry->precedes(c2);
+
+    c1->precedes(c3);
+    c2->precedes(c3);
+
+    c3->precedes(c4);
+    c3->precedes(c5);
+
+    c4->precedes(exit);
+    c5->precedes(exit);
+
+    cg->dump("cg-pre-batch-false-twins-sequence.dot");
+    cg->optimize(COMMAND_GRAPH_PASS_BATCH);
+    cg->dump("cg-post-batch-false-twins-sequence.dot");
+
+    constexpr const char * const name     = "false-twins-sequence";
+    constexpr size_t expected_top_level   = 3;
+    constexpr size_t expected_inner_level = 7;
+    return check_batch(cg, name, expected_top_level, expected_inner_level, device_unique_id);
+}
+
+/**
+ *         s
+ *       / | \
+ *      0  0  1
+ *       \ |  | \
+ *         0  1 1
+ *         | /
+ *         0
+ *         |
+ *         t
+ *
+ * should become
+ *
+ *         s
+ *        / \
+ *      000 111
+ *       | /
+ *       0
+ *       |
+ *       t
+ */
+static int
+test_batch_multi_dev(void)
+{
+    command_graph_node_t * entry;
+    command_graph_node_t * exit;
+    command_graph_t * cg = make_graph(&entry, &exit);
+
+    command_graph_node_t * c1  = make_command_node(cg, 0);
+    command_graph_node_t * c2  = make_command_node(cg, 0);
+    command_graph_node_t * c3  = make_command_node(cg, 1);
+    command_graph_node_t * c4  = make_command_node(cg, 0);
+    command_graph_node_t * c5  = make_command_node(cg, 1);
+    command_graph_node_t * c6  = make_command_node(cg, 1);
+    command_graph_node_t * c7  = make_command_node(cg, 0);
+
+    entry->precedes(c1);
+    entry->precedes(c2);
+    entry->precedes(c3);
+
+    c1->precedes(c4);
+    c2->precedes(c4);
+    c3->precedes(c5);
+    c3->precedes(c6);
+
+    c4->precedes(c7);
+    c5->precedes(c7);
+    c6->precedes(c7);
+
+    c7->precedes(exit);
+
+    cg->dump("cg-pre-batch-multi-dev.dot");
+    cg->optimize(COMMAND_GRAPH_PASS_BATCH);
+    cg->dump("cg-post-batch-multi-dev.dot");
+
+    return 0;
 }
 
 int
@@ -337,5 +454,7 @@ main(void)
     rc |= test_batch_false_twins();
     rc |= test_batch_mixed();
     rc |= test_batch_island();
+    rc |= test_batch_false_twins_sequence();
+    rc |= test_batch_multi_dev();
     return rc;
 }

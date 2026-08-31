@@ -39,7 +39,7 @@
  *
  *  The pass collapses a maximal linear chain (u -> v -> ... -> w) of same-device
  *  TASK_SPAWN PROG commands into a single COMMAND_TYPE_BATCH whose sub-graph is
- *  flagged `is_sequence`. Chains are broken by branches (a node with != 1
+ *  flagged `is_serial`. Chains are broken by branches (a node with != 1
  *  successor / predecessor) and by device changes.
  */
 
@@ -114,7 +114,7 @@ count_command_nodes(command_graph_t * cg)
 }
 
 /* Count the top-level BATCH nodes of `cg` (and, via `inner`, the size of the
- * unique one's is_sequence sub-graph when there is exactly one). */
+ * unique one's is_serial sub-graph when there is exactly one). */
 static size_t
 count_batches(command_graph_t * cg, command_graph_node_t ** the_batch)
 {
@@ -136,7 +136,7 @@ count_batches(command_graph_t * cg, command_graph_node_t ** the_batch)
 }
 
 /*
- *  A same-device chain of TASK_SPAWN progs collapses into ONE is_sequence batch.
+ *  A same-device chain of TASK_SPAWN progs collapses into ONE is_serial batch.
  *      entry -> a -> b -> c -> exit
  */
 static int
@@ -167,9 +167,9 @@ test_sequence_chain(void)
         fprintf(stderr, "FAIL [chain]: expected exactly 1 top-level BATCH\n");
         return 1;
     }
-    if (batch->command->batch.cg == NULL || !batch->command->batch.cg->is_sequence)
+    if (batch->command->batch.cg == NULL || !batch->command->batch.cg->is_serial)
     {
-        fprintf(stderr, "FAIL [chain]: batch sub-graph is not flagged is_sequence\n");
+        fprintf(stderr, "FAIL [chain]: batch sub-graph is not flagged is_serial\n");
         return 1;
     }
     if (batch->device_unique_id != task_device)
@@ -185,7 +185,7 @@ test_sequence_chain(void)
         return 1;
     }
 
-    fprintf(stdout, "PASS [chain]: collapsed to 1 is_sequence BATCH of %zu\n", inner);
+    fprintf(stdout, "PASS [chain]: collapsed to 1 is_serial BATCH of %zu\n", inner);
     return 0;
 }
 
@@ -255,10 +255,10 @@ test_sequence_device_split(void)
         return 1;
     }
     if (batch->command->batch.cg == NULL ||
-        !batch->command->batch.cg->is_sequence ||
+        !batch->command->batch.cg->is_serial ||
         count_command_nodes(batch->command->batch.cg) != 2)
     {
-        fprintf(stderr, "FAIL [device-split]: batch is not an is_sequence of 2\n");
+        fprintf(stderr, "FAIL [device-split]: batch is not an is_serial of 2\n");
         return 1;
     }
 

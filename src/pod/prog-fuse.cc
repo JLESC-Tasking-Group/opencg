@@ -97,7 +97,7 @@ command_graph_t::pass_prog_fuse(void)
         while (cur->successors.size() == 1)
         {
             command_graph_node_t * w = cur->successors.front();
-            if (!node_is_llvmir_prog(w) || !this->are_sequence(cur, w))
+            if (!node_is_llvmir_prog(w) || !this->are_serial(cur, w))
                 break ;
             /* only fuse programs with rigorously identical launch parameters
              * (grid/block and launch mode); every chain member must match the head u */
@@ -121,7 +121,7 @@ command_graph_t::pass_prog_fuse(void)
         /* Contract the chain into u (each successive node absorbed in series). */
         for (size_t k = 1 ; k < chain.size() ; ++k)
         {
-            this->contract<COMMAND_GRAPH_CONTRACTION_HINT_U_V_SEQUENCE | COMMAND_GRAPH_CONTRACTION_HINT_INPLACE>(u, chain[k]);
+            this->contract<COMMAND_GRAPH_CONTRACTION_HINT_U_V_SERIAL | COMMAND_GRAPH_CONTRACTION_HINT_INPLACE>(u, chain[k]);
             nodes[chain[k]->iterator_index].data.contracted = true;
         }
     }

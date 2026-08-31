@@ -264,7 +264,7 @@ command_graph_t::pass_batch(void)
 
     /* Connect each sub-graph's entry/exit to the island's sources/sinks. After
      * boundary removal a member's remaining edges are all internal, so a source
-     * has no predecessor and a sink no successor. (is_sequence stays false here;
+     * has no predecessor and a sink no successor. (is_serial stays false here;
      * linear task chains are handled by the dedicated 'sequence' pass.) */
     for (auto & kv : mat)
     {
