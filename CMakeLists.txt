@@ -46,15 +46,14 @@ SET(SOURCE_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/cgir.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/prog-fuse-llvmir.cc
     # POD interface implementation
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/command-graph.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/batch.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/sequence.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/command-graph.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/copy-fuse.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/copy-normalize.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/prog-fuse.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/jit.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/reduce-edge.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/prog-fuse.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/reduce-node.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/sequence.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/transitive-reduction.cc
 )
 
 if (BUILD_C_API)

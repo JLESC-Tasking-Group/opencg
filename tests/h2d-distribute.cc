@@ -93,7 +93,7 @@ main(void)
     /* optimize the cg */
     cg->optimize(
           COMMAND_GRAPH_PASS_REDUCE_NODE_BIT
-        | COMMAND_GRAPH_PASS_REDUCE_EDGE_BIT
+        | COMMAND_GRAPH_PASS_TRANSITIVE_REDUCTION_BIT
         | COMMAND_GRAPH_PASS_BATCH_BIT);
 
     return 0;

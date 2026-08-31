@@ -58,15 +58,14 @@ CGIR_NAMESPACE_BEGIN
  * set of passes is requested at once (command_graph_t::optimize(command_graph_pass_set_t)),
  * enabled passes are applied in this order. Keep reductions before batching, and
  * batching last. */
-# define CGIR_FORALL_COMMAND_GRAPH_PASS(F)                                                                       \
-    F(COMMAND_GRAPH_PASS_COPY_NORMALIZE,    pass_copy_normalize,    "copy-normalize",   create_copy_normalize_pass) \
-    F(COMMAND_GRAPH_PASS_COPY_FUSE,         pass_copy_fuse,         "copy-fuse",        create_copy_fuse_pass)      \
-    F(COMMAND_GRAPH_PASS_REDUCE_NODE,       pass_reduce_node,       "reduce-node",      create_reduce_node_pass)    \
-    F(COMMAND_GRAPH_PASS_REDUCE_EDGE,       pass_reduce_edge,       "reduce-edge",      create_reduce_edge_pass)    \
-    F(COMMAND_GRAPH_PASS_PROG_FUSE,         pass_prog_fuse,         "prog-fuse",        create_prog_fuse_pass)      \
-    F(COMMAND_GRAPH_PASS_JIT,               pass_jit,               "jit",              create_jit_pass)            \
-    F(COMMAND_GRAPH_PASS_SEQUENCE,          pass_sequence,          "sequence",         create_sequence_pass)       \
-    F(COMMAND_GRAPH_PASS_BATCH,             pass_batch,             "batch",            create_batch_pass)
+# define CGIR_FORALL_COMMAND_GRAPH_PASS(F)                                                                              \
+    F(COMMAND_GRAPH_PASS_COPY_FUSE,             pass_copy_fuse,         "copy-fuse",        create_copy_fuse_pass)      \
+    F(COMMAND_GRAPH_PASS_REDUCE_NODE,           pass_reduce_node,       "reduce-node",      create_reduce_node_pass)    \
+    F(COMMAND_GRAPH_PASS_TRANSITIVE_REDUCTION,  pass_reduce_edge,       "reduce-edge",      create_reduce_edge_pass)    \
+    F(COMMAND_GRAPH_PASS_PROG_FUSE,             pass_prog_fuse,         "prog-fuse",        create_prog_fuse_pass)      \
+    F(COMMAND_GRAPH_PASS_JIT,                   pass_jit,               "jit",              create_jit_pass)            \
+    F(COMMAND_GRAPH_PASS_SEQUENCE,              pass_sequence,          "sequence",         create_sequence_pass)       \
+    F(COMMAND_GRAPH_PASS_BATCH,                 pass_batch,             "batch",            create_batch_pass)
 
 enum command_graph_pass_t
 {

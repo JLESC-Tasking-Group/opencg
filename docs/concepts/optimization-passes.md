@@ -12,7 +12,7 @@ cg.pass_batch();
 
 ## Available Passes
 
-### Transitive Edge Reduction (reduce-edge)
+### Transitive Edge Reduction (transitive-reduction)
 
 Removes redundant edges from the graph. If node `v` is reachable from `u` through an intermediate path via `w`, the direct edge `u -> v` is redundant and can be removed.
 
@@ -96,7 +96,7 @@ cg.optimize(
     | COMMAND_GRAPH_PASS_BATCH_BIT);
 ```
 
-Enabled passes always run in a fixed *canonical order* — the order in which they are declared in `CGIR_FORALL_COMMAND_GRAPH_PASS` (`copy-normalize`, `copy-fuse`, `reduce-node`, `reduce-edge`, `prog-fuse`, `jit`, `sequence`, `batch`) — regardless of the order of the bits. This guarantees the reduction passes run before batching, so the graph is simplified before it is contracted.
+Enabled passes always run in a fixed *canonical order* — the order in which they are declared in `CGIR_FORALL_COMMAND_GRAPH_PASS` (`copy-normalize`, `copy-fuse`, `reduce-node`, `transitive-reduction`, `prog-fuse`, `jit`, `sequence`, `batch`) — regardless of the order of the bits. This guarantees the reduction passes run before batching, so the graph is simplified before it is contracted.
 
 A single pass can still be run on its own with the `command_graph_pass_t` overload:
 

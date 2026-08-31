@@ -54,16 +54,15 @@ struct copy_fuse_pls_t
 };
 
 static inline bool
-command_graph_pass_batch_try_fuse_copy(
+command_graph_pass_try_fuse_copy(
     command_graph_t * cg,
     command_graph_node_t * u,
     command_graph_node_t * v
 ) {
-    # define MUST(T) if (!(T)) return false;
-    MUST(u != v);
-    MUST(cg->are_false_twins(u, v));
-    MUST(u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND);
-    MUST(v->type == COMMAND_GRAPH_NODE_TYPE_COMMAND);
+    assert(u != v);
+    assert(u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND);
+    assert(v->type == COMMAND_GRAPH_NODE_TYPE_COMMAND);
+    assert(cg->are_false_twins(u, v));
     assert(u->command);
     assert(v->command);
 
@@ -83,8 +82,9 @@ command_graph_pass_batch_try_fuse_copy(
                 case (COMMAND_TYPE_COPY_D2D_1D):
                 {
                     // must have same src/dst device
-                    MUST(u->command->copy_1D.src_device_unique_id == v->command->copy_1D.src_device_unique_id &&
-                         u->command->copy_1D.dst_device_unique_id == v->command->copy_1D.dst_device_unique_id);
+                    if (u->command->copy_1D.src_device_unique_id != v->command->copy_1D.src_device_unique_id ||
+                        u->command->copy_1D.dst_device_unique_id != v->command->copy_1D.dst_device_unique_id)
+                        return false;
 
                     //  u's src
                     //  [.........................]
@@ -98,7 +98,8 @@ command_graph_pass_batch_try_fuse_copy(
                     //
 
                     // memory mapping src/dst must be contiguous
-                    MUST(u->command->copy_1D.src_device_addr - u->command->copy_1D.dst_device_addr == v->command->copy_1D.src_device_addr - v->command->copy_1D.dst_device_addr);
+                    if (u->command->copy_1D.src_device_addr - u->command->copy_1D.dst_device_addr != v->command->copy_1D.src_device_addr - v->command->copy_1D.dst_device_addr)
+                        return false;
 
                     // compute end of src segments
                     const uintptr_t u_src_bgn = u->command->copy_1D.src_device_addr;
@@ -166,8 +167,9 @@ command_graph_pass_batch_try_fuse_copy(
                 case (COMMAND_TYPE_COPY_D2D_2D):
                 {
                     // must be on the same device
-                    MUST(u->command->copy_2D.src_device_unique_id == v->command->copy_2D.src_device_unique_id &&
-                         u->command->copy_2D.dst_device_unique_id == v->command->copy_2D.dst_device_unique_id);
+                    if (u->command->copy_2D.src_device_unique_id != v->command->copy_2D.src_device_unique_id ||
+                        u->command->copy_2D.dst_device_unique_id != v->command->copy_2D.dst_device_unique_id)
+                        return false;
 
                     // byte-unit quantities
                     const size_t u_src_stride = u->command->copy_2D.sizeof_type * u->command->copy_2D.src_ld;
@@ -179,10 +181,12 @@ command_graph_pass_batch_try_fuse_copy(
                     const size_t v_col_bytes  = v->command->copy_2D.sizeof_type * v->command->copy_2D.m;
 
                     // Requires identical col length length, and row striding.
-                    MUST(u_col_bytes == v_col_bytes && u_src_stride == v_src_stride && u_dst_stride == v_dst_stride);
+                    if (u_col_bytes != v_col_bytes || u_src_stride != v_src_stride || u_dst_stride != v_dst_stride)
+                        return false;
 
                     // memory mapping src/dst must be contiguous
-                    MUST(u->command->copy_2D.src_addr - u->command->copy_2D.dst_addr == v->command->copy_2D.src_addr - v->command->copy_2D.dst_addr);
+                    if (u->command->copy_2D.src_addr - u->command->copy_2D.dst_addr != v->command->copy_2D.src_addr - v->command->copy_2D.dst_addr)
+                        return false;
 
                     //
                     //  Fusion possible case:
@@ -226,8 +230,65 @@ command_graph_pass_batch_try_fuse_copy(
         default:
             return false;
     }
+}
 
-    # undef MUST
+static inline void
+command_graph_pass_copy_fuse_normalize(command_t * command)
+{
+    assert(command);
+
+    /**
+     * if it is a 2D copy,
+     *  - normalize it to a 1D copy if possible
+     *  - set sizeof_type to 1 and scale dimensions
+     */
+
+    switch (command->type)
+    {
+        # define HANDLE_CASE(X)                                                         \
+            case (COMMAND_TYPE_COPY_##X##_2D):                                          \
+            {                                                                           \
+                if (command->copy_2D.m == command->copy_2D.src_ld &&                    \
+                    command->copy_2D.m == command->copy_2D.dst_ld)                      \
+                {                                                                       \
+                    command->type = COMMAND_TYPE_COPY_##X##_1D;                         \
+                                                                                        \
+                    const size_t src_addr = command->copy_2D.src_addr;                  \
+                    const size_t dst_addr = command->copy_2D.dst_addr;                  \
+                    const size_t m        = command->copy_2D.m;                         \
+                    const size_t n        = command->copy_2D.n;                         \
+                    const size_t s        = command->copy_2D.sizeof_type;               \
+                                                                                        \
+                    command->copy_1D.src_device_addr = src_addr;                        \
+                    command->copy_1D.dst_device_addr = dst_addr;                        \
+                    command->copy_1D.size            = m * n * s;                       \
+                                                                                        \
+                    break ;                                                             \
+                }                                                                       \
+                else                                                                    \
+                {                                                                       \
+                    /* normalize to byte units: scale the column extent AND both   */   \
+                    /* leading dimensions by the element size, otherwise the row   */   \
+                    /* strides would lose the 'sizeof_type' factor.                */   \
+                    const size_t s = command->copy_2D.sizeof_type;                      \
+                    command->copy_2D.sizeof_type = 1;                                   \
+                    command->copy_2D.m      = command->copy_2D.m      * s;              \
+                    command->copy_2D.src_ld = command->copy_2D.src_ld * s;              \
+                    command->copy_2D.dst_ld = command->copy_2D.dst_ld * s;              \
+                    break ;                                                             \
+                }                                                                       \
+            }
+
+        HANDLE_CASE(H2H);
+        HANDLE_CASE(H2D);
+        HANDLE_CASE(D2H);
+        HANDLE_CASE(D2D);
+
+        # undef HANDLE_CASE
+
+        default:
+            break ;
+    }
 }
 
 //  CGIR can generate multiple copies with same source, same destination, on contiguous memory.
@@ -243,7 +304,21 @@ command_graph_t::pass_copy_fuse(void)
     constexpr bool include_entry_exit = false;
     auto nodes = this->create_node_iterators<include_entry_exit, copy_fuse_pls_t>();
 
-    /* iterate through each original nodes */
+    /* 1. normalize copies */
+    for (command_graph_node_index_t i = 0 ; i < nodes.size() ; ++i)
+    {
+        command_graph_node_t * u = nodes[i].node;
+        assert(u);
+
+        /* for each command */
+        if (u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND)
+        {
+            assert(u->command);
+            command_graph_pass_copy_fuse_normalize(u->command);
+        }
+    }
+
+    /* 2. try fusing */
     for (command_graph_node_index_t i = 0 ; i < nodes.size() ; ++i)
     {
         auto & it = nodes[i];
@@ -260,10 +335,18 @@ command_graph_t::pass_copy_fuse(void)
 
 retry_node:
 
-        /* 1. detect false twins */
         for (command_graph_node_t * pred : u->predecessors)
+        {
             for (command_graph_node_t * v : pred->successors)
-                if (command_graph_pass_batch_try_fuse_copy(this, u, v))
+            {
+                if (u == v)                                     continue ;
+                if (u->type != COMMAND_GRAPH_NODE_TYPE_COMMAND) continue ;
+                if (v->type != COMMAND_GRAPH_NODE_TYPE_COMMAND) continue;
+                if (!this->are_false_twins(u, v))               continue ;
+
+                if (command_graph_pass_try_fuse_copy(this, u, v))
                     goto retry_node;
+            }
+        }
     }
 }

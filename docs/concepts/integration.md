@@ -26,7 +26,7 @@ To integrate CGIR into your own runtime:
 
 See `tests/h2d-distribute.cc` for a complete example that:
 1. Creates a command graph distributing a host buffer to 4 devices
-2. Runs `reduce-node`, `reduce-edge`, and `batch` passes
+2. Runs `reduce-node`, `transitive-reduction`, and `batch` passes
 3. Dumps the graph at each stage in Graphviz DOT format
 
 ## CMake Integration
