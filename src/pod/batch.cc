@@ -38,247 +38,409 @@
 # include <cgir/command.hpp>
 # include <cgir/command-graph.hpp>
 
-# include <algorithm>
-# include <map>
-# include <set>
-# include <tuple>
-# include <unordered_map>
-# include <vector>
-
-# include <assert.h>
+# include <queue>
+# include <stack>
 
 CGIR_NAMESPACE_USE;
 
-/*
- * BATCH PASS - group same-device "islands" into COMMAND_TYPE_BATCH sub-graphs so
- * a driver can capture each island as a single vendor graph (CUDA/HIP graph,
- * Level-Zero command list, ...).
- */
-
-/* per-node pass storage (the device stays on the node: node->device_unique_id) */
-struct batch_pls_t
+/* pass local storage */
+struct pass_batch_pls_t
 {
-    bool candidate;                 /* batching candidate (not entry/exit, not an opaque batch/graph node) */
-    int parent;                     /* union-find parent index (island detection) */
-    command_graph_node_t * rep;     /* representative top-level node after batching */
+    bool contracted;
+
+    pass_batch_pls_t(void) : contracted(false) {}
+    ~pass_batch_pls_t(void) {}
 };
+
+using node_t = command_graph_t::node_iterator_t<pass_batch_pls_t>;
+
+# define NODE_IS_ATOMIC(N) (N->type == COMMAND_GRAPH_NODE_TYPE_EMPTY || (N->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && N->command && (N->command->type != COMMAND_TYPE_BATCH || N->command->batch.cg == NULL)))
+
+/* A node is "sequence-able" (may belong to an OpenMP-task sequence) if it is a
+ * control node, or a PROG command whose launch mode is TASK_SPAWN (a recorded
+ * OpenMP task body). Copies, non-TASK_SPAWN progs and (nested) batches are not:
+ * a batch containing any of them is not a plain sequence of tasks. */
+# define NODE_IS_SEQABLE(N) (N->type == COMMAND_GRAPH_NODE_TYPE_EMPTY || (N->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && N->command && N->command->type == COMMAND_TYPE_PROG && N->command->prog.launch_mode == CGIR_COMMAND_PROG_LAUNCH_MODE_TASK_SPAWN))
+
+/**
+ *  Init a batch command
+ */
+template <command_graph_contraction_hint_t hint>
+inline void
+command_batch_init(
+    command_graph_t * original_cg,
+    command_graph_node_t * u,
+    command_graph_node_t * v
+) {
+    assert(original_cg);
+    assert(u);
+    assert(v);
+    assert(NODE_IS_ATOMIC(u));
+    assert(NODE_IS_ATOMIC(v));
+
+    /* retrieve original u/v commands */
+    command_t * cmd_u = u->command; // can be null if COMMAND_GRAPH_NODE_TYPE_EMPTY
+    command_t * cmd_v = v->command; // can be null if COMMAND_GRAPH_NODE_TYPE_EMPTY
+
+    /* create a new batch command */
+    assert(original_cg->command_new);
+    command_t * cmd = original_cg->command_new(original_cg, COMMAND_TYPE_BATCH);
+    assert(cmd);
+
+    /* replace u's command (since 'v' just got contracted into 'u'),
+     * we are building a new 'batch' command to the node 'u' here */
+    assert(original_cg->command_graph_new);
+    cmd->batch.cg = original_cg->command_graph_new(original_cg, NULL, NULL);
+    assert(cmd->batch.cg);
+
+    /* create new nodes corresponding to u and v in the new batch cg */
+    assert(cmd->batch.cg->command_graph_node_new);
+    command_graph_node_t * uu = cmd->batch.cg->command_graph_node_new(cmd->batch.cg, u->device_unique_id, u->type);
+    command_graph_node_t * vv = cmd->batch.cg->command_graph_node_new(cmd->batch.cg, v->device_unique_id, v->type);
+    assert(uu);
+    assert(vv);
+    uu->command = cmd_u;
+    vv->command = cmd_v;
+
+    /* update 'u' as it became a new batch command node */
+    u->type = COMMAND_GRAPH_NODE_TYPE_COMMAND;
+    u->command = cmd;
+
+    /* remove entry->exit edge in the new cg */
+    command_graph_node_t * entry = cmd->batch.cg->node_get_entry();
+    command_graph_node_t * exit  = cmd->batch.cg->node_get_exit();
+    assert(entry);
+    assert(exit);
+    entry->successors.clear();
+    exit->predecessors.clear();
+    assert(entry->predecessors.size() == 0);
+    assert(exit->successors.size() == 0);
+
+    if constexpr (hint == COMMAND_GRAPH_CONTRACTION_HINT_FALSE_TWINS)
+    {
+        entry->precedes(uu);
+        entry->precedes(vv);
+        uu->precedes(exit);
+        vv->precedes(exit);
+    }
+    else if constexpr (hint == COMMAND_GRAPH_CONTRACTION_HINT_U_V_SERIAL)
+    {
+        entry->precedes(uu);
+        uu->precedes(vv);
+        vv->precedes(exit);
+    }
+    else if constexpr (hint == COMMAND_GRAPH_CONTRACTION_HINT_V_U_SERIAL)
+    {
+        entry->precedes(uu);
+        vv->precedes(uu);
+        uu->precedes(exit);
+    }
+    else
+    {
+        abort();
+    }
+}
+
+/**
+ *  Add the node 'v' to the graph 'u_graph'.
+ *  The node 'v' may be allocated within another command graph
+ */
+template <command_graph_contraction_hint_t hint>
+static inline void
+command_graph_pass_batch_contract_batch_single_node(
+    command_graph_t * u_graph,
+    command_graph_node_t * v
+) {
+    assert(u_graph);
+    assert(v);
+    assert(NODE_IS_ATOMIC(v));
+
+    command_graph_node_t * u_entry = u_graph->node_get_entry();
+    command_graph_node_t * u_exit  = u_graph->node_get_exit();
+    assert(u_entry);
+    assert(u_exit);
+
+    /* clear original edges in 'v' */
+    v->predecessors.clear();
+    v->successors.clear();
+
+    /**
+     *      <>
+     *    /    \
+     *   Gu     v
+     *    \    /
+     *      <>
+     */
+    if constexpr (hint & COMMAND_GRAPH_CONTRACTION_HINT_FALSE_TWINS)
+    {
+        u_entry->precedes(v);
+        v->precedes(u_exit);
+    }
+    /**
+     *      < >
+     *       |
+     *      Gu
+     *       |
+     *       v
+     *       |
+     *      < >
+     */
+    else if constexpr (hint & COMMAND_GRAPH_CONTRACTION_HINT_U_V_SERIAL)
+    {
+        // connect u's exit predecessors to 'v'
+        for (command_graph_node_t * pred : u_exit->predecessors)
+        {
+            pred->successors.erase(std::find(pred->successors.begin(), pred->successors.end(), u_exit));
+            pred->precedes(v);
+        }
+        u_exit->predecessors.clear();
+
+        // connect 'v' to u's exit
+        v->precedes(u_exit);
+    }
+    /**
+     *      < >
+     *       |
+     *       v
+     *       |
+     *      Gu
+     *       |
+     *      < >
+     */
+    else if constexpr (hint & COMMAND_GRAPH_CONTRACTION_HINT_V_U_SERIAL)
+    {
+        // connect u's entry successors to 'v'
+        for (command_graph_node_t * succ : u_entry->successors)
+        {
+            succ->predecessors.erase(std::find(succ->predecessors.begin(), succ->predecessors.end(), u_entry));
+            v->precedes(succ);
+        }
+        u_entry->successors.clear();
+
+        // connect 'v' to u's entry
+        u_entry->precedes(v);
+    }
+    else
+    {
+        // LOGGER_FATAL("Not implemented");
+        abort();
+    }
+}
+
+/**
+ *  Merge the graph 'v' to 'u'
+ */
+template <command_graph_contraction_hint_t hint>
+static inline void
+command_graph_pass_batch_contract_batch_merge(
+    command_graph_node_t * u,
+    command_graph_node_t * v
+) {
+    assert(u);
+    assert(v);
+    assert(u->device_unique_id == v->device_unique_id);
+    assert(!NODE_IS_ATOMIC(u));
+    assert(!NODE_IS_ATOMIC(v));
+
+    command_graph_t * u_cg = u->command->batch.cg;
+    command_graph_t * v_cg = v->command->batch.cg;
+
+    command_graph_node_t * u_entry = u_cg->node_get_entry();
+    command_graph_node_t * u_exit  = u_cg->node_get_exit();
+    assert(u_entry);
+    assert(u_exit);
+
+    command_graph_node_t * v_entry = v_cg->node_get_entry();
+    command_graph_node_t * v_exit  = v_cg->node_get_exit();
+    assert(v_entry);
+    assert(v_exit);
+
+    // move all sources from v to u
+    for (command_graph_node_t * succ : v_entry->successors)
+    {
+        assert(succ != v_exit);
+        succ->predecessors.erase(std::find(succ->predecessors.begin(), succ->predecessors.end(), v_entry));
+        u_entry->precedes(succ);
+    }
+
+    // move all sinks from v to u
+    for (command_graph_node_t * pred : v_exit->predecessors)
+    {
+        assert(pred != v_entry);
+        pred->successors.erase(std::find(pred->successors.begin(), pred->successors.end(), v_exit));
+        pred->precedes(u_exit);
+    }
+}
+
+/* Contract u and v, whether being twins, u->v serial or v->u serial.
+ * One of the two node is removed from the graph, the other contracts both.
+ * The contracted one is returned. */
+template <command_graph_contraction_hint_t hint>
+static inline command_graph_node_t *
+command_graph_pass_batch_contract(
+    command_graph_t * cg,
+    command_graph_node_t * u,
+    command_graph_node_t * v,
+    std::vector<node_t> & nodes
+) {
+    assert(u->device_unique_id == v->device_unique_id);
+    assert(u->type != COMMAND_GRAPH_NODE_TYPE_COMMAND_GRAPH);
+    assert(v->type != COMMAND_GRAPH_NODE_TYPE_COMMAND_GRAPH);
+
+    if (NODE_IS_ATOMIC(u))
+    {
+        if (NODE_IS_ATOMIC(v))
+        {
+            // nothing to do
+        }
+        else
+        {
+            if constexpr(hint & COMMAND_GRAPH_CONTRACTION_HINT_U_V_SERIAL)
+                return command_graph_pass_batch_contract<COMMAND_GRAPH_CONTRACTION_HINT_V_U_SERIAL>(cg, v, u, nodes);
+            else if constexpr(hint & COMMAND_GRAPH_CONTRACTION_HINT_V_U_SERIAL)
+                return command_graph_pass_batch_contract<COMMAND_GRAPH_CONTRACTION_HINT_U_V_SERIAL>(cg, v, u, nodes);
+            else
+            {
+                static_assert(hint & COMMAND_GRAPH_CONTRACTION_HINT_FALSE_TWINS);
+                std::swap(u, v);
+            }
+        }
+    }
+    else
+    {
+        // u is non-atomic, so it must be a batch
+        assert(u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && u->command && u->command->type == COMMAND_TYPE_BATCH && u->command->batch.cg);
+        // nothing to do
+    }
+
+    /* always contract in place */
+    cg->contract<hint | COMMAND_GRAPH_CONTRACTION_HINT_INPLACE>(u, v);
+
+    /* mark 'v' as contracted to skip it from future contractions */
+    nodes[v->iterator_index].data.contracted = true;
+
+    /**
+     *  A node is atomic if it is empty, or a non-batch command, or a batch command with no CGIR attached
+     *
+     *  At this point, either
+     *      (a) u is atomic, v must be too      -> batch 'u' and 'v' to the new batch 'u'
+     *      (b) u is not atomic
+     *          (b.1) v is atomic               -> add 'v' to the graph of 'u'
+     *          (b.2) v is not atomic           -> merge the two graph 'u' and 'v'
+     */
+
+    // (a)
+    if (NODE_IS_ATOMIC(u))
+    {
+        assert(NODE_IS_ATOMIC(v));
+
+        /* capture seqability of both leaves before 'init' overwrites u->command */
+        const bool su = NODE_IS_SEQABLE(u);
+        const bool sv = NODE_IS_SEQABLE(v);
+
+        command_batch_init<hint>(cg, u, v);
+    }
+    // (b)
+    else
+    {
+        // (b.1)
+        if (NODE_IS_ATOMIC(v))
+        {
+            command_graph_pass_batch_contract_batch_single_node<hint>(u->command->batch.cg, v);
+        }
+        // (b.2)
+        else
+        {
+            command_graph_pass_batch_contract_batch_merge<hint>(u, v);
+        }
+    }
+
+    return u;
+}
+
+static inline bool
+command_graph_pass_batch_can_batch(
+    const command_graph_node_t * u,
+    const command_graph_node_t * v
+) {
+    return u != v && u->device_unique_id == v->device_unique_id && u->type != COMMAND_GRAPH_NODE_TYPE_COMMAND_GRAPH && v->type != COMMAND_GRAPH_NODE_TYPE_COMMAND_GRAPH;
+}
 
 void
 command_graph_t::pass_batch(void)
 {
-    /* Index every top-level node; node->iterator_index is its index in [0, n). */
-    constexpr bool include_entry_exit = true;
-    auto nodes = this->create_node_iterators<include_entry_exit, batch_pls_t>();
-    const int n = (int) nodes.size();
-    if (n <= 2)   /* only entry/exit: nothing to batch */
-        return ;
+    /* Iterate through all nodes, and contract until we tried all nodes.
+     * New node can be safely pushed-back: they will be iterated on. */
+    constexpr bool include_entry_exit = false;
+    std::vector<node_t> nodes = this->create_node_iterators<include_entry_exit, pass_batch_pls_t>();
 
-    command_graph_node_t * g_entry = this->node_get_entry();
-    command_graph_node_t * g_exit  = this->node_get_exit();
+    command_graph_node_t * exit = this->node_get_exit();
+    assert(exit);
 
-    /* initialize per-node storage: candidate flag (entry/exit and pre-existing
-     * batches / nested graphs are opaque boundaries, never grouped), union-find
-     * parent (self), and post-batch representative (self). */
-    for (int i = 0 ; i < n ; ++i)
+retry_node:
+    /* iterate through each original nodes */
+    for (command_graph_node_index_t i = 0 ; i < nodes.size() ; ++i)
     {
-        command_graph_node_t * u = nodes[i].node;
-        const bool boundary =
-            (u == g_entry) || (u == g_exit) ||
-            (u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND_GRAPH) ||
-            (u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && u->command && u->command->type == COMMAND_TYPE_BATCH);
-        nodes[i].data.candidate   = !boundary;
-        nodes[i].data.parent = i;
-        nodes[i].data.rep    = u;
-    }
+        node_t & node = nodes[i];
+        command_graph_node_t * u = node.node;
+        assert(u);
 
-    /* -------------------------------------------------------------------- *
-     * Detect islands: union-find flood-fill.                               *
-     * -------------------------------------------------------------------- */
-
-    auto find = [&] (int x)
-    {
-        while (nodes[x].data.parent != x)
+        /* if the node was already contracted, ignore it */
+        if (node.data.contracted)
         {
-            nodes[x].data.parent = nodes[nodes[x].data.parent].data.parent;
-            x = nodes[x].data.parent;
-        }
-        return x;
-    };
-
-    auto unite = [&] (int a, int b)
-    {
-        a = find(a);
-        b = find(b);
-        if (a != b)
-            nodes[a].data.parent = b;
-    };
-
-    // TODO: verify that this detects series formed after merging false-twins ?
-
-    /* 1. flood-fill along same-device edges */
-    for (int i = 0 ; i < n ; ++i)
-    {
-        if (!nodes[i].data.candidate)
+            // LOGGER_DEBUG("Skipping %zu: already contracted", u->index);
             continue ;
-        const device_unique_id_t di = nodes[i].node->device_unique_id;
-        for (command_graph_node_t * s : nodes[i].node->successors)
-        {
-            const int j = (int) s->iterator_index;
-            if (nodes[j].data.candidate && di == s->device_unique_id)
-                unite(i, j);
         }
-    }
+        assert(!node.data.contracted);
 
-    /* 2. fold same-device false twins: two islands with the same device and the
-     * same set of neighbor-islands (predecessors and successors) are twins. This
-     * is re-evaluated on the quotient until stable (so twins that only appear
-     * after an edge-merge, e.g. a sibling of a merged chain, are caught too). */
-    bool changed = true;
-    while (changed)
-    {
-        changed = false;
-
-        std::unordered_map<int, std::set<int>> rpred, rsucc;
-        for (int i = 0 ; i < n ; ++i)
+        /* 1. detect false twins */
+        for (command_graph_node_t * pred : u->predecessors)
         {
-            const int ri = find(i);
-            for (command_graph_node_t * s : nodes[i].node->successors)
+            for (command_graph_node_t * v : pred->successors)
             {
-                const int rj = find((int) s->iterator_index);
-                if (ri != rj)
+                if (command_graph_pass_batch_can_batch(u, v))
                 {
-                    rsucc[ri].insert(rj);
-                    rpred[rj].insert(ri);
+                    if (this->are_false_twins(u, v))
+                    {
+                        command_graph_pass_batch_contract<COMMAND_GRAPH_CONTRACTION_HINT_FALSE_TWINS>(this, u, v, nodes);
+                        goto retry_node;
+                    }
                 }
             }
         }
 
-        std::map<std::tuple<device_unique_id_t, std::set<int>, std::set<int>>, int> seen;
-        for (int i = 0 ; i < n ; ++i)
+        /* 2. detect u->v sequence */
+        for (command_graph_node_t * v : u->successors)
         {
-            if (!nodes[i].data.candidate || find(i) != i)   /* candidate island roots only */
+            if (v == exit)
                 continue ;
-            auto key = std::make_tuple(nodes[i].node->device_unique_id, rpred[i], rsucc[i]);
-            auto it  = seen.find(key);
-            if (it == seen.end())
-                seen.emplace(std::move(key), i);
-            else
+
+            assert(u != v);
+            if (command_graph_pass_batch_can_batch(u, v))
             {
-                unite(i, it->second);
-                changed = true;
+                if (this->are_sequence(u, v))
+                {
+                    command_graph_pass_batch_contract<COMMAND_GRAPH_CONTRACTION_HINT_U_V_SERIAL>(this, u, v, nodes);
+                    goto retry_node;
+                }
+            }
+        }
+
+        /* 3. detect v->u sequence */
+        for (command_graph_node_t * v : u->predecessors)
+        {
+            if (v == entry)
+                continue ;
+
+            assert(u != v);
+            if (command_graph_pass_batch_can_batch(u, v))
+            {
+                if (this->are_sequence(v, u))
+                {
+                    command_graph_pass_batch_contract<COMMAND_GRAPH_CONTRACTION_HINT_V_U_SERIAL>(this, u, v, nodes);
+                    goto retry_node;
+                }
             }
         }
     }
-
-    /* group members by island root (candidates only) */
-    std::unordered_map<int, std::vector<command_graph_node_t *>> island;
-    for (int i = 0 ; i < n ; ++i)
-        if (nodes[i].data.candidate)
-            island[find(i)].push_back(nodes[i].node);
-
-    /* -------------------------------------------------------------------- *
-     * Materialize each island with >= 2 COMMAND members.                   *
-     * -------------------------------------------------------------------- */
-
-    /* nodes[i].data.rep already holds each node's post-batch representative
-     * (itself); materialization overwrites it with the BATCH node for members. */
-    struct island_mat_t
-    {
-        command_graph_t *      sub;
-        command_graph_node_t * s_entry;
-        command_graph_node_t * s_exit;
-    };
-    std::unordered_map<int, island_mat_t> mat;
-
-    for (auto & kv : island)
-    {
-        std::vector<command_graph_node_t *> & members = kv.second;
-
-        int                ncmd = 0;
-        device_unique_id_t gdev = nodes[kv.first].node->device_unique_id;
-        for (command_graph_node_t * m : members)
-        {
-            if (m->type == COMMAND_GRAPH_NODE_TYPE_COMMAND)
-            {
-                if (ncmd == 0)
-                    gdev = m->device_unique_id;
-                ++ncmd;
-            }
-        }
-        if (ncmd < 2)
-            continue ;
-
-        /* fresh BATCH command + its (initialized) sub command-graph */
-        assert(this->command_new && this->command_graph_new && this->command_graph_node_new);
-        command_t * cmd = this->command_new(this, COMMAND_TYPE_BATCH);
-        assert(cmd);
-
-        command_graph_t * sub = this->command_graph_new(this, nullptr, nullptr);
-        assert(sub);
-        cmd->batch.cg = sub;
-
-        command_graph_node_t * s_entry = sub->node_get_entry();
-        command_graph_node_t * s_exit  = sub->node_get_exit();
-        s_entry->successors.clear();     /* drop the default entry->exit edge */
-        s_exit->predecessors.clear();
-
-        /* fresh top-level BATCH node; every member maps to it */
-        command_graph_node_t * B = this->command_graph_node_new(this, gdev, COMMAND_GRAPH_NODE_TYPE_COMMAND);
-        assert(B);
-        B->command = cmd;
-        for (command_graph_node_t * m : members)
-            nodes[m->iterator_index].data.rep = B;
-
-        mat[kv.first] = island_mat_t{ sub, s_entry, s_exit };
-    }
-
-    /* Rewire boundaries only: every original edge whose endpoints map to
-     * different representatives is moved onto the batch node(s); internal edges
-     * (both endpoints in the same island) are left physically untouched. */
-    for (int i = 0 ; i < n ; ++i)
-    {
-        command_graph_node_t * u  = nodes[i].node;
-        assert(u);
-
-        /* for each edge u->v */
-        for (auto it = u->successors.begin(); it != u->successors.end(); )
-        {
-            command_graph_node_t * v = *it;
-            assert(v);
-
-            command_graph_node_t * ru = nodes[u->iterator_index].data.rep;
-            command_graph_node_t * rv = nodes[v->iterator_index].data.rep;
-            assert(ru);
-            assert(rv);
-
-            if (ru == rv)           { ++it; continue; } /* internal to one island: keep as-is */
-            if (ru == u && rv == v) { ++it; continue; } /* neither endpoint batched: keep as-is */
-
-            /* boundary edge: detach the original, add the mapped one (deduplicated) */
-            it = u->successors.erase(it);
-            v->predecessors.erase(std::find(v->predecessors.begin(), v->predecessors.end(), u));
-            if (std::find(ru->successors.begin(), ru->successors.end(), rv) == ru->successors.end())
-                ru->precedes(rv);
-        }
-    }
-
-    /* Connect each sub-graph's entry/exit to the island's sources/sinks. After
-     * boundary removal a member's remaining edges are all internal, so a source
-     * has no predecessor and a sink no successor. (is_sequence stays false here;
-     * linear task chains are handled by the dedicated 'sequence' pass.) */
-    for (auto & kv : mat)
-    {
-        island_mat_t & M       = kv.second;
-        auto &         members = island[kv.first];
-
-        for (command_graph_node_t * m : members)
-        {
-            if (m->predecessors.empty()) M.s_entry->precedes(m);
-            if (m->successors.empty())   m->precedes(M.s_exit);
-        }
-    }
-
-# ifndef NDEBUG
-    this->coherence_checks();
-# endif
 }
