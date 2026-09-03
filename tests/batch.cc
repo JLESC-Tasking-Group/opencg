@@ -166,6 +166,67 @@ check_batch(
     return 0;
 }
 
+/* Verify the *shape* of the result: `expected_top_level` top-level nodes, of
+ * which the BATCH ones hold exactly the command counts of `expected_sizes`
+ * (given in decreasing order, entry/exit of the sub-graphs excluded).
+ *
+ * This is the checker for the partition itself, and the two tests below use it
+ * to pin the cases the previous heuristic got wrong. Returns 0 on success. */
+static int
+check_batch_sizes(
+    command_graph_t * cg,
+    const char * name,
+    size_t expected_top_level,
+    const size_t * expected_sizes,
+    size_t expected_nbatch
+) {
+    cg->coherence_checks();
+
+    const size_t top = count_nodes(cg);
+    if (top != expected_top_level)
+    {
+        fprintf(stderr, "FAIL [%s]: expected %zu top-level nodes, got %zu\n",
+                name, expected_top_level, top);
+        return 1;
+    }
+
+    /* collect the batch sizes, then sort them decreasing */
+    size_t sizes[64];
+    size_t nbatch = 0;
+    cg->walk([&](command_graph_node_t * node) {
+        if (node->type == COMMAND_GRAPH_NODE_TYPE_COMMAND &&
+            node->command && node->command->type == COMMAND_TYPE_BATCH)
+        {
+            assert(node->command->batch.cg);
+            assert(nbatch < sizeof(sizes) / sizeof(sizes[0]));
+            sizes[nbatch++] = count_nodes(node->command->batch.cg) - 2;
+        }
+    });
+    for (size_t i = 0 ; i < nbatch ; ++i)
+        for (size_t j = i + 1 ; j < nbatch ; ++j)
+            if (sizes[j] > sizes[i])
+            {
+                const size_t tmp = sizes[i]; sizes[i] = sizes[j]; sizes[j] = tmp;
+            }
+
+    if (nbatch != expected_nbatch)
+    {
+        fprintf(stderr, "FAIL [%s]: expected %zu batches, got %zu\n",
+                name, expected_nbatch, nbatch);
+        return 1;
+    }
+    for (size_t i = 0 ; i < nbatch ; ++i)
+        if (sizes[i] != expected_sizes[i])
+        {
+            fprintf(stderr, "FAIL [%s]: batch %zu holds %zu commands, expected %zu\n",
+                    name, i, sizes[i], expected_sizes[i]);
+            return 1;
+        }
+
+    fprintf(stdout, "PASS [%s]: %zu top-level nodes, %zu batches\n", name, top, nbatch);
+    return 0;
+}
+
 /* Verify that `cg` collapsed to exactly two BATCH nodes, one per device, that
  * each holds `inner` nodes (commands plus the sub-graph entry/exit), and that
  * the two are *concurrent*: neither is a predecessor of the other, and both
@@ -548,6 +609,125 @@ test_batch_multi_dev(void)
     return check_two_parallel_batches(cg, name, expected_top_level, 0, 1, expected_inner);
 }
 
+/**
+ *          s
+ *          |
+ *          d            d, b, c on device 1; a on device 0
+ *         / \
+ *        a   |
+ *       / \  |
+ *      c   \ |
+ *       \   \|
+ *        `--- b
+ *             |
+ *             t
+ *
+ * Edges: s->d, d->a, d->b, a->b, a->c, c->b, b->t.
+ *
+ * {b, c} is admissible: N-({b,c}) = {a, d} and both precede b and c (d < a < c),
+ * N+({b,c}) = {t}. The optimum is therefore 3 parts: {a}, {b,c}, {d}.
+ *
+ * The previous seed/merge/restrict/extend heuristic returned 4 parts and no
+ * batch at all: seed put the whole device-1 component {b,c,d} in one island,
+ * restrict saw a in N-(S) with a not before d and evicted a's successors
+ * {b,c}, and extend could not put them back -- not next to d, since a still
+ * does not precede d, and not next to each other, since an evicted node was
+ * never a host. Refinement has no such order dependence: it splits {b,c,d} by
+ * a into {d} and {b,c}, and stops there.
+ */
+static int
+test_batch_minimal_gap(void)
+{
+    command_graph_node_t * entry;
+    command_graph_node_t * exit;
+    command_graph_t * cg = make_graph(&entry, &exit);
+
+    command_graph_node_t * a = make_command_node(cg, 0);
+    command_graph_node_t * b = make_command_node(cg, 1);
+    command_graph_node_t * c = make_command_node(cg, 1);
+    command_graph_node_t * d = make_command_node(cg, 1);
+
+    entry->precedes(d);
+    d->precedes(a);
+    d->precedes(b);
+    a->precedes(b);
+    a->precedes(c);
+    c->precedes(b);
+    b->precedes(exit);
+
+    cg->optimize(COMMAND_GRAPH_PASS_BATCH);
+
+    /* entry, exit, a, d, and one batch {b,c} */
+    constexpr size_t expected_top_level = 5;
+    constexpr size_t expected_sizes[]   = { 2 };
+    return check_batch_sizes(cg, "minimal-gap", expected_top_level, expected_sizes, 1);
+}
+
+/**
+ * The 12-node graph of test_batch_island, with c4 moved to a second device.
+ *
+ * On one device the whole graph is a single admissible set (test_batch_island).
+ * Moving one node away breaks it, and the answer is then the interesting part
+ * of the structure: the admissible sets of this order are its 19 modules, and
+ * the maximal monochromatic ones are
+ *      {c7, c13, c8, c9}, {c2, c3}, {c10, c11}
+ * plus the four singletons {c1}, {c4}, {c6}, {c12} -- 7 parts, 3 batched.
+ *
+ * The previous heuristic returned 9 parts and a single batch here: seed put
+ * the eleven device-1 nodes in one island, restrict shredded it down to
+ * {c7, c13, c8, c9}, and extend could not rebuild {c2, c3} or {c10, c11},
+ * because the nodes restrict had evicted were never hosts for one another.
+ */
+static int
+test_batch_island_two_dev(void)
+{
+    constexpr device_unique_id_t dev = 1;
+
+    command_graph_node_t * entry;
+    command_graph_node_t * exit;
+    command_graph_t * cg = make_graph(&entry, &exit);
+
+    command_graph_node_t * c1  = make_command_node(cg, dev);
+    command_graph_node_t * c2  = make_command_node(cg, dev);
+    command_graph_node_t * c3  = make_command_node(cg, dev);
+    command_graph_node_t * c4  = make_command_node(cg, 2);      /* the odd one */
+    command_graph_node_t * c6  = make_command_node(cg, dev);
+    command_graph_node_t * c7  = make_command_node(cg, dev);
+    command_graph_node_t * c8  = make_command_node(cg, dev);
+    command_graph_node_t * c9  = make_command_node(cg, dev);
+    command_graph_node_t * c10 = make_command_node(cg, dev);
+    command_graph_node_t * c11 = make_command_node(cg, dev);
+    command_graph_node_t * c12 = make_command_node(cg, dev);
+    command_graph_node_t * c13 = make_command_node(cg, dev);
+
+    entry->precedes(c1);
+    entry->precedes(c7);
+    entry->precedes(c13);
+
+    c1->precedes(c2);
+    c2->precedes(c3);
+    c3->precedes(c4);
+    c3->precedes(c6);
+    c4->precedes(exit);
+    c6->precedes(exit);
+
+    c7->precedes(c8);
+    c8->precedes(c9);
+    c9->precedes(c10);
+    c9->precedes(c12);
+    c10->precedes(c11);
+    c11->precedes(c2);
+    c12->precedes(c6);
+    c13->precedes(c8);
+
+    cg->optimize(COMMAND_GRAPH_PASS_BATCH);
+
+    /* entry, exit, the 4 unbatched commands, and 3 batches */
+    constexpr size_t expected_top_level = 9;
+    constexpr size_t expected_sizes[]   = { 4, 2, 2 };
+    return check_batch_sizes(cg, "island-two-dev", expected_top_level, expected_sizes, 3);
+}
+
 int
 main(void)
 {
@@ -558,5 +738,7 @@ main(void)
     rc |= test_batch_island();
     rc |= test_batch_false_twins_sequence();
     rc |= test_batch_multi_dev();
+    rc |= test_batch_minimal_gap();
+    rc |= test_batch_island_two_dev();
     return rc;
 }

@@ -64,38 +64,44 @@ CGIR_NAMESPACE_USE;
  * commands, and on a multi-device graph serializes whole devices. Admissible
  * also implies convex, so it rules out the cycle a non-convex packing creates.
  *
- * Four stages:
- *      1. seed     - same-device connected components
- *      2. merge    - fold same-device twin islands, to a fixed point
- *      3. restrict - drop members until every island is admissible
- *      4. extend   - add unpacked nodes back while admissibility is preserved
+ * The pass wants the fewest islands. That reads like a search, and it is not:
  *
- * Stages 1-2 deliberately ignore admissibility, and stage 3 is not cleanup: it
- * is the projection back onto the feasible sets. The order cannot be changed:
+ *   - S is admissible for the precedence relation iff every node outside S is
+ *     uniformly related to S -- before all of it, after all of it, or
+ *     concurrent with all of it. Such a set is a *module* (autonomous set) of
+ *     the partial order '<'.
  *
- *   - Re-running stage 1 after stage 3 does not terminate. It would re-absorb
- *     exactly the node stage 3 removed (they are joined by a same-device edge),
- *     so the two would oscillate with period two.
+ *   - Two modules that share a node have a union that is a module, and two
+ *     monochromatic sets that share a node carry the same device. So the
+ *     admissible sets holding a given node have a greatest element, the
+ *     maximal admissible sets are pair-wise disjoint, and they form the unique
+ *     coarsest -- hence smallest -- admissible partition.
  *
- *   - Growing only through admissible states -- never producing a broken island
- *     in the first place -- cannot reach the answer, because admissibility is
- *     not closed under union. In tests/batch.cc test_batch_island, of the 4095
- *     non-trivial subsets only 19 are admissible, with sizes {1,2,3,4,12}, and
- *     no bipartition of the 12 nodes into two admissible halves exists. The
- *     correct 12-node packing is admissible but unreachable by any merge
- *     sequence that keeps every intermediate admissible; such a scheme stops at
- *     size 4.
+ * Computing it is one partition refinement: start from the partition by device
+ * and, as long as some node x outside a class C is not uniformly related to C,
+ * split C by the relation x has with its members. No admissible set is ever
+ * cut, because a splitter of C lies outside every admissible subset of C, so
+ * at the fixed point every class *is* the maximal admissible set of its
+ * members. See the "Minimum Monochromatic and Parallelism-Preserving
+ * Partitioning" subsection of the paper, and rocq/theories/P7_Optimum.v for
+ * the machine-checked statement (Pstar_partition, opt_card).
  *
- * Stage 4 exists so that saturation is a postcondition rather than a hope: on
- * exit, no unpacked node can be added to any island. It cannot loop with stage
- * 3, because every addition it makes preserves admissibility.
+ * The previous four-stage heuristic (seed / merge / restrict / extend) is gone.
+ * It was not exact: growing by pair-wise merges of admissible sets cannot reach
+ * every admissible set, because admissibility is not closed under union of
+ * *disjoint* sets. In tests/batch.cc test_batch_island, of the 4095 non-trivial
+ * subsets exactly 19 are admissible, with sizes {1,2,3,4,12} -- those 19 are
+ * precisely the modules of that order -- and no bipartition of the 12 nodes
+ * into two admissible halves exists, so no merge sequence that keeps every
+ * intermediate admissible reaches the correct 12-node packing. Refinement comes
+ * from above instead of from below, and does not have that blind spot.
  */
 
 /* per-node pass storage (the device stays on the node: node->device_unique_id) */
 struct batch_pls_t
 {
     bool candidate;                 /* batching candidate (not entry/exit, not an opaque batch/graph node) */
-    int parent;                     /* union-find parent index (island detection) */
+    int cls;                        /* refinement class index, or -1 for a non-candidate */
     command_graph_node_t * rep;     /* representative top-level node after batching */
 };
 
@@ -113,8 +119,8 @@ command_graph_t::pass_batch(void)
     command_graph_node_t * g_exit  = this->node_get_exit();
 
     /* initialize per-node storage: candidate flag (entry/exit and pre-existing
-     * batches / nested graphs are opaque boundaries, never grouped), union-find
-     * parent (self), and post-batch representative (self). */
+     * batches / nested graphs are opaque boundaries, never grouped), refinement
+     * class (none yet), and post-batch representative (self). */
     for (int i = 0 ; i < n ; ++i)
     {
         command_graph_node_t * u = nodes[i].node;
@@ -122,352 +128,127 @@ command_graph_t::pass_batch(void)
             (u == g_entry) || (u == g_exit) ||
             (u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND_GRAPH) ||
             (u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && u->command && u->command->type == COMMAND_TYPE_BATCH);
-        nodes[i].data.candidate   = !boundary;
-        nodes[i].data.parent = i;
-        nodes[i].data.rep    = u;
+        nodes[i].data.candidate = !boundary;
+        nodes[i].data.cls       = -1;
+        nodes[i].data.rep       = u;
     }
 
     /* -------------------------------------------------------------------- *
-     * Detect islands: union-find flood-fill.                               *
+     * Partition into maximal admissible sets, by refinement.               *
+     *                                                                      *
+     * Start from the partition of the candidates by device, then split a   *
+     * class C by any node x outside it that C's members do not all see the *
+     * same way: the members x precedes, those that precede x, and those    *
+     * concurrent with x, become three classes.  Iterate to a fixed point.  *
+     *                                                                      *
+     * Correctness: refinement only splits, so every class stays            *
+     * monochromatic; the stopping condition is exactly admissibility; and  *
+     * an admissible T inside a class C is never cut, because a splitter of *
+     * C lies outside C, hence outside T, hence sees all of T the same way. *
+     * Each split adds a class, so at most |V| - 1 of them happen.          *
      * -------------------------------------------------------------------- */
 
-    auto find = [&] (int x)
+    /* initial classes: one per device, over the candidates only */
+    int ncls = 0;
     {
-        while (nodes[x].data.parent != x)
+        std::unordered_map<device_unique_id_t, int> by_device;
+        for (int i = 0 ; i < n ; ++i)
         {
-            nodes[x].data.parent = nodes[nodes[x].data.parent].data.parent;
-            x = nodes[x].data.parent;
-        }
-        return x;
-    };
-
-    auto unite = [&] (int a, int b)
-    {
-        a = find(a);
-        b = find(b);
-        if (a != b)
-            nodes[a].data.parent = b;
-    };
-
-    /* Stage 1 needs no explicit series rule, and needs no re-run after stage 2:
-     *   - a series edge is a same-device edge, so the flood-fill below already
-     *     subsumes it;
-     *   - twins are never edge-connected (an edge a->b with a in A, b in B would
-     *     put b in N+(A) = N+(B), which cannot hold since N+(B) excludes B), so
-     *     folding twins never creates a same-device edge-adjacency that the
-     *     flood-fill had not already collapsed. */
-
-    /* 1. seed: flood-fill along same-device edges */
-    for (int i = 0 ; i < n ; ++i)
-    {
-        if (!nodes[i].data.candidate)
-            continue ;
-        const device_unique_id_t di = nodes[i].node->device_unique_id;
-        for (command_graph_node_t * s : nodes[i].node->successors)
-        {
-            const int j = (int) s->iterator_index;
-            if (nodes[j].data.candidate && di == s->device_unique_id)
-                unite(i, j);
+            if (!nodes[i].data.candidate)
+                continue ;
+            auto it = by_device.find(nodes[i].node->device_unique_id);
+            if (it == by_device.end())
+                it = by_device.emplace(nodes[i].node->device_unique_id, ncls++).first;
+            nodes[i].data.cls = it->second;
         }
     }
 
-    /* 2. merge: fold same-device false twins. Two islands with the same device
-     * and the same set of neighbor-islands (predecessors and successors). This
-     * is re-evaluated on the quotient until stable (so twins that only appear
-     * after an edge-merge, e.g. a sibling of a merged chain, are caught too). */
-    bool changed = true;
-    while (changed)
-    {
-        changed = false;
-
-        std::unordered_map<int, std::set<int>> rpred, rsucc;
+    /* A splitter is a node outside the class it splits. With a single class,
+     * the only nodes outside it are the entry, the exit, and the opaque nodes
+     * a previous pass left behind. The entry precedes and the exit follows
+     * every command, so neither can split anything: if there is no opaque node
+     * either, the initial partition is already the answer and the |V|^2-bit
+     * precedence matrix is never built. This is the single-device case. */
+    bool may_split = (ncls > 1);
+    if (!may_split)
         for (int i = 0 ; i < n ; ++i)
-        {
-            const int ri = find(i);
-            for (command_graph_node_t * s : nodes[i].node->successors)
+            if (!nodes[i].data.candidate && nodes[i].node != g_entry && nodes[i].node != g_exit)
             {
-                const int rj = find((int) s->iterator_index);
-                if (ri != rj)
+                may_split = true;
+                break ;
+            }
+
+    if (may_split)
+    {
+        /* reachability of the *original* graph: r.test(a, b) iff a < b (the
+         * diagonal is set, but a splitter is never a member of the class it
+         * splits, so the pairs tested below always have a != b) */
+        bitset2d_t<uint64_t, command_graph_node_index_t> r(n);
+        this->walk<COMMAND_GRAPH_WALK_SEARCH_DFS, COMMAND_GRAPH_WALK_ORDER_POST>(
+            [&] (command_graph_node_t * node)
+            {
+                r.set(node->iterator_index, node->iterator_index);
+                for (command_graph_node_t * succ : node->successors)
+                    r.or_rows(node->iterator_index, succ->iterator_index);
+            }
+        );
+
+        /* (class, x precedes v, v precedes x) -> class of v after the split */
+        std::map<std::tuple<int, bool, bool>, int> bucket;
+        std::set<int> touched;      /* classes that already kept their index */
+
+        bool changed = true;
+        while (changed)
+        {
+            changed = false;
+
+            for (int x = 0 ; x < n ; ++x)
+            {
+                const int  xcls = nodes[x].data.cls;
+                const auto xi   = (command_graph_node_index_t) x;
+                bucket.clear();
+                touched.clear();
+
+                for (int v = 0 ; v < n ; ++v)
                 {
-                    rsucc[ri].insert(rj);
-                    rpred[rj].insert(ri);
+                    const int c = nodes[v].data.cls;
+                    if (c < 0 || c == xcls)
+                        continue ;      /* not a candidate, or x is inside v's class */
+
+                    const auto vi = (command_graph_node_index_t) v;
+                    const auto key = std::make_tuple(c, r.test(xi, vi), r.test(vi, xi));
+
+                    auto it = bucket.find(key);
+                    if (it == bucket.end())
+                    {
+                        /* the first key seen for a class keeps the class index,
+                         * the next ones open a new class */
+                        const bool first = touched.insert(c).second;
+                        const int  id    = first ? c : ncls++;
+                        it = bucket.emplace(key, id).first;
+                        if (!first)
+                            changed = true;
+                    }
+                    nodes[v].data.cls = it->second;
                 }
             }
         }
-
-        std::map<std::tuple<device_unique_id_t, std::set<int>, std::set<int>>, int> seen;
-        for (int i = 0 ; i < n ; ++i)
-        {
-            if (!nodes[i].data.candidate || find(i) != i)   /* candidate island roots only */
-                continue ;
-            auto key = std::make_tuple(nodes[i].node->device_unique_id, rpred[i], rsucc[i]);
-            auto it  = seen.find(key);
-            if (it == seen.end())
-                seen.emplace(std::move(key), i);
-            else
-            {
-                unite(i, it->second);
-                changed = true;
-            }
-        }
     }
 
-    /* group members by island root (candidates only) */
+    /* group the candidates by class; the key is the index of the first member,
+     * so that nodes[key] is a node of the island */
     std::unordered_map<int, std::vector<command_graph_node_t *>> island;
-    for (int i = 0 ; i < n ; ++i)
-        if (nodes[i].data.candidate)
-            island[find(i)].push_back(nodes[i].node);
-
-    /* -------------------------------------------------------------------- *
-     * 3. restrict / 4. extend                                               *
-     *                                                                       *
-     * restrict is the projection back onto the admissible sets. Operator R: *
-     * pick a non-admissible island S and a witness,                         *
-     *   - u in N-(S) with u not< v : X = the successors of u that are in S  *
-     *   - w in N+(S) with v not< w : X = the predecessors of w that are in S*
-     * and move X out of S. X is never empty (u has an edge into S, by       *
-     * definition of N-(S)) and never all of S (if u had an edge to every    *
-     * member then u < v for all v, contradicting the witness), so S stays   *
-     * non-empty and strictly shrinks.                                       *
-     *   Termination: PHI = sum over islands of (|S| - 1) is a non-negative  *
-     * integer that each step decreases by |X| >= 1, so R reaches a fixed    *
-     * point in at most |V| - 1 steps, where every island is admissible.     *
-     *                                                                       *
-     * extend then adds unpacked nodes back while admissibility holds. Each  *
-     * addition moves one node from unpacked to packed, so it terminates in  *
-     * at most |V| steps; and since every addition preserves admissibility,  *
-     * restrict never has to run again. On exit no unpacked node can be      *
-     * added to any island (saturation).                                     *
-     *                                                                       *
-     * Both need the precedence relation, which costs |V|^2 bits. The scan   *
-     * below skips it when it is provably useless. On a single-device graph  *
-     * that is always the case: two same-device islands can never be edge-   *
-     * adjacent (stage 1 would have merged them), so every island carries the*
-     * key (dev, {s}, {t}) and stage 2 folds them all into one island        *
-     * holding every candidate, whose boundary is exactly {s, t}.            *
-     * -------------------------------------------------------------------- */
-
     {
-        /* island root of each node, or -1 for a node no island holds */
-        std::vector<int> iid((size_t) n, -1);
-        for (auto & kv : island)
-            if (kv.second.size() >= 2)
-                for (command_graph_node_t * m : kv.second)
-                    iid[m->iterator_index] = kv.first;
-
-        /* An island whose boundary is contained in {s, t} is admissible for
-         * free: s precedes every node and every node precedes t. */
-        bool need_restrict = false;
-        bool has_unpacked  = false;
+        std::unordered_map<int, int> root_of;    /* class -> first member index */
         for (int i = 0 ; i < n ; ++i)
-            if (nodes[i].data.candidate && iid[i] < 0)
-                has_unpacked = true;
-        for (auto & kv : island)
         {
-            if (kv.second.size() < 2)
+            const int c = nodes[i].data.cls;
+            if (c < 0)
                 continue ;
-            for (command_graph_node_t * v : kv.second)
-            {
-                for (command_graph_node_t * u : v->predecessors)
-                    if (iid[u->iterator_index] != kv.first && u != g_entry && u != g_exit)
-                        need_restrict = true;
-                for (command_graph_node_t * w : v->successors)
-                    if (iid[w->iterator_index] != kv.first && w != g_entry && w != g_exit)
-                        need_restrict = true;
-            }
-        }
-        const bool need_extend = has_unpacked && !island.empty();
-
-        if (need_restrict || need_extend)
-        {
-            /* reachability of the *original* graph: r.test(a, b) iff a < b (the
-             * diagonal is set, but the pairs tested below always have a != b,
-             * since a boundary node is never a member of the island tested) */
-            bitset2d_t<uint64_t, command_graph_node_index_t> r(n);
-            this->walk<COMMAND_GRAPH_WALK_SEARCH_DFS, COMMAND_GRAPH_WALK_ORDER_POST>(
-                [&] (command_graph_node_t * node)
-                {
-                    r.set(node->iterator_index, node->iterator_index);
-                    for (command_graph_node_t * succ : node->successors)
-                        r.or_rows(node->iterator_index, succ->iterator_index);
-                }
-            );
-
-            /* ---------------- 3. restrict ---------------- */
-            bool restricted = true;
-            while (restricted)
-            {
-                restricted = false;
-
-                for (auto & kv : island)
-                {
-                    const int root = kv.first;
-                    std::vector<command_graph_node_t *> & S = kv.second;
-                    if (S.size() < 2)
-                        continue ;
-
-                    std::vector<command_graph_node_t *> X;
-
-                    /* in-side: every external predecessor precedes every member */
-                    for (command_graph_node_t * v : S)
-                    {
-                        for (command_graph_node_t * u : v->predecessors)
-                        {
-                            if (iid[u->iterator_index] == root)
-                                continue ;                  /* internal edge */
-
-                            bool bad = false;
-                            for (command_graph_node_t * m : S)
-                                if (!r.test(u->iterator_index, m->iterator_index))
-                                {
-                                    bad = true;
-                                    break ;
-                                }
-                            if (!bad)
-                                continue ;
-
-                            for (command_graph_node_t * x : u->successors)
-                                if (iid[x->iterator_index] == root)
-                                    X.push_back(x);
-                            break ;
-                        }
-                        if (!X.empty())
-                            break ;
-                    }
-
-                    /* out-side: every member precedes every external successor */
-                    if (X.empty())
-                    {
-                        for (command_graph_node_t * v : S)
-                        {
-                            for (command_graph_node_t * w : v->successors)
-                            {
-                                if (iid[w->iterator_index] == root)
-                                    continue ;              /* internal edge */
-
-                                bool bad = false;
-                                for (command_graph_node_t * m : S)
-                                    if (!r.test(m->iterator_index, w->iterator_index))
-                                    {
-                                        bad = true;
-                                        break ;
-                                    }
-                                if (!bad)
-                                    continue ;
-
-                                for (command_graph_node_t * x : w->predecessors)
-                                    if (iid[x->iterator_index] == root)
-                                        X.push_back(x);
-                                break ;
-                            }
-                            if (!X.empty())
-                                break ;
-                        }
-                    }
-
-                    if (X.empty())
-                        continue ;                          /* S is admissible */
-
-                    const size_t before = S.size();
-                    for (command_graph_node_t * x : X)
-                        iid[x->iterator_index] = -1;
-                    S.erase(
-                        std::remove_if(S.begin(), S.end(),
-                            [&] (command_graph_node_t * m) { return iid[m->iterator_index] != root; }),
-                        S.end()
-                    );
-                    assert(!S.empty());
-                    assert(S.size() < before);
-                    (void) before;
-                    restricted = true;
-                    break ;                                 /* restart the scan */
-                }
-            }
-
-            /* ---------------- 4. extend ---------------- */
-
-            /* an island restrict shrank below two members is not a batch any
-             * more: release it so its node can be re-homed below */
-            for (auto & kv : island)
-                if (kv.second.size() < 2)
-                    for (command_graph_node_t * m : kv.second)
-                        iid[m->iterator_index] = -1;
-
-            /* true iff S + {v} is admissible; S is assumed admissible already */
-            auto admissible_with = [&] (
-                const std::vector<command_graph_node_t *> & S,
-                const int root,
-                command_graph_node_t * v
-            ) {
-                /* every external predecessor of S + {v} precedes every member */
-                auto ok_in = [&] (command_graph_node_t * u)
-                {
-                    if (u == v || iid[u->iterator_index] == root)
-                        return true;                        /* internal */
-                    if (!r.test(u->iterator_index, v->iterator_index))
-                        return false;
-                    for (command_graph_node_t * m : S)
-                        if (!r.test(u->iterator_index, m->iterator_index))
-                            return false;
-                    return true;
-                };
-                auto ok_out = [&] (command_graph_node_t * w)
-                {
-                    if (w == v || iid[w->iterator_index] == root)
-                        return true;                        /* internal */
-                    if (!r.test(v->iterator_index, w->iterator_index))
-                        return false;
-                    for (command_graph_node_t * m : S)
-                        if (!r.test(m->iterator_index, w->iterator_index))
-                            return false;
-                    return true;
-                };
-                for (command_graph_node_t * u : v->predecessors)
-                    if (!ok_in(u)) return false;
-                for (command_graph_node_t * w : v->successors)
-                    if (!ok_out(w)) return false;
-                for (command_graph_node_t * m : S)
-                {
-                    for (command_graph_node_t * u : m->predecessors)
-                        if (!ok_in(u)) return false;
-                    for (command_graph_node_t * w : m->successors)
-                        if (!ok_out(w)) return false;
-                }
-                return true;
-            };
-
-            bool extended = true;
-            while (extended)
-            {
-                extended = false;
-
-                for (auto & kv : island)
-                {
-                    const int root = kv.first;
-                    std::vector<command_graph_node_t *> & S = kv.second;
-                    if (S.size() < 2)
-                        continue ;
-                    const device_unique_id_t dev = S.front()->device_unique_id;
-
-                    for (int i = 0 ; i < n ; ++i)
-                    {
-                        command_graph_node_t * v = nodes[i].node;
-                        if (!nodes[i].data.candidate || iid[i] >= 0)
-                            continue ;                      /* already packed */
-                        if (v->device_unique_id != dev)
-                            continue ;
-                        if (!admissible_with(S, root, v))
-                            continue ;
-
-                        iid[i] = root;
-                        S.push_back(v);
-                        extended = true;
-                        break ;
-                    }
-                    if (extended)
-                        break ;
-                }
-            }
+            auto it = root_of.find(c);
+            if (it == root_of.end())
+                it = root_of.emplace(c, i).first;
+            island[it->second].push_back(nodes[i].node);
         }
     }
 
