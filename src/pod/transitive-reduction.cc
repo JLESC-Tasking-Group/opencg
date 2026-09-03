@@ -44,7 +44,7 @@ CGIR_NAMESPACE_USE;
 typedef bitset2d_t<uint64_t, command_graph_node_index_t> command_graph_reachability_t;
 
 void
-command_graph_t::pass_reduce_edge(void)
+command_graph_t::pass_transitive_reduction(void)
 {
     /* Iterate through all nodes */
     constexpr bool include_entry_exit = true;

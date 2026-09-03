@@ -62,7 +62,7 @@ command_graph_pass_try_fuse_copy(
     assert(u != v);
     assert(u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND);
     assert(v->type == COMMAND_GRAPH_NODE_TYPE_COMMAND);
-    assert(cg->are_false_twins(u, v));
+    assert(cg->are_false_twins(u, v) || cg->are_serial(u, v));
     assert(u->command);
     assert(v->command);
 
@@ -291,10 +291,6 @@ command_graph_pass_copy_fuse_normalize(command_t * command)
     }
 }
 
-//  CGIR can generate multiple copies with same source, same destination, on contiguous memory.
-//  In such case, these nodes would be false-twins --- in such case, this pass merges them to a single copy.
-//  TODO: does other runtimes would have similar merge needs but with different nodes relationships? (e.g., u->v sequence)
-//
 //  This pass also merge discontiguous 1D copies to a single 2D when possible.
 //  TODO: merge multiple 2D to 3D
 void
@@ -339,13 +335,14 @@ retry_node:
         {
             for (command_graph_node_t * v : pred->successors)
             {
-                if (u == v)                                     continue ;
-                if (u->type != COMMAND_GRAPH_NODE_TYPE_COMMAND) continue ;
-                if (v->type != COMMAND_GRAPH_NODE_TYPE_COMMAND) continue;
-                if (!this->are_false_twins(u, v))               continue ;
-
-                if (command_graph_pass_try_fuse_copy(this, u, v))
-                    goto retry_node;
+                if (u != v &&
+                    u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND &&
+                    v->type != COMMAND_GRAPH_NODE_TYPE_COMMAND &&
+                    (this->are_false_twins(u, v) || this->are_serial(u, v))
+                ) {
+                    if (command_graph_pass_try_fuse_copy(this, u, v))
+                        goto retry_node;
+                }
             }
         }
     }
