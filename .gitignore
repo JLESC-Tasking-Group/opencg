@@ -5,3 +5,12 @@ docs/generated/
 *.output
 *.swp
 tags
+
+# Rocq build artefacts (rocq/)
+*.vo
+*.vok
+*.vos
+*.glob
+.*.aux
+rocq/Makefile.rocq
+rocq/Makefile.rocq.conf

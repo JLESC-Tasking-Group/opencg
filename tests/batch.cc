@@ -166,6 +166,100 @@ check_batch(
     return 0;
 }
 
+/* Verify that `cg` collapsed to exactly two BATCH nodes, one per device, that
+ * each holds `inner` nodes (commands plus the sub-graph entry/exit), and that
+ * the two are *concurrent*: neither is a predecessor of the other, and both
+ * share the same single predecessor and the same single successor.
+ *
+ * The last check is the point of the test: a batch that swallows a node whose
+ * other predecessors live on the other device makes the two batches sequential,
+ * which silently removes the concurrency between the two devices. */
+static int
+check_two_parallel_batches(
+    command_graph_t * cg,
+    const char * name,
+    size_t expected_top_level,
+    const device_unique_id_t dev_a,
+    const device_unique_id_t dev_b,
+    size_t expected_inner
+) {
+    cg->coherence_checks();
+
+    size_t top = count_nodes(cg);
+    if (top != expected_top_level)
+    {
+        fprintf(stderr, "FAIL [%s]: expected %zu top-level nodes, got %zu\n", name, expected_top_level, top);
+        return 1;
+    }
+
+    command_graph_node_t * ba = NULL;
+    command_graph_node_t * bb = NULL;
+    size_t nbatch = 0;
+    cg->walk([&](command_graph_node_t * node) {
+        if (node->type == COMMAND_GRAPH_NODE_TYPE_COMMAND &&
+            node->command && node->command->type == COMMAND_TYPE_BATCH)
+        {
+            ++nbatch;
+            if (node->device_unique_id == dev_a) ba = node;
+            if (node->device_unique_id == dev_b) bb = node;
+        }
+    });
+
+    if (nbatch != 2 || ba == NULL || bb == NULL)
+    {
+        fprintf(stderr, "FAIL [%s]: expected 2 BATCH nodes on devices %u and %u, got %zu\n",
+                name, dev_a, dev_b, nbatch);
+        return 1;
+    }
+
+    for (command_graph_node_t * b : { ba, bb })
+    {
+        if (b->command->batch.cg == NULL)
+        {
+            fprintf(stderr, "FAIL [%s]: BATCH on device %u has no inner graph\n", name, b->device_unique_id);
+            return 1;
+        }
+        size_t inner = count_nodes(b->command->batch.cg);
+        if (inner != expected_inner)
+        {
+            fprintf(stderr, "FAIL [%s]: BATCH on device %u holds %zu nodes, expected %zu\n",
+                    name, b->device_unique_id, inner, expected_inner);
+            return 1;
+        }
+    }
+
+    /* the two batches must not be ordered with respect to each other */
+    for (command_graph_node_t * s : ba->successors)
+        if (s == bb)
+        {
+            fprintf(stderr, "FAIL [%s]: batch(dev %u) precedes batch(dev %u): the two devices are serialized\n",
+                    name, dev_a, dev_b);
+            return 1;
+        }
+    for (command_graph_node_t * s : bb->successors)
+        if (s == ba)
+        {
+            fprintf(stderr, "FAIL [%s]: batch(dev %u) precedes batch(dev %u): the two devices are serialized\n",
+                    name, dev_b, dev_a);
+            return 1;
+        }
+
+    /* and they must share their boundary: same single predecessor, same single
+     * successor. That pins them as two parallel branches of the graph. */
+    if (ba->predecessors.size() != 1 || bb->predecessors.size() != 1 ||
+        ba->successors.size()   != 1 || bb->successors.size()   != 1 ||
+        ba->predecessors.front() != bb->predecessors.front() ||
+        ba->successors.front()   != bb->successors.front())
+    {
+        fprintf(stderr, "FAIL [%s]: the two batches do not share the same boundary\n", name);
+        return 1;
+    }
+
+    fprintf(stdout, "PASS [%s]: 2 concurrent BATCH nodes (devices %u and %u), %zu nodes each\n",
+            name, dev_a, dev_b, expected_inner);
+    return 0;
+}
+
 /*
  *  Sequence batching: entry -> u -> v -> exit, u and v on the same device.
  *  u->v is a sequence, so the pass groups them into one batch.
@@ -443,7 +537,15 @@ test_batch_multi_dev(void)
     cg->optimize(COMMAND_GRAPH_PASS_BATCH);
     cg->dump("cg-post-batch-multi-dev.dot");
 
-    return 0;
+    /* c7 depends on c5 and c6, which live on device 1: pulling it into device
+     * 0's batch would make that batch wait for device 1's, serializing the two.
+     * It must therefore stay a top-level command, leaving
+     *   entry -> {c1,c2,c4} -> c7 -> exit  and  entry -> {c3,c5,c6} -> c7
+     * with the two batches concurrent. */
+    constexpr const char * const name   = "multi-dev";
+    constexpr size_t expected_top_level = 5;   /* entry, 2 batches, c7, exit */
+    constexpr size_t expected_inner     = 5;   /* 3 commands + sub-graph entry/exit */
+    return check_two_parallel_batches(cg, name, expected_top_level, 0, 1, expected_inner);
 }
 
 int
