@@ -63,38 +63,6 @@ CGIR_NAMESPACE_USE;
  * every member, packing adds an ordering that G did not have -- which serializes
  * commands, and on a multi-device graph serializes whole devices. Admissible
  * also implies convex, so it rules out the cycle a non-convex packing creates.
- *
- * The pass wants the fewest islands. That reads like a search, and it is not:
- *
- *   - S is admissible for the precedence relation iff every node outside S is
- *     uniformly related to S -- before all of it, after all of it, or
- *     concurrent with all of it. Such a set is a *module* (autonomous set) of
- *     the partial order '<'.
- *
- *   - Two modules that share a node have a union that is a module, and two
- *     monochromatic sets that share a node carry the same device. So the
- *     admissible sets holding a given node have a greatest element, the
- *     maximal admissible sets are pair-wise disjoint, and they form the unique
- *     coarsest -- hence smallest -- admissible partition.
- *
- * Computing it is one partition refinement: start from the partition by device
- * and, as long as some node x outside a class C is not uniformly related to C,
- * split C by the relation x has with its members. No admissible set is ever
- * cut, because a splitter of C lies outside every admissible subset of C, so
- * at the fixed point every class *is* the maximal admissible set of its
- * members. See the "Minimum Monochromatic and Parallelism-Preserving
- * Partitioning" subsection of the paper, and rocq/theories/P7_Optimum.v for
- * the machine-checked statement (Pstar_partition, opt_card).
- *
- * The previous four-stage heuristic (seed / merge / restrict / extend) is gone.
- * It was not exact: growing by pair-wise merges of admissible sets cannot reach
- * every admissible set, because admissibility is not closed under union of
- * *disjoint* sets. In tests/batch.cc test_batch_island, of the 4095 non-trivial
- * subsets exactly 19 are admissible, with sizes {1,2,3,4,12} -- those 19 are
- * precisely the modules of that order -- and no bipartition of the 12 nodes
- * into two admissible halves exists, so no merge sequence that keeps every
- * intermediate admissible reaches the correct 12-node packing. Refinement comes
- * from above instead of from below, and does not have that blind spot.
  */
 
 /* per-node pass storage (the device stays on the node: node->device_unique_id) */
