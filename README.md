@@ -60,6 +60,25 @@ You may set the following environment variables
 
 JIT compilation caching and profiling (the `jit` pass compiles each program's
 LLVM IR to a host function or device PTX):
+- `CGIR_JIT_DEVICE_NOALIAS` set to any non-empty value other than `0` makes the
+  `jit` pass assume the pointer parameters of a device kernel do not overlap.
+  This is the one place the device JIT can beat the ahead-of-time toolchain:
+  NVPTX only emits `ld.global.nc` (the read-only data path, which matters for an
+  indirect gather) for a kernel parameter that is *both* `readonly` and
+  `noalias`, and the compiler can never infer the latter because an `omp target`
+  does not require its mapped list items to be distinct objects -- whereas a
+  runtime that knows which buffers a task touches can. Off by default: it is an
+  assumption about the program, not a deduction. (`prog-fuse` already makes the
+  same assumption for the pointers it captures into a fused wrapper.)
+- `CGIR_JIT_AOT_DEVICE` set to any non-empty value other than `0` makes the
+  `jit` pass **also** recompile device programs that still carry their
+  ahead-of-time compiled kernel. Off by default: such a program was recorded
+  from an `omp target` whose cubin the offload runtime already loaded, and the
+  device JIT path performs no specialization (no extern binding, no argument
+  folding), so recompiling only risks emitting worse code and costs a compile
+  plus one `CUmodule` load per node. Programs synthesized by `prog-fuse` have no
+  AOT counterpart and are always JIT-compiled. Use this to measure the
+  JIT-emitted code against the AOT toolchain.
 - `CGIR_JIT_CACHE` gates the JIT **result cache**, which is **on by default**.
   Set it to `0` to disable all caching (in-process and on-disk). The in-process
   cache is content-addressed: task instances of the same construct (identical IR,

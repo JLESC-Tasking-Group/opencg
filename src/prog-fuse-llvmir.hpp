@@ -79,6 +79,12 @@ command_prog_launch_params_equal(
     const command_prog_t * a,
     const command_prog_t * b
 ) {
+    /* NOTE: blocks_per_sm is deliberately NOT compared. It is the occupancy each
+     * program happened to be recorded with, which follows from its register
+     * footprint and so differs from kernel to kernel; requiring equality would
+     * refuse almost every fusion. The fused program takes the most restrictive
+     * of its inputs instead (see the launch-parameter propagation in
+     * command_graph_prog_fuse_llvmir). */
     return a->launch_mode == b->launch_mode
         && a->grid.x  == b->grid.x  && a->grid.y  == b->grid.y  && a->grid.z  == b->grid.z
         && a->block.x == b->block.x && a->block.y == b->block.y && a->block.z == b->block.z;

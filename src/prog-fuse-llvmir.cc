@@ -348,6 +348,23 @@ struct scoped_phase_t
     }
 };
 
+/* True iff the env var `var` is set to a non-empty, non-"0" value. */
+static bool
+env_flag(const char * var)
+{
+    const char * s = getenv(var);
+    return s && s[0] != '\0' && strcmp(s, "0") != 0;
+}
+
+/* `CGIR_JIT_DEVICE_NOALIAS` -- see the use site in command_graph_jit_llvmir. It
+ * changes the emitted code, so it is also folded into the JIT cache key. */
+static bool
+device_assume_noalias_params(void)
+{
+    static const bool value = env_flag("CGIR_JIT_DEVICE_NOALIAS");
+    return value;
+}
+
 /* FNV-1a 64-bit over a byte range, chainable via `h` (seed the first call with
  * jit_fnv1a). Cheap content hash for the cache key and the cache-stat estimate. */
 static uint64_t
@@ -378,11 +395,17 @@ jit_static_salt(void)
 {
     static const int      CGIR_JIT_CACHE_FORMAT = 1;          // bump to force-invalidate
     static const char     build_id[] = __DATE__ " " __TIME__; // cgir codegen rebuild
-    static const uint64_t s = jit_fnv1a_seed(
-        jit_fnv1a_seed(
-            jit_fnv1a(LLVM_VERSION_STRING, strlen(LLVM_VERSION_STRING)),
-            build_id, sizeof(build_id)),
-        &CGIR_JIT_CACHE_FORMAT, sizeof(CGIR_JIT_CACHE_FORMAT));
+    static const uint64_t s = [] {
+        uint64_t h = jit_fnv1a_seed(
+            jit_fnv1a_seed(
+                jit_fnv1a(LLVM_VERSION_STRING, strlen(LLVM_VERSION_STRING)),
+                build_id, sizeof(build_id)),
+            &CGIR_JIT_CACHE_FORMAT, sizeof(CGIR_JIT_CACHE_FORMAT));
+        /* codegen-affecting knobs must be part of the key, or the on-disk cache
+         * would hand back PTX built under a different assumption */
+        const char noalias = device_assume_noalias_params() ? 1 : 0;
+        return jit_fnv1a_seed(h, &noalias, sizeof(noalias));
+    }();
     return s;
 }
 
@@ -1084,8 +1107,7 @@ optimize_module(llvm::Module & M, llvm::TargetMachine * tm, const std::string & 
 static bool
 dump_enabled(const char * var)
 {
-    const char * s = getenv(var);
-    return s && s[0] != '\0' && strcmp(s, "0") != 0;
+    return env_flag(var);
 }
 
 /* Create (mkdir -p) a fresh dump directory <base>/<prefix>-<seq> and return its
@@ -2371,7 +2393,21 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      *  on dst aliasing progs[0]) so a distinct dst is correct too.        *
      *  progs[0]'s grid/block/launch_mode are never freed/modified above,  *
      *  so reading them here is safe even when dst == progs[0].            *
+     *                                                                     *
+     *  The occupancy target is NOT uniform across the inputs (it follows  *
+     *  from each kernel's register footprint), and the fused kernel       *
+     *  replaces all of them at once, so it takes the most restrictive     *
+     *  non-zero value -- zero meaning "unconstrained" and losing to any   *
+     *  real target.                                                       *
      * ------------------------------------------------------------------ */
+    unsigned int fused_blocks_per_sm = 0;
+    for (size_t i = 0 ; i < n ; ++i)
+    {
+        const unsigned int b = progs[i]->blocks_per_sm;
+        if (b && (fused_blocks_per_sm == 0 || b < fused_blocks_per_sm))
+            fused_blocks_per_sm = b;
+    }
+
     if (dst != progs[0])
     {
         dst->grid        = progs[0]->grid;
@@ -2384,6 +2420,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         assert(memcmp(&dst->block, &progs[0]->block, sizeof(dst->block)) == 0);
         assert(dst->launch_mode == progs[0]->launch_mode);
     }
+    dst->blocks_per_sm = fused_blocks_per_sm;
 
     /* ------------------------------------------------------------------ *
      * 12. Release the consumed inputs' owned heap buffers.                 *
@@ -2615,6 +2652,30 @@ optimize_host_module(llvm::Module & M, llvm::TargetMachine * tm)
     });
 }
 
+/* The subtarget feature string the compiler stamped on the device functions
+ * (e.g. "+ptx92,+sm_90"). The TargetMachine's *default* subtarget is what the
+ * NVPTX AsmPrinter uses for the `.version`/`.target` PTX header and what the
+ * backend uses for anything not attached to a function, so building it with an
+ * empty feature string silently downgrades the emitted PTX ISA version below
+ * what the (per-function) subtarget selects instructions for. Prefer the kernel
+ * entry's attribute, then any function's. */
+static std::string
+device_features_of(const llvm::Module & M)
+{
+    const llvm::Function * fallback = nullptr;
+    for (const llvm::Function & F : M)
+    {
+        if (F.isDeclaration() || !F.hasFnAttribute("target-features"))
+            continue ;
+        if (F.hasKernelCallingConv())
+            return F.getFnAttribute("target-features").getValueAsString().str();
+        if (fallback == nullptr)
+            fallback = &F;
+    }
+    return fallback ? fallback->getFnAttribute("target-features").getValueAsString().str()
+                    : std::string();
+}
+
 /* Emit PTX for a device (GPU) module: build a device TargetMachine for `triple`
  * (e.g. "nvptx64-nvidia-cuda") + `arch` (target-cpu, e.g. "sm_80"), stamp the
  * module's triple/DataLayout, and run codegen to a PTX assembly string. Returns
@@ -2630,9 +2691,13 @@ emit_device_ptx(llvm::Module & M, const char * triple, const char * arch,
     const llvm::Target * T = llvm::TargetRegistry::lookupTarget(TT, terr);
     if (!T) { err = "lookupTarget('" + TT.str() + "'): " + terr; return {}; }
 
+    /* Read the features off the snapshot BEFORE anything is linked/optimized in:
+     * at this point the module holds only the compiler-emitted device functions. */
+    const std::string features = device_features_of(M);
+
     llvm::TargetOptions opts;
     std::unique_ptr<llvm::TargetMachine> TM(T->createTargetMachine(
-        TT, arch ? arch : "", /* features */ "", opts,
+        TT, arch ? arch : "", features, opts,
         std::nullopt, std::nullopt, llvm::CodeGenOptLevel::Aggressive));
     if (!TM) { err = "createTargetMachine failed"; return {}; }
 
@@ -2907,6 +2972,37 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
      * (source.symbol) at launch. The fast path above already handled cache hits. */
     if (is_device)
     {
+        /* Opt-in: assume the kernel's pointer parameters do not overlap.
+         *
+         * This is the one place the device JIT can beat the ahead-of-time
+         * toolchain on code quality. NVPTX lowers a load through a kernel
+         * parameter to `ld.global.nc` (the read-only data path) only when the
+         * parameter is BOTH readonly and noalias -- `readonly` the optimizer
+         * infers on its own, `noalias` it cannot, because an `omp target`'s
+         * mapped list items are not required to be distinct objects. The
+         * compiler must therefore give up on it; a runtime that knows which
+         * buffers a task actually touches does not have to. prog-fuse already
+         * makes exactly this assumption for the pointers it captures into a
+         * fused wrapper (command_graph_prog_fuse_llvmir, "distinct captured
+         * pointers are assumed non-overlapping").
+         *
+         * Off by default because it is an assumption about the program, not a
+         * deduction: enable it only when the mapped buffers of a target region
+         * are known to be disjoint. */
+        if (device_assume_noalias_params())
+        {
+            unsigned marked = 0;
+            for (llvm::Argument & A : entry->args())
+                if (A.getType()->isPointerTy() && !A.hasNoAliasAttr())
+                {
+                    A.addAttr(llvm::Attribute::NoAlias);
+                    ++marked;
+                }
+            if (marked && dump)
+                fprintf(stderr, "jit(device): assuming %u pointer parameters of `%s` do not alias\n",
+                        marked, entry->getName().str().c_str());
+        }
+
         const char * dtriple = prog->source.content.llvmir.triple;
         std::string perr;
         std::string ptx = emit_device_ptx(*mod, dtriple,

@@ -226,6 +226,22 @@ struct command_prog_t
     struct {
         unsigned int x, y, z;
     } block;
+
+    /* Occupancy target, in blocks (CTAs) per SM/CU. 0 = unset (let the device
+     * decide). A device kernel's register footprint decides how many blocks the
+     * hardware co-schedules per SM, so *replacing a program's code silently
+     * changes its occupancy* -- and for a kernel whose performance rests on cache
+     * reuse (an indirect gather, a stencil) more occupancy means more concurrent
+     * streams competing for the same cache, which can cost several x. This field
+     * pins that property across such a substitution: the runtime records the
+     * occupancy of the program it is about to replace (see
+     * driver_t::f_prog_max_blocks_per_sm in xkrt) and the driver caps the launch
+     * grid so the replacement co-schedules no more blocks per SM than that.
+     *
+     * The device kernels this applies to are grid-stride (an OpenMP `distribute`
+     * loop strides by gridDim), so capping the grid is semantics-preserving; a
+     * driver whose kernels are not grid-stride must ignore this field. */
+    unsigned int blocks_per_sm;
 };
 
 /* read/write files */
@@ -340,6 +356,7 @@ struct command_t
              * even when a producer leaves them unset. */
             prog.grid.x  = prog.grid.y  = prog.grid.z  = 0;
             prog.block.x = prog.block.y = prog.block.z = 0;
+            prog.blocks_per_sm = 0;
         }
     }
 };
