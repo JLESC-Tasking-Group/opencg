@@ -93,7 +93,6 @@
 # include <llvm/Support/TargetSelect.h>
 # include <llvm/Target/TargetMachine.h>
 # include <llvm/TargetParser/Host.h>
-# include <llvm/TargetParser/SubtargetFeature.h>  /* host feature string (JIT retarget) */
 # include <llvm/TargetParser/Triple.h>
 # include <llvm/Config/llvm-config.h>      /* LLVM_VERSION_STRING (disk cache salt) */
 
@@ -388,29 +387,39 @@ env_str(const char * var, const char * dflt)
     return (s && s[0]) ? s : dflt;
 }
 
-/* The machine this process is running on, as an LLVM (target-cpu, target-features)
- * pair. Stamped onto host modules before optimization (stamp_host_target_attrs)
- * and folded into the host cache key (jit_host_salt) -- one source for both, so a
- * cached object can never disagree with the attributes it was compiled under.
- * The feature list is sorted because StringMap iteration order is unspecified and
- * the string ends up in a hash. Computed once. */
-static const std::pair<std::string, std::string> &
-host_target_attrs(void)
+/* Identity of the machine this process is running on: the host CPU name followed
+ * by its enabled features, sorted. Only used to salt the host cache key -- what
+ * the code is actually compiled for comes from the TargetMachine that
+ * JITTargetMachineBuilder::detectHost() configures (see stamp_host_target_attrs)
+ * -- but it has to capture the same thing, or a cached object could be reused on
+ * a machine it was not compiled for.
+ *
+ * Sorted because StringMap iteration order is unspecified and this ends up in a
+ * hash; copied into std::strings because getHostCPUFeatures() returns the map by
+ * value and its keys live in its own storage, which dies with the temporary.
+ * Computed once. */
+static const std::string &
+host_target_id(void)
 {
-    static const std::pair<std::string, std::string> attrs = [] {
-        std::vector<llvm::StringRef> enabled;
-        for (const auto & f : llvm::sys::getHostCPUFeatures())
+    static const std::string id = [] {
+        const auto host = llvm::sys::getHostCPUFeatures();
+
+        std::vector<std::string> enabled;
+        enabled.reserve(host.size());
+        for (const auto & f : host)
             if (f.second)
-                enabled.push_back(f.first());
+                enabled.push_back(f.first().str());
         std::sort(enabled.begin(), enabled.end());
 
-        llvm::SubtargetFeatures features;
-        for (const llvm::StringRef & f : enabled)
-            features.AddFeature(f, true);
-
-        return std::make_pair(llvm::sys::getHostCPUName().str(), features.getString());
+        std::string s = llvm::sys::getHostCPUName().str();
+        for (const std::string & f : enabled)
+        {
+            s += ',';
+            s += f;
+        }
+        return s;
     }();
-    return attrs;
+    return id;
 }
 
 /* `CGIR_JIT_DEVICE_NOALIAS` -- see the use site in command_graph_jit_llvmir. It
@@ -477,14 +486,13 @@ static uint64_t
 jit_host_salt(void)
 {
     static const uint64_t s = [] {
-        /* The host CPU *and* its feature set: both are stamped onto the module
-         * before optimization (stamp_host_target_attrs), so a cached object is
-         * only valid on a machine that reports the same ones. The code model is
-         * in here too, being a codegen-affecting knob. */
-        const auto & attrs = host_target_attrs();
+        /* The host CPU *and* its feature set: the module is compiled for whatever
+         * the running machine reports (stamp_host_target_attrs), so a cached
+         * object is only valid on a machine that reports the same. The code model
+         * is in here too, being a codegen-affecting knob. */
+        const std::string & id = host_target_id();
         uint64_t h = jit_static_salt();
-        h = jit_fnv1a_seed(h, attrs.first.data(),  attrs.first.size());
-        h = jit_fnv1a_seed(h, attrs.second.data(), attrs.second.size());
+        h = jit_fnv1a_seed(h, id.data(), id.size());
         const char * cm = env_str("CGIR_JIT_HOST_CODE_MODEL", "small");
         h = jit_fnv1a_seed(h, cm, strlen(cm) + 1);
         return h;
@@ -2728,34 +2736,35 @@ optimize_device_module_o3(llvm::Module & M, llvm::TargetMachine * tm)
  * optimize, emit an object, link it into the process with ORC.
  * ------------------------------------------------------------------------- */
 
-/* Retarget every definition in `M` at the machine we are running on.
+/* Let every definition in `M` be compiled for the machine we are running on.
  *
- * A TargetMachine's CPU/features are only a default: both the AArch64 and X86
- * backends prefer a function's own `target-cpu`/`target-features` attributes
- * when they are present, and the compiler stamps them on everything with the
- * baseline the application was built for. Overwriting them is what lets the JIT
- * use the instructions the machine actually has. Declarations are left alone
- * (they carry no code), and the vector-width hints are dropped because they were
- * derived from the old feature set. */
+ * A TargetMachine's CPU and features are only a *default*: the backends prefer a
+ * function's own `target-cpu`/`target-features` attributes whenever they are
+ * present, and the compiler stamped those on everything with the baseline the
+ * application was built for. So a JIT that does nothing here re-optimizes and
+ * re-codegens at that baseline, and the host detection is wasted -- throwing away
+ * the one advantage it has over the ahead-of-time compiler, which is knowing the
+ * exact machine.
+ *
+ * Dropping the attributes is enough, and is better than writing our own: the
+ * function then falls back to the TargetMachine, which
+ * JITTargetMachineBuilder::detectHost() has already configured with the host CPU
+ * name and its full feature set. Nothing here has to construct a feature string,
+ * so nothing here can mis-form one. The vector-width hints go too, having been
+ * derived from the abandoned feature set; declarations are left alone, carrying
+ * no code. */
 static void
 stamp_host_target_attrs(llvm::Module & M)
 {
-    const std::string & cpu      = host_target_attrs().first;
-    const std::string & features = host_target_attrs().second;
-    if (cpu.empty() && features.empty())
-        return ;
-
     for (llvm::Function & F : M)
     {
         if (F.isDeclaration())
             continue ;
-        if (!cpu.empty())
-            F.addFnAttr("target-cpu", cpu);
-        if (!features.empty())
-            F.addFnAttr("target-features", features);
+        F.removeFnAttr("target-cpu");
+        F.removeFnAttr("target-features");
+        F.removeFnAttr("tune-cpu");
         F.removeFnAttr("min-legal-vector-width");
         F.removeFnAttr("prefer-vector-width");
-        F.removeFnAttr("tune-cpu");
     }
 }
 
@@ -3325,14 +3334,8 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
      * variable. We link against the running process, so use its TLS model. */
     jtmb->getOptions().EmulatedTLS = false;
 
-    /* Give the optimizer and codegen the machine they are actually running on.
-     * detectHost() puts the host CPU and feature set on the TargetMachine, but a
-     * per-function `target-cpu`/`target-features` attribute wins over it, and the
-     * compiler stamped every function with the baseline the application was built
-     * for. Without this the JIT re-optimizes at that baseline and the host
-     * detection is wasted -- which throws away the one advantage a JIT has here,
-     * since it knows the exact machine and the ahead-of-time compiler did not.
-     * (Folded into the cache key by jit_host_salt.) */
+    /* Compile for the machine we are running on rather than the one the
+     * application was built for (folded into the cache key by jit_host_salt). */
     stamp_host_target_attrs(*mod);
 
     /* Parsed IR may omit the triple (the fuse pass stamps it for the same
