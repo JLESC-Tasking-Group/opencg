@@ -85,7 +85,12 @@ static const char one_ptr_llvm_ir[] =
 /*  void via_args(void ** args) { *(double *) args[0] *= 2; }
  *
  *  Genuinely the uniform launch shape: it takes the slot array and dereferences
- *  it itself. Same signature as one_ptr; only the proto tells them apart. */
+ *  it itself. Same signature as one_ptr; only the proto tells them apart.
+ *
+ *  Note the argument conventions differ with the proto, which is the whole point
+ *  of the distinction: an UNPACKED_PARAMS slot holds `&value` (the wrapper does
+ *  the extra load), whereas a VOID_PTRPTR entry receives the slots raw and
+ *  decides for itself -- here args[0] *is* the double*. */
 static const char via_args_llvm_ir[] =
     "define void @via_args(ptr %args) {\n"
     "entry:\n"
@@ -210,9 +215,8 @@ main(void)
      *  Must be launched directly -- wrapping it would double-deref.     *
      * ---------------------------------------------------------------- */
     {
-        double   y  = 21.0;
-        double * yp = &y;
-        void *   args[1] = { &yp };
+        double y = 21.0;
+        void * args[1] = { &y };   /* raw slot: args[0] IS the double* */
 
         if (jit_and_launch("void(void**) entry",
                            via_args_llvm_ir, sizeof(via_args_llvm_ir), "via_args",

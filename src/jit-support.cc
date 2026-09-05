@@ -46,6 +46,7 @@
 
 # if CGIR_SUPPORT_LLVM
 
+#  include <llvm/ADT/StringMap.h>          /* getHostCPUFeatures' return type; Host.h only forward-declares it */
 #  include <llvm/Config/llvm-config.h>      /* LLVM_VERSION_STRING (disk cache salt) */
 #  include <llvm/Support/FileSystem.h>
 #  include <llvm/Support/MemoryBuffer.h>
@@ -59,6 +60,7 @@
 #  include <cstring>
 #  include <mutex>
 #  include <string>
+#  include <system_error>
 #  include <unordered_map>
 #  include <utility>
 #  include <vector>
