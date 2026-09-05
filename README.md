@@ -70,15 +70,15 @@ LLVM IR to a host function or device PTX):
   runtime that knows which buffers a task touches can. Off by default: it is an
   assumption about the program, not a deduction. (`prog-fuse` already makes the
   same assumption for the pointers it captures into a fused wrapper.)
-- `CGIR_JIT_AOT_DEVICE` set to any non-empty value other than `0` makes the
-  `jit` pass **also** recompile device programs that still carry their
-  ahead-of-time compiled kernel. Off by default: such a program was recorded
-  from an `omp target` whose cubin the offload runtime already loaded, and the
-  device JIT path performs no specialization (no extern binding, no argument
-  folding), so recompiling only risks emitting worse code and costs a compile
-  plus one `CUmodule` load per node. Programs synthesized by `prog-fuse` have no
-  AOT counterpart and are always JIT-compiled. Use this to measure the
-  JIT-emitted code against the AOT toolchain.
+- `CGIR_JIT_AOT_DEVICE` set to `0` makes the `jit` pass leave alone any device
+  program that still carries its ahead-of-time compiled kernel, i.e. recompile
+  only what `prog-fuse` synthesized. **On by default** — recompiling is safe and
+  pays (Krylov CG on GH200: 1.95 ms ahead-of-time vs 1.82 ms recompiled).
+  Set it to `0` on a runtime whose device driver cannot preserve a program's
+  occupancy across the substitution (see `command_prog_t::blocks_per_sm`):
+  recompiling changes the per-block resources a kernel uses, hence how many
+  blocks the hardware co-schedules, and that alone has been measured to cost 6x
+  on an unchanged instruction stream.
 - `CGIR_JIT_CACHE` gates the JIT **result cache**, which is **on by default**.
   Set it to `0` to disable all caching (in-process and on-disk). The in-process
   cache is content-addressed: task instances of the same construct (identical IR,

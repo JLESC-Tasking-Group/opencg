@@ -243,11 +243,13 @@ struct command_prog_t
      *
      * So a producer records here the occupancy of the program it is about to have
      * rewritten (in xkrt, from driver_t::f_prog_max_blocks_per_sm just before
-     * command_graph_t::optimize), and the driver holds the replacement to it.
-     * Enforcement is the driver's business and must use a resource the hardware
-     * accounts *per block* -- shrinking the launch grid does not work, because
-     * other blocks (of the same program or of a concurrent one) simply take the
-     * freed slots.
+     * command_graph_t::optimize), and the driver holds the replacement to it --
+     * in both directions: code that is co-scheduled more densely floods the
+     * cache, code that is co-scheduled more sparsely starves the device of
+     * parallelism. Enforcement is the driver's business and must use a resource
+     * the hardware accounts *per block* -- shrinking the launch grid does not
+     * work, because other blocks (of the same program or of a concurrent one)
+     * simply take the freed slots.
      *
      * A driver consumes this at first launch; it may clear or overwrite the field
      * afterwards (it is a request, not a durable record). */
