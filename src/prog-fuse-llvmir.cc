@@ -2395,17 +2395,21 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      *  so reading them here is safe even when dst == progs[0].            *
      *                                                                     *
      *  The occupancy target is NOT uniform across the inputs (it follows  *
-     *  from each kernel's register footprint), and the fused kernel       *
+     *  from each kernel's per-block resource use), and the fused kernel   *
      *  replaces all of them at once, so it takes the most restrictive     *
      *  non-zero value -- zero meaning "unconstrained" and losing to any   *
-     *  real target.                                                       *
+     *  real target. Dynamic shared memory is a requirement rather than a  *
+     *  limit, so the fused program needs the largest of its inputs'.      *
      * ------------------------------------------------------------------ */
     unsigned int fused_blocks_per_sm = 0;
+    unsigned int fused_dyn_shmem     = 0;
     for (size_t i = 0 ; i < n ; ++i)
     {
         const unsigned int b = progs[i]->blocks_per_sm;
         if (b && (fused_blocks_per_sm == 0 || b < fused_blocks_per_sm))
             fused_blocks_per_sm = b;
+        if (progs[i]->dyn_shmem > fused_dyn_shmem)
+            fused_dyn_shmem = progs[i]->dyn_shmem;
     }
 
     if (dst != progs[0])
@@ -2421,6 +2425,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         assert(dst->launch_mode == progs[0]->launch_mode);
     }
     dst->blocks_per_sm = fused_blocks_per_sm;
+    dst->dyn_shmem     = fused_dyn_shmem;
 
     /* ------------------------------------------------------------------ *
      * 12. Release the consumed inputs' owned heap buffers.                 *

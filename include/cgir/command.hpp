@@ -227,21 +227,38 @@ struct command_prog_t
         unsigned int x, y, z;
     } block;
 
-    /* Occupancy target, in blocks (CTAs) per SM/CU. 0 = unset (let the device
-     * decide). A device kernel's register footprint decides how many blocks the
-     * hardware co-schedules per SM, so *replacing a program's code silently
-     * changes its occupancy* -- and for a kernel whose performance rests on cache
-     * reuse (an indirect gather, a stencil) more occupancy means more concurrent
-     * streams competing for the same cache, which can cost several x. This field
-     * pins that property across such a substitution: the runtime records the
-     * occupancy of the program it is about to replace (see
-     * driver_t::f_prog_max_blocks_per_sm in xkrt) and the driver caps the launch
-     * grid so the replacement co-schedules no more blocks per SM than that.
+    /* Occupancy target: how many blocks (CTAs) the device may co-schedule per
+     * SM/CU. 0 = unset, let the device decide.
      *
-     * The device kernels this applies to are grid-stride (an OpenMP `distribute`
-     * loop strides by gridDim), so capping the grid is semantics-preserving; a
-     * driver whose kernels are not grid-stride must ignore this field. */
+     * grid and block say how much work is launched; this says how much of it the
+     * device runs at once. That is a third, independent launch parameter, and it
+     * is one a *code* transformation changes by accident: occupancy is decided by
+     * the per-block resources the compiler happened to use (registers, shared
+     * memory, barriers), so a pass that rewrites a program -- the `jit` pass
+     * recompiling it, `prog-fuse` merging several -- generally produces code the
+     * hardware co-schedules differently. That is not a neutral change: a program
+     * whose speed rests on cache reuse slows down when more of its blocks run
+     * concurrently and compete for the same cache, and the loss can be several x
+     * even when the emitted instructions are identical.
+     *
+     * So a producer records here the occupancy of the program it is about to have
+     * rewritten (in xkrt, from driver_t::f_prog_max_blocks_per_sm just before
+     * command_graph_t::optimize), and the driver holds the replacement to it.
+     * Enforcement is the driver's business and must use a resource the hardware
+     * accounts *per block* -- shrinking the launch grid does not work, because
+     * other blocks (of the same program or of a concurrent one) simply take the
+     * freed slots.
+     *
+     * A driver consumes this at first launch; it may clear or overwrite the field
+     * afterwards (it is a request, not a durable record). */
     unsigned int blocks_per_sm;
+
+    /* Dynamic (per-block) shared memory to reserve at launch, in bytes. 0 = none.
+     * Both a real requirement of the program and the last-resort lever a driver
+     * has to hold it to `blocks_per_sm` when no cheaper per-block resource
+     * suffices -- shared-memory capacity bounds residency, at the cost of the L1
+     * it shares its budget with on most devices. */
+    unsigned int dyn_shmem;
 };
 
 /* read/write files */
@@ -357,6 +374,7 @@ struct command_t
             prog.grid.x  = prog.grid.y  = prog.grid.z  = 0;
             prog.block.x = prog.block.y = prog.block.z = 0;
             prog.blocks_per_sm = 0;
+            prog.dyn_shmem     = 0;
         }
     }
 };
