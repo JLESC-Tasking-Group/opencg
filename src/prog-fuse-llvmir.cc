@@ -3424,10 +3424,10 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
      * construct, record the outcome, and install it. A nanos6 outline chain
      * launches as fn(args_v, dev_v, transl_v); a packed entry as fn(args, size);
      * anything else as a uniform void(void**) VARIADIC over prog->args. */
-    const int proto = entry_is_nanos6 ? (int) CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_NANOS6
-                    : entry_is_packed ? (int) CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED
+    const int proto_to_use = entry_is_nanos6 ? (int) CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_NANOS6
+                           : entry_is_packed ? (int) CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED
                                       : (int) CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC;
-    jit_cache().host_put_fn(cache_key, proto, fn_addr);
+    jit_cache().host_put_fn(cache_key, proto_to_use, fn_addr);
     if (jit_prof().stats_on) jit_prof().cache_event(false, obj_from_disk ? 1 : 0);
     install_host_jit_result(prog, fn_addr, entry_is_nanos6, entry_is_packed);
     # endif /* CGIR_SUPPORT_LLVM */
