@@ -60,6 +60,13 @@ You may set the following environment variables
 
 JIT compilation caching and profiling (the `jit` pass compiles each program's
 LLVM IR to a host function or device PTX):
+- `CGIR_JIT_HOST_CODE_MODEL` selects the code model for host programs: `small`
+  (default) or `large`. JIT'd code can be mapped further from the process it
+  binds to than a PC-relative branch reaches; `small` leaves that to ORC's
+  JITLink, which routes only the references that need it through a GOT/PLT,
+  whereas `large` makes *every* global reference and call pay (on AArch64, a
+  4-instruction address materialization instead of `ADRP`+`ADD`). Use `large`
+  only on a platform where LLJIT falls back to RuntimeDyld instead of JITLink.
 - `CGIR_JIT_DEVICE_NOALIAS` set to any non-empty value other than `0` makes the
   `jit` pass assume the pointer parameters of a device kernel do not overlap.
   This is the one place the device JIT can beat the ahead-of-time toolchain:

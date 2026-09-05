@@ -278,7 +278,7 @@ struct command_graph_t;
  * opaque executable (e.g. CUgraphExec on CUDA) */
 struct command_batch_t
 {
-    /* the command graph of that batch (its `is_sequence` flag marks a linear
+    /* the command graph of that batch (its `is_serial` flag marks a linear
      * chain of TASK_SPAWN PROG commands, see command_graph_t) */
     command_graph_t * cg;
 };

@@ -93,6 +93,7 @@
 # include <llvm/Support/TargetSelect.h>
 # include <llvm/Target/TargetMachine.h>
 # include <llvm/TargetParser/Host.h>
+# include <llvm/TargetParser/SubtargetFeature.h>  /* host feature string (JIT retarget) */
 # include <llvm/TargetParser/Triple.h>
 # include <llvm/Config/llvm-config.h>      /* LLVM_VERSION_STRING (disk cache salt) */
 
@@ -158,8 +159,27 @@ CGIR_NAMESPACE_USE;
 
 # if CGIR_SUPPORT_LLVM
 
+/* =============================================================================
+ * This file holds seven concerns, in this order. They are marked with `SECTION`
+ * banners; each is a seam along which the file is meant to be split once the
+ * churn settles (the anonymous namespace below would become a small internal
+ * header, and every new LLVM-consuming TU needs the -fno-rtti property that
+ * CMakeLists sets on this one):
+ *
+ *   SECTION 1  profiling / cache-stat instrumentation      -> jit-profile
+ *   SECTION 2  environment knobs + host machine identity   -> jit-env
+ *   SECTION 3  content hashing, salts, two-level cache     -> jit-cache
+ *   SECTION 4  generic LLVM IR utilities                   -> llvm-util
+ *   SECTION 5  the prog-fuse pass                          -> stays here
+ *   SECTION 6  device (NVPTX) code generation              -> jit-device
+ *   SECTION 7  host (CPU) code generation + the JIT entry  -> jit-host
+ *
+ * Sections 1-3 are the natural first extraction: they are one contiguous
+ * anonymous namespace with no dependency on sections 4-7.
+ * ========================================================================== */
+
 /* ---------------------------------------------------------------------------
- * Phase 0: opt-in JIT profiling / cache-stat instrumentation. Off (and
+ * SECTION 1 - opt-in JIT profiling / cache-stat instrumentation. Off (and
  * near-free) unless enabled via env, read once at first use:
  *   CGIR_JIT_TIMING=1       accumulate per-phase wall time, print at exit
  *   CGIR_JIT_CACHE_STATS=1  hash each JIT'd body, print distinct-vs-total
@@ -348,12 +368,49 @@ struct scoped_phase_t
     }
 };
 
+/* ---------------------------------------------------------------------------
+ * SECTION 2 - environment knobs and host machine identity.
+ * ------------------------------------------------------------------------- */
+
 /* True iff the env var `var` is set to a non-empty, non-"0" value. */
 static bool
 env_flag(const char * var)
 {
     const char * s = getenv(var);
     return s && s[0] != '\0' && strcmp(s, "0") != 0;
+}
+
+/* Value of the env var `var`, or `dflt` when unset/empty. */
+static const char *
+env_str(const char * var, const char * dflt)
+{
+    const char * s = getenv(var);
+    return (s && s[0]) ? s : dflt;
+}
+
+/* The machine this process is running on, as an LLVM (target-cpu, target-features)
+ * pair. Stamped onto host modules before optimization (stamp_host_target_attrs)
+ * and folded into the host cache key (jit_host_salt) -- one source for both, so a
+ * cached object can never disagree with the attributes it was compiled under.
+ * The feature list is sorted because StringMap iteration order is unspecified and
+ * the string ends up in a hash. Computed once. */
+static const std::pair<std::string, std::string> &
+host_target_attrs(void)
+{
+    static const std::pair<std::string, std::string> attrs = [] {
+        std::vector<llvm::StringRef> enabled;
+        for (const auto & f : llvm::sys::getHostCPUFeatures())
+            if (f.second)
+                enabled.push_back(f.first());
+        std::sort(enabled.begin(), enabled.end());
+
+        llvm::SubtargetFeatures features;
+        for (const llvm::StringRef & f : enabled)
+            features.AddFeature(f, true);
+
+        return std::make_pair(llvm::sys::getHostCPUName().str(), features.getString());
+    }();
+    return attrs;
 }
 
 /* `CGIR_JIT_DEVICE_NOALIAS` -- see the use site in command_graph_jit_llvmir. It
@@ -364,6 +421,11 @@ device_assume_noalias_params(void)
     static const bool value = env_flag("CGIR_JIT_DEVICE_NOALIAS");
     return value;
 }
+
+/* ---------------------------------------------------------------------------
+ * SECTION 3 - content hashing, toolchain salts and the two-level JIT result
+ * cache (in-process + optional on-disk).
+ * ------------------------------------------------------------------------- */
 
 /* FNV-1a 64-bit over a byte range, chainable via `h` (seed the first call with
  * jit_fnv1a). Cheap content hash for the cache key and the cache-stat estimate. */
@@ -415,8 +477,17 @@ static uint64_t
 jit_host_salt(void)
 {
     static const uint64_t s = [] {
-        const std::string cpu = llvm::sys::getHostCPUName().str();
-        return jit_fnv1a_seed(jit_static_salt(), cpu.data(), cpu.size());
+        /* The host CPU *and* its feature set: both are stamped onto the module
+         * before optimization (stamp_host_target_attrs), so a cached object is
+         * only valid on a machine that reports the same ones. The code model is
+         * in here too, being a codegen-affecting knob. */
+        const auto & attrs = host_target_attrs();
+        uint64_t h = jit_static_salt();
+        h = jit_fnv1a_seed(h, attrs.first.data(),  attrs.first.size());
+        h = jit_fnv1a_seed(h, attrs.second.data(), attrs.second.size());
+        const char * cm = env_str("CGIR_JIT_HOST_CODE_MODEL", "small");
+        h = jit_fnv1a_seed(h, cm, strlen(cm) + 1);
+        return h;
     }();
     return s;
 }
@@ -460,12 +531,15 @@ jit_cache_key(const command_prog_t * prog)
     if (L.symbol) h = jit_fnv1a_seed(h, L.symbol, strlen(L.symbol) + 1);
     if (L.triple) h = jit_fnv1a_seed(h, L.triple, strlen(L.triple) + 1);
     if (L.arch)   h = jit_fnv1a_seed(h, L.arch,   strlen(L.arch)   + 1);
+    /* Extern *names* only. The address is bound at link time (the emitted object
+     * relocates against the name), so it does not change the generated code --
+     * and folding it in would make the key differ on every run under ASLR, which
+     * silently defeats the on-disk cache for any program with externalized
+     * globals. */
+    h = jit_fnv1a_seed(h, &L.externs_count, sizeof(L.externs_count));
     for (size_t i = 0 ; L.externs && i < L.externs_count ; ++i)
-    {
         if (L.externs[i].name)
             h = jit_fnv1a_seed(h, L.externs[i].name, strlen(L.externs[i].name) + 1);
-        h = jit_fnv1a_seed(h, &L.externs[i].addr, sizeof(L.externs[i].addr));
-    }
     if (L.triple)   // device: fold device-lib identity + static salt
     {
         for (size_t i = 0 ; L.device_libs && i < L.device_libs_count ; ++i)
@@ -614,6 +688,10 @@ jit_cache(void)
 }
 
 } // namespace
+
+/* ---------------------------------------------------------------------------
+ * SECTION 4 - generic LLVM IR utilities shared by the fuse pass and the JIT.
+ * ------------------------------------------------------------------------- */
 
 /**
  *  Parse an LLVM IR (textual .ll, NUL-terminated) or LLVM bitcode (binary) blob
@@ -1162,6 +1240,10 @@ dump_module(const std::string & dir, const char * name, llvm::Module & M)
 }
 
 # endif /* CGIR_SUPPORT_LLVM */
+
+/* ---------------------------------------------------------------------------
+ * SECTION 5 - the prog-fuse pass: merge a chain of programs into one.
+ * ------------------------------------------------------------------------- */
 
 void
 CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
@@ -2594,6 +2676,11 @@ run_module_passes(llvm::Module & M, llvm::TargetMachine * tm, BuildFn && body)
     MPM.run(M, MAM);
 }
 
+/* ---------------------------------------------------------------------------
+ * SECTION 6 - device (NVPTX) code generation: SPMD-ize the recorded snapshot,
+ * link the device libraries, optimize, emit PTX.
+ * ------------------------------------------------------------------------- */
+
 /* Pre-link SPMD-ization of the raw generic-mode device snapshot. Runs OpenMPOpt
  * in a NON-post-link phase, BEFORE linking the DeviceRTL: SPMD-ization needs the
  * SPMD runtime (__kmpc_get_hardware_thread_id_in_block, __kmpc_barrier_simple_spmd)
@@ -2636,6 +2723,42 @@ optimize_device_module_o3(llvm::Module & M, llvm::TargetMachine * tm)
     });
 }
 
+/* ---------------------------------------------------------------------------
+ * SECTION 7 - host (CPU) code generation: retarget at the running machine,
+ * optimize, emit an object, link it into the process with ORC.
+ * ------------------------------------------------------------------------- */
+
+/* Retarget every definition in `M` at the machine we are running on.
+ *
+ * A TargetMachine's CPU/features are only a default: both the AArch64 and X86
+ * backends prefer a function's own `target-cpu`/`target-features` attributes
+ * when they are present, and the compiler stamps them on everything with the
+ * baseline the application was built for. Overwriting them is what lets the JIT
+ * use the instructions the machine actually has. Declarations are left alone
+ * (they carry no code), and the vector-width hints are dropped because they were
+ * derived from the old feature set. */
+static void
+stamp_host_target_attrs(llvm::Module & M)
+{
+    const std::string & cpu      = host_target_attrs().first;
+    const std::string & features = host_target_attrs().second;
+    if (cpu.empty() && features.empty())
+        return ;
+
+    for (llvm::Function & F : M)
+    {
+        if (F.isDeclaration())
+            continue ;
+        if (!cpu.empty())
+            F.addFnAttr("target-cpu", cpu);
+        if (!features.empty())
+            F.addFnAttr("target-features", features);
+        F.removeFnAttr("min-legal-vector-width");
+        F.removeFnAttr("prefer-vector-width");
+        F.removeFnAttr("tune-cpu");
+    }
+}
+
 /* Optimize a JIT'd host task module before codegen (host analogue of
  * optimize_device_module_o3): O3 optimizes the pre-optimization frontend snapshot.
  * Also promote available_externally definitions (inline callees the closure keeps
@@ -2643,7 +2766,7 @@ optimize_device_module_o3(llvm::Module & M, llvm::TargetMachine * tm)
  * them instead of dropping them into unresolvable externals. Externalized globals
  * are plain external declarations, so they are left untouched. */
 static void
-optimize_host_module(llvm::Module & M, llvm::TargetMachine * tm)
+optimize_host_module(llvm::Module & M, llvm::TargetMachine * tm, llvm::StringRef entry_name)
 {
     for (llvm::Function & F : M)
         if (F.hasAvailableExternallyLinkage() && !F.isDeclaration())
@@ -2651,6 +2774,17 @@ optimize_host_module(llvm::Module & M, llvm::TargetMachine * tm)
     for (llvm::GlobalVariable & G : M.globals())
         if (G.hasAvailableExternallyLinkage() && G.hasInitializer())
             G.setLinkage(llvm::GlobalValue::InternalLinkage);
+
+    /* Only the entry is looked up after linking, so everything else can be
+     * internal -- which is what lets O3 propagate the arguments the wrapper
+     * loads into the body, drop the dead parameters, and DCE what is left. Kept
+     * external, the task body is an ABI-visible symbol and none of that applies.
+     * (The device path internalizes for the same reason, and the fuse pass does
+     * not need to because it force-inlines everything into its wrapper.)
+     * llvm.used members are preserved automatically. */
+    llvm::internalizeModule(M, [&] (const llvm::GlobalValue & GV) -> bool {
+        return GV.getName() == entry_name;
+    });
 
     run_module_passes(M, tm, [] (llvm::PassBuilder & PB, llvm::ModulePassManager & MPM) {
         MPM.addPass(PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3));
@@ -3036,11 +3170,29 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
     /* The runtime launches a JIT'd PROG as `void(void**)` (VARIADIC) or, for a
      * packed body, `void(void*, size_t)` (PACKED). If the entry already has one
      * of those shapes, use it directly; otherwise synthesize a void(void**)
-     * wrapper that unpacks the argument slots and calls the entry. */
+     * wrapper that unpacks the argument slots and calls the entry.
+     *
+     * Which shape it is must come from the declared proto, not from the
+     * signature alone: under opaque pointers a leaf taking a single captured
+     * pointer -- `void kernel(double * A)`, proto UNPACKED_PARAMS -- has exactly
+     * the shape of `void kernel(void ** args)`, and calling it directly would
+     * hand it the slot array instead of `*(double **) args[0]`.
+     *
+     * UNPACKED_PARAMS is also the default enumerator, so it doubles as "the
+     * producer said nothing". A parameter table disambiguates the two: when one
+     * is present the program really is a leaf and always gets a wrapper; without
+     * it we fall back to the signature, which is what producers that fill in
+     * nothing have always relied on. */
     llvm::FunctionType * efty = entry->getFunctionType();
     std::string lookup_name;
-    const bool entry_is_packed = is_void_ptr_size(efty);
+    const auto   proto        = prog->source.content.llvmir.proto;
+    const bool   proto_unset  = (proto == CGIR_COMMAND_PROG_SOURCE_PROTO_UNPACKED_PARAMS &&
+                                 prog->source.content.llvmir.param_count == 0);
     const bool entry_is_nanos6 = proto_is_nanos6;
+    const bool entry_is_packed = (proto == CGIR_COMMAND_PROG_SOURCE_PROTO_PACKED_BUFFER) ||
+                                 (proto_unset && is_void_ptr_size(efty));
+    const bool entry_is_ptrptr = (proto == CGIR_COMMAND_PROG_SOURCE_PROTO_VOID_PTRPTR) ||
+                                 (proto_unset && is_void_voidptr(efty));
     if (entry_is_nanos6)
     {
         /* nanos6 outline chain: the runtime launches it as
@@ -3080,7 +3232,7 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
             lookup_name = "__fused_wrapper";
         }
     }
-    else if (is_void_voidptr(efty) || entry_is_packed)
+    else if (entry_is_ptrptr || entry_is_packed)
     {
         lookup_name = entry->getName().str();
     }
@@ -3094,6 +3246,13 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
         llvm::Function * wrapper = llvm::Function::Create(
             wfty, llvm::GlobalValue::ExternalLinkage, "__cgir_jit_wrapper", mod.get());
 
+        /* The slot array is the runtime's own, distinct from every buffer the
+         * body touches (same assumption the fuse pass makes of its wrapper). It
+         * is what frees the loads below to be hoisted and CSE'd instead of being
+         * re-read after every store the body performs. */
+        wrapper->addParamAttr(0, llvm::Attribute::NoAlias);
+        wrapper->addParamAttr(0, llvm::Attribute::ReadOnly);
+
         llvm::BasicBlock * bb = llvm::BasicBlock::Create(C, "entry", wrapper);
         llvm::IRBuilder<> b(bb);
         llvm::Value * args_ptr = wrapper->getArg(0);
@@ -3102,17 +3261,23 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
         call_args.reserve(efty->getNumParams());
         for (unsigned k = 0 ; k < efty->getNumParams() ; ++k)
             call_args.push_back(emit_load_arg(b, args_ptr, k, efty->getParamType(k)));
-        b.CreateCall(efty, entry, call_args);
+        llvm::CallInst * call = b.CreateCall(efty, entry, call_args);
         b.CreateRetVoid();
+
+        /* Inline it here rather than hoping the cost model does: the wrapper
+         * exists only to unpack, and leaving the call in place would both keep a
+         * real call on every task launch and hide the now-known argument values
+         * from the body. The fuse pass inlines its constituents for the same
+         * reason. */
+        llvm::InlineFunctionInfo ifi;
+        llvm::InlineResult ires = llvm::InlineFunction(*call, ifi);
+        if (!ires.isSuccess())
+            fprintf(stderr, "jit: could not inline `%s` into its argument-unpacking "
+                            "wrapper (%s); leaving the call in place\n",
+                    entry->getName().str().c_str(), ires.getFailureReason());
 
         lookup_name = "__cgir_jit_wrapper";
     }
-
-    /* Compile with the LARGE code model. JIT'd code maps in a fresh region that
-     * can be >2GB from the process objects this program binds to (externalized
-     * globals as absolute symbols, libc, ...); small/medium 32-bit PC-relative
-     * relocations (R_X86_64_PC32) cannot span that -- large uses 64-bit absolute. */
-    mod->setCodeModel(llvm::CodeModel::Large);
 
     auto jtmb = llvm::orc::JITTargetMachineBuilder::detectHost();
     if (!jtmb)
@@ -3121,7 +3286,60 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
         fprintf(stderr, "jit: failed to detect host JIT target machine\n");
         abort();
     }
-    jtmb->setCodeModel(llvm::CodeModel::Large);
+
+    /* Code model. JIT'd code maps in a fresh region that can be far from the
+     * process objects this program binds to (externalized globals as absolute
+     * symbols, libc, ...), further than a PC-relative branch or page-relative
+     * address can reach -- which is why this used to compile everything with the
+     * LARGE model. That is a heavy price to pay everywhere for a few far
+     * references: on AArch64 the large model materializes *every* global,
+     * constant-pool entry and block address with a 4-instruction MOVZ/MOVK chain
+     * instead of ADRP+ADD, and calls out of range must go through a register.
+     *
+     * The distance problem is the linker's to solve, and ORC's JITLink already
+     * does: it builds GOT and PLT tables for the references that need them and
+     * relaxes the ones that do not, so only genuinely far symbols pay. LLJIT
+     * therefore *wants* Small + PIC (see its JITLink auto-configuration) and only
+     * refrains because a code model is already set here. So set the one it wants
+     * -- on the builder, since the object below is compiled by a TargetMachine
+     * made from it, not by LLJIT's own.
+     *
+     * `CGIR_JIT_HOST_CODE_MODEL=large` restores the old behaviour, for a platform
+     * where LLJIT falls back to RuntimeDyld rather than JITLink. */
+    if (strcmp(env_str("CGIR_JIT_HOST_CODE_MODEL", "small"), "large") == 0)
+        jtmb->setCodeModel(llvm::CodeModel::Large);
+    else
+    {
+        jtmb->setCodeModel(llvm::CodeModel::Small);
+        jtmb->setRelocationModel(llvm::Reloc::PIC_);
+    }
+
+    /* Codegen at the same level as the IR pipeline (O3), as the device and fuse
+     * paths do; JITTargetMachineBuilder otherwise defaults to O2. */
+    jtmb->setCodeGenOptLevel(llvm::CodeGenOptLevel::Aggressive);
+
+    /* JITTargetMachineBuilder's constructor turns emulated TLS on. That would
+     * lower every `thread_local` access in a JIT'd body to an
+     * __emutls_get_address call instead of a thread-pointer-relative access --
+     * and, worse, to a *different* storage than the process uses for the same
+     * variable. We link against the running process, so use its TLS model. */
+    jtmb->getOptions().EmulatedTLS = false;
+
+    /* Give the optimizer and codegen the machine they are actually running on.
+     * detectHost() puts the host CPU and feature set on the TargetMachine, but a
+     * per-function `target-cpu`/`target-features` attribute wins over it, and the
+     * compiler stamped every function with the baseline the application was built
+     * for. Without this the JIT re-optimizes at that baseline and the host
+     * detection is wasted -- which throws away the one advantage a JIT has here,
+     * since it knows the exact machine and the ahead-of-time compiler did not.
+     * (Folded into the cache key by jit_host_salt.) */
+    stamp_host_target_attrs(*mod);
+
+    /* Parsed IR may omit the triple (the fuse pass stamps it for the same
+     * reason): without it TargetLibraryInfo is built for an unknown triple, so
+     * the optimizer does not know which libcalls exist. */
+    if (mod->getTargetTriple().empty())
+        mod->setTargetTriple(jtmb->getTargetTriple());
 
     /* Obtain the relocatable object for `lookup_name`: reuse it from the on-disk
      * cache if a prior run compiled this exact body (skips optimize + codegen),
@@ -3139,9 +3357,14 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
             fprintf(stderr, "jit: failed to create host target machine\n");
             abort();
         }
+        /* likewise for the layout: the default one has the wrong ABI alignments
+         * and no native integer widths, which both mislays structs/allocas and
+         * degrades what InstCombine and the vectorizer will do */
+        if (mod->getDataLayout().isDefault())
+            mod->setDataLayout(otm->get()->createDataLayout());
         {
             scoped_phase_t _p("host-optimize");
-            optimize_host_module(*mod, otm->get());
+            optimize_host_module(*mod, otm->get(), lookup_name);
         }
         if (dump)
             dump_module(dump_dir, "final.ll", *mod);

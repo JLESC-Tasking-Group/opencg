@@ -49,9 +49,9 @@ CGIR_NAMESPACE_USE;
 /*
  * SEQUENCE PASS - group maximal linear chains (u -> v -> ... -> w) of
  * same-device task nodes into COMMAND_TYPE_BATCH sub-graphs flagged
- * `is_sequence`. Such a batch is a plain sequence of OpenMP task bodies, which
+ * `is_serial`. Such a batch is a plain sequence of OpenMP task bodies, which
  * the runtime replays as a single "super" task instead of one task per command
- * (see command_graph_t::is_sequence and xkrt's command_graph_replay_sequence).
+ * (see command_graph_t::is_serial and xkrt's command_graph_replay_sequence).
  */
 
 /* per-node pass storage */

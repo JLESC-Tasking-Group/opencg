@@ -51,14 +51,15 @@ This enables mapping to vendor-specific batching mechanisms (e.g. CUDA Graphs, H
 
 Collapses a maximal **linear chain** `u -> v -> ... -> w` of same-device
 `TASK_SPAWN` PROG commands (a recorded OpenMP-task chain) into a single
-`COMMAND_TYPE_BATCH` node whose sub-graph is flagged `is_sequence`. The runtime
+`COMMAND_TYPE_BATCH` node whose sub-graph is flagged `is_serial`. The runtime
 replays such a batch as one "super" task (running each recorded task body serially
 on one thread) instead of spawning and scheduling one task per command.
 
-Chains are grown by union-find over *sequence edges* — an edge `u -> v` where `u`
-has exactly one successor (`v`) and `v` exactly one predecessor (`u`), both on the
-same device and both sequence-able (a `TASK_SPAWN` PROG or a control node). Since a
-sequence edge cannot branch, each detected island is inherently a linear chain.
+Chains are grown by walking *sequence edges* — an edge `u -> v` where `u` has
+exactly one successor (`v`) and `v` exactly one predecessor (`u`), both on the same
+device and both sequence-able (a `TASK_SPAWN` PROG or a control node). Since a
+sequence edge cannot branch, following them from an unvisited chain head yields a
+linear chain directly; only chains of at least two commands are materialized.
 Materialization is identical to the batch pass (reuse the node objects and internal
 edges in place; rewire only the boundary), and only chains with at least two
 `COMMAND` members are batched.
