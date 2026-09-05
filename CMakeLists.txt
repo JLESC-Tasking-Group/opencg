@@ -44,6 +44,7 @@ cgiroption(USE_MLIR "Use MLIR for the command-graph IR and optimization passes."
 SET(SOURCE_FILES
     # common (POD + MLIR)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/cgir.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/jit-support.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/prog-fuse-llvmir.cc
     # POD interface implementation
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/batch.cc
@@ -191,15 +192,20 @@ if (USE_LLVM)
     # Add LLVM's own include directories (source tree + build tree headers).
     target_include_directories(${CGIR} PRIVATE ${LLVM_INCLUDE_DIRS})
 
-    # prog-fuse-llvmir.cc is the LLVM-consuming translation unit. Match LLVM's
-    # own build (typically -fno-rtti): consuming LLVM APIs (e.g. the ORC JIT's
-    # error/typeinfo machinery) from an RTTI-enabled TU emits references to LLVM
-    # RTTI symbols (e.g. `typeinfo for llvm::ErrorInfoBase`) that a no-RTTI LLVM
-    # does not provide, yielding an undefined-reference link error. It only uses
-    # LLVM's own isa<>/dyn_cast<> (not C++ RTTI), so -fno-rtti is safe here.
+    # The LLVM-consuming translation units. Match LLVM's own build (typically
+    # -fno-rtti): consuming LLVM APIs (e.g. the ORC JIT's error/typeinfo
+    # machinery) from an RTTI-enabled TU emits references to LLVM RTTI symbols
+    # (e.g. `typeinfo for llvm::ErrorInfoBase`) that a no-RTTI LLVM does not
+    # provide, yielding an undefined-reference link error. They only use LLVM's
+    # own isa<>/dyn_cast<> (not C++ RTTI), so -fno-rtti is safe here.
+    #
+    # Every new source that includes an LLVM header must be added to this list.
+    set(CGIR_LLVM_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/jit-support.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/prog-fuse-llvmir.cc
+    )
     if (NOT LLVM_ENABLE_RTTI)
-        set_source_files_properties(
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/prog-fuse-llvmir.cc
+        set_source_files_properties(${CGIR_LLVM_SOURCES}
             PROPERTIES COMPILE_OPTIONS "-fno-rtti")
     endif()
 
