@@ -946,10 +946,12 @@ collapse_device_kernel_brackets(llvm::Function & F, std::string & why)
  * optimize pipeline can dump the pre-LoopFuse wrapper for debugging). */
 static void dump_module(const std::string & dir, const char * name, llvm::Module & M);
 
-/* Turn a generic-mode device module into SPMD form (defined in SECTION 3, where
- * PTX codegen also uses it; forward-declared so the fuse pass can run it FIRST --
- * see the call site for why the ordering matters). */
+/* Turn a generic-mode device module into SPMD form, and read back the target
+ * features to build a TargetMachine with (both defined in SECTION 3, where PTX
+ * codegen also uses them; forward-declared so the fuse pass can SPMD-ize its
+ * inputs FIRST -- see the call site for why the ordering matters). */
 static void spmdize_device_module(llvm::Module & M, llvm::TargetMachine * tm);
+static std::string device_features_of(const llvm::Module & M);
 
 /* Run an O3 module pipeline (inlining + loop-fuse + vectorization) on the
  * merged module, so the inlined kernels' loops can vectorize/fuse. `dump_dir` is
@@ -1177,6 +1179,73 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             char name[32];
             snprintf(name, sizeof(name), "input-%zu.ll", i);
             dump_module(dump_dir, name, *mods[i]);
+        }
+
+        /* SPMD-ize a device input HERE, before it is renamed, internalized and
+         * linked into the merged module.
+         *
+         * A recorded `omp target teams distribute parallel for` is a generic-mode
+         * kernel: its loop lives in an outlined function reached through
+         * `__kmpc_parallel_XX(..., ptr @outlined, ...)` -- the body is a function
+         * POINTER handed to a runtime declaration, never a direct call. Nothing
+         * downstream can follow that edge (the inlining fixpoint later only walks
+         * direct calls), so the fused wrapper would contain no load or store at
+         * all. Two things then fail silently: LoopFuse has no adjacent loops to
+         * fuse, which is the whole point of this pass; and the legality gate in
+         * collapse_device_kernel_brackets has no memory accesses to reason about,
+         * so it approves chains it has not examined.
+         *
+         * OpenMPOpt's SPMD-ization removes the indirection. It already runs on
+         * this IR -- but in the `jit` pass, long after the fusion decision. It has
+         * to happen before.
+         *
+         * It has to happen HERE specifically, and not once on the merged module:
+         * by then each constituent has been given internal linkage, stripped of
+         * its `ptx_kernel` calling convention and left unreferenced until the
+         * wrapper is built (see step 5b). OpenMPOpt would no longer recognize them
+         * as device kernels, and would delete them as dead code. At this point
+         * each module is still the standalone snapshot it expects -- one external
+         * `ptx_kernel` entry plus its helpers -- which is exactly the shape
+         * emit_device_ptx feeds it.
+         *
+         * Best-effort: if the target is unavailable the module is left in generic
+         * mode, and the legality gate then refuses the chain (a body with no
+         * visible memory access cannot be proved safe). The failure mode is
+         * "not fused", never "fused wrongly". */
+        const char * itriple = progs[i]->source.content.llvmir.triple;
+        if (itriple != nullptr)
+        {
+            scoped_phase_t _p("fuse-spmdize");
+
+            llvm::Triple TT(itriple);
+            std::string terr;
+            if (const llvm::Target * T = llvm::TargetRegistry::lookupTarget(TT, terr))
+            {
+                const char * iarch = progs[i]->source.content.llvmir.arch;
+                llvm::TargetOptions topts;
+                std::unique_ptr<llvm::TargetMachine> itm(T->createTargetMachine(
+                    TT, iarch ? iarch : "", device_features_of(*mods[i]), topts,
+                    std::nullopt, std::nullopt, llvm::CodeGenOptLevel::Aggressive));
+                if (itm)
+                {
+                    mods[i]->setTargetTriple(TT);
+                    mods[i]->setDataLayout(itm->createDataLayout());
+                    spmdize_device_module(*mods[i], itm.get());
+
+                    /* Both shapes are worth having when a fusion misbehaves: the
+                     * recording as it arrived, and what the pass actually works on. */
+                    if (dump)
+                    {
+                        char name[40];
+                        snprintf(name, sizeof(name), "input-%zu-spmd.ll", i);
+                        dump_module(dump_dir, name, *mods[i]);
+                    }
+                }
+            }
+            else
+                fprintf(stderr, "prog-fuse: no target for '%s' (%s); program %zu stays "
+                                "in generic mode and will not be fused\n",
+                        TT.str().c_str(), terr.c_str(), i);
         }
     }
 
@@ -1714,31 +1783,6 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
 
     if (device)
     {
-        /* SPMD-ize BEFORE fusing, not after.
-         *
-         * A recorded `omp target teams distribute parallel for` is a generic-mode
-         * kernel: its loop lives in an outlined function reached through
-         * `__kmpc_parallel_XX(..., ptr @outlined, ...)`, i.e. as a function
-         * POINTER handed to a runtime declaration. Nothing downstream can follow
-         * that edge -- the inlining fixpoint below only walks direct calls -- so
-         * on generic-mode input the fused wrapper ends up containing no load or
-         * store whatsoever. Two things then quietly fail: LoopFuse has no adjacent
-         * loops to fuse (the whole point of the pass), and the legality gate in
-         * collapse_device_kernel_brackets has no memory accesses to reason about.
-         *
-         * OpenMPOpt's SPMD-ization removes the indirection. It already ran on this
-         * IR -- but in the `jit` pass, long after the fusion decision was made.
-         * Running it here puts the loops inside the wrapper, where both the gate
-         * and LoopFuse can see them.
-         *
-         * If it does not fire, the gate refuses the chain (a body with no visible
-         * access cannot be proved safe), so the failure mode is "not fused",
-         * never "fused wrongly". */
-        {
-            scoped_phase_t _p("fuse-spmdize");
-            spmdize_device_module(*mod_u, nullptr);
-        }
-
         /* Device fusion (Level 1, program-level): build a single `ptx_kernel` over
          * the deduplicated kernel parameters, call each region kernel with its
          * subset, inline them, then collapse the per-kernel target_init/deinit
@@ -1772,6 +1816,18 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         for (size_t i = 0 ; i < n ; ++i)
         {
             llvm::Function * fn = mod_u->getFunction(inputs[i].fused_name);
+            if (fn == nullptr)
+            {
+                /* The constituent was present at step 5b and is gone now, so
+                 * something between the two removed it -- a module pass that saw
+                 * an internal function with no callers, most likely. Refuse
+                 * rather than dereference null: the wrapper is half-built, but
+                 * `dst` has not been touched yet, so the caller simply keeps the
+                 * chain unfused. */
+                fprintf(stderr, "prog-fuse: constituent '%s' vanished before the "
+                                "wrapper could call it\n", inputs[i].fused_name.c_str());
+                return false;
+            }
             std::vector<llvm::Value *> call_args;
             call_args.reserve(inputs[i].arity);
             for (unsigned j = 0 ; j < inputs[i].arity ; ++j)
