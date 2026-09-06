@@ -53,7 +53,7 @@ You may set the following environment variables
   per-command-type counts *before* and *after* the pass (nodes, edges, empty
   control nodes, commands, PROG, 1D/2D copies, batches). Set it to a file path;
   rows accumulate across passes and processes. This is the data source for the
-  evaluation harness (`bench/`). Independent of `CGIR_OPTIMIZE_DUMP`.
+  evaluation harness (`apps/openmp/scripts/`). Independent of `CGIR_OPTIMIZE_DUMP`.
 - `CGIR_STATS_TAG` an arbitrary string written verbatim in the `tag` column of
   every `CGIR_STATS_CSV` row, so a caller (e.g. the benchmark runner) can join
   the per-pass stats back to a specific run.

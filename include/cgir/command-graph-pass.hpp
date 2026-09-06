@@ -121,9 +121,69 @@ command_graph_pass_from_str(const char * s)
     return COMMAND_GRAPH_PASS_MAX;
 }
 
+/* Parse a comma/space/tab-separated list of pass names into a set, e.g.
+ * "reduce-node,transitive-reduction,jit". A "none" token contributes nothing, so
+ * both "" and "none" yield the empty set. An unknown token is skipped; when
+ * `unknown` is non-NULL the first one is copied into it (NUL-terminated, at most
+ * `unknown_size` bytes) so the caller can report it with its own logger.
+ *
+ * Tokenizes in place over the caller's buffer without allocating, so it is usable
+ * from a runtime's start-up path. */
+static inline command_graph_pass_set_t
+command_graph_pass_set_from_str(const char * s, char * unknown, size_t unknown_size)
+{
+    if (unknown && unknown_size)
+        unknown[0] = 0;
+    if (s == NULL)
+        return 0;
+
+    command_graph_pass_set_t passes = 0;
+    for (const char * p = s ; *p ; )
+    {
+        /* skip separators */
+        if (*p == ',' || *p == ' ' || *p == '\t')
+        {
+            ++p;
+            continue;
+        }
+
+        /* [p..q[ is the token */
+        const char * q = p;
+        while (*q && *q != ',' && *q != ' ' && *q != '\t')
+            ++q;
+
+        const size_t len = (size_t) (q - p);
+        char tok[64];
+        if (len < sizeof(tok))
+        {
+            memcpy(tok, p, len);
+            tok[len] = 0;
+
+            if (strcmp(tok, "none"))
+            {
+                const command_graph_pass_t pass = command_graph_pass_from_str(tok);
+                if (pass == COMMAND_GRAPH_PASS_MAX)
+                {
+                    /* only the first unknown token is reported */
+                    if (unknown && unknown_size && unknown[0] == 0)
+                    {
+                        const size_t n = (len < unknown_size - 1) ? len : unknown_size - 1;
+                        memcpy(unknown, p, n);
+                        unknown[n] = 0;
+                    }
+                }
+                else
+                    passes |= command_graph_pass_bit(pass);
+            }
+        }
+        p = q;
+    }
+    return passes;
+}
+
 /* A comma-separated list of every pass name, with a trailing ", " separator,
  * built at compile time from CGIR_FORALL_COMMAND_GRAPH_PASS, e.g.
- * "copy-normalize, copy-fuse, reduce-node, transitive-reduction, prog-fuse, batch, ".
+ * "copy-fuse, reduce-node, transitive-reduction, prog-fuse, jit, sequence, batch, ".
  * The trailing separator lets a caller append a final token (such as "none")
  * without special-casing. Handy for diagnostics that enumerate valid pass names.
  *
