@@ -35,6 +35,17 @@ make
 You may set the following environment variables
 - `CGIR_OPTIMIZER` as `mlir` or `pod` to switch the optimizer representation.
 - `CGIR_JIT_DUMP` to dump the LLVM IR before and after JIT passes.
+- `CGIR_PROG_FUSE_UNSAFE_DEVICE` set to any non-empty value other than `0` makes
+  the `prog-fuse` pass merge a chain of device kernels into a single launch
+  **without proving that it may**. Two `omp target` regions run as two launches
+  separated by a device-wide barrier; a single launch has no such barrier, so
+  merging is only meaning-preserving when no thread of a later kernel reads a
+  location a *different* thread of an earlier one wrote. By default the pass
+  proves that (rejecting reductions, atomics, block-shared memory, and any access
+  a later kernel makes at a different index than the earlier one wrote) and
+  leaves the chain unfused otherwise. This variable skips the proof, and will
+  **silently compute wrong results** on any chain it would have refused --- it
+  exists only to measure how much fusion the conservative answer gives up.
 - `CGIR_PROG_FUSE_DUMP` to dump the LLVM IR of each prog-fusion for debugging:
   the input programs (`input-<i>.ll`), the merged module before optimization
   (`merged.ll`) and the fused/optimized result (`fused.ll`). Set it to any

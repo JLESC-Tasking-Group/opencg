@@ -137,11 +137,19 @@ command_graph_pass_set_from_str(const char * s, char * unknown, size_t unknown_s
     if (s == NULL)
         return 0;
 
+    /* Newline and carriage return are separators too: a value assembled by a
+     * script can pick one up (a shell line continuation inside single quotes is a
+     * literal backslash-newline), and treating it as part of a token turns a
+     * valid pass name into an unknown one -- silently running a different
+     * pipeline than the caller asked for. */
+    # define CGIR_PASS_IS_SEP(C) ((C) == ',' || (C) == ' ' || (C) == '\t' \
+                              || (C) == '\n' || (C) == '\r')
+
     command_graph_pass_set_t passes = 0;
     for (const char * p = s ; *p ; )
     {
         /* skip separators */
-        if (*p == ',' || *p == ' ' || *p == '\t')
+        if (CGIR_PASS_IS_SEP(*p))
         {
             ++p;
             continue;
@@ -149,7 +157,7 @@ command_graph_pass_set_from_str(const char * s, char * unknown, size_t unknown_s
 
         /* [p..q[ is the token */
         const char * q = p;
-        while (*q && *q != ',' && *q != ' ' && *q != '\t')
+        while (*q && !CGIR_PASS_IS_SEP(*q))
             ++q;
 
         const size_t len = (size_t) (q - p);
@@ -178,6 +186,7 @@ command_graph_pass_set_from_str(const char * s, char * unknown, size_t unknown_s
         }
         p = q;
     }
+    # undef CGIR_PASS_IS_SEP
     return passes;
 }
 

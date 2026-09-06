@@ -116,7 +116,12 @@ command_graph_t::pass_prog_fuse(void)
         for (command_graph_node_t * c : chain)
             progs.push_back(&c->command->prog);
 
-        command_graph_prog_fuse_llvmir(progs.data(), progs.size(), &u->command->prog);
+        /* Refusing a chain is a normal outcome (an unhandled program shape, or a
+         * device chain whose meaning fusion would not preserve). The nodes must
+         * then stay separate: contracting them anyway would drop every member
+         * but the head, i.e. silently skip work. Leave them for the next pass. */
+        if (!command_graph_prog_fuse_llvmir(progs.data(), progs.size(), &u->command->prog))
+            continue ;
 
         /* Contract the chain into u (each successive node absorbed in series). */
         for (size_t k = 1 ; k < chain.size() ; ++k)

@@ -71,7 +71,13 @@
 
 # if CGIR_SUPPORT_LLVM
 
+# include <llvm/ADT/DenseMap.h>
+# include <llvm/ADT/DenseSet.h>
+# include <llvm/ADT/PostOrderIterator.h>
+# include <llvm/Analysis/AliasAnalysis.h>
 # include <llvm/Analysis/InlineCost.h>
+# include <llvm/Analysis/MemoryLocation.h>
+# include <llvm/Analysis/ScalarEvolution.h>
 # include <llvm/Analysis/ValueTracking.h>
 # include <llvm/IR/Function.h>
 # include <llvm/IR/IRBuilder.h>
@@ -473,21 +479,16 @@ constant_value_equal(llvm::Constant * a, llvm::Constant * b)
     return true;
 }
 
-/* Collapse the per-kernel OpenMP-device runtime brackets in a fused device kernel.
- * Inlining N device target-region kernels into one wrapper leaves N
- * `__kmpc_target_init`/`__kmpc_target_deinit` pairs, but a single launch must have
- * exactly ONE. For SPMD kernels (target_init returns -1 => every thread runs the
- * body) with an identical launch configuration, keep the FIRST init and the LAST
- * deinit and drop the inner ones: each removed init's result is replaced by -1 so
- * its "== -1 => body" branch falls through into the body, and each removed deinit
- * is erased. Returns false if the kernels are not the expected SPMD shape or their
- * launch configurations differ (caller must then NOT fuse them). Assumes the
- * inlined bodies appear in launch order (block layout order), which holds since the
- * wrapper calls them in order and we inline in place. */
-static bool
-collapse_device_kernel_brackets(llvm::Function & F)
+/* Collect the per-kernel target_init / target_deinit calls of `F`, in block
+ * order. Split out because the brackets must be re-found after the canonicalizing
+ * passes below, which may replace the instructions holding them. */
+static void
+collect_device_kernel_brackets(llvm::Function & F,
+                               std::vector<llvm::CallInst *> & inits,
+                               std::vector<llvm::CallInst *> & deinits)
 {
-    std::vector<llvm::CallInst *> inits, deinits;
+    inits.clear();
+    deinits.clear();
     for (llvm::BasicBlock & BB : F)
         for (llvm::Instruction & I : BB)
             if (auto * CI = llvm::dyn_cast<llvm::CallInst>(&I))
@@ -496,10 +497,299 @@ collapse_device_kernel_brackets(llvm::Function & F)
                     if (cf->getName() == "__kmpc_target_init")   inits.push_back(CI);
                     else if (cf->getName() == "__kmpc_target_deinit") deinits.push_back(CI);
                 }
+}
+
+/* ---------------------------------------------------------------------------
+ * Device-chain fusion legality.
+ *
+ * Two `omp target` regions execute as two kernel launches, and the launch
+ * boundary is a DEVICE-WIDE barrier: every thread of kernel k finishes before
+ * any thread of kernel k+1 starts. Collapsing the brackets (below) fuses them
+ * into a single launch, which removes that barrier -- nothing in a single SPMD
+ * launch synchronizes across thread blocks.
+ *
+ * That is only meaning-preserving if no thread of a later kernel reads a
+ * location written by a DIFFERENT thread of an earlier one. Two families of
+ * program violate it:
+ *
+ *   - a cross-thread write: a reduction (`reduction(+:s)` lowers to a
+ *     `__kmpc_*reduce*` call whose result is only settled at kernel exit) or an
+ *     atomic. Every Krylov solver has one: `dot(p, Ap)` reduces, and the next
+ *     kernel divides by it.
+ *   - a cross-thread read: a gather/stencil, where thread i of kernel k+1 reads
+ *     an element thread j != i of kernel k wrote.
+ *
+ * LLVM cannot decide this for us. Its loop-fusion legality analysis reasons
+ * within one function about one loop nest; it has no notion of the launch
+ * boundary we removed before it ever ran. So the check lives here.
+ *
+ * The test below is conservative: it refuses whenever it cannot prove safety.
+ * ------------------------------------------------------------------------- */
+
+/* True if `name` is a call that combines values across threads, i.e. one whose
+ * result is only complete at kernel exit. Deliberately a broad substring match:
+ * refusing a fusion costs performance, allowing an unsound one costs correctness,
+ * so a false positive here is the cheap error. */
+static bool
+is_cross_thread_runtime_call(llvm::StringRef name)
+{
+    return name.contains("reduce")       /* __kmpc_nvptx_parallel_reduce_nowait_v2, ... */
+        || name.contains("reduction");   /* __kmpc_reduction_get_fixed_buffer, ...      */
+}
+
+/* One memory access of a fused kernel body, as seen from the merged wrapper. */
+struct device_access_t
+{
+    llvm::Instruction * inst;
+    llvm::Value       * ptr;
+    bool                is_write;
+};
+
+/* Partition the wrapper's instructions into the N inlined kernel bodies and
+ * decide whether the device-wide barriers between them can be removed.
+ *
+ * `n` is the number of fused kernels. Body k is every instruction from the k-th
+ * `__kmpc_target_init` up to (excluding) the (k+1)-th, in reverse-post-order,
+ * which is the order the wrapper calls them in.
+ *
+ * Refuses -- and writes the reason to `why` -- when:
+ *   (a) a body performs a cross-thread write (reduction call, atomicrmw,
+ *       cmpxchg), whose value is only settled by the launch boundary;
+ *   (b) a body touches block-shared memory (addrspace 3), whose lifetime is the
+ *       launch and would otherwise leak from one body into the next;
+ *   (c) a location written by body k may be accessed by a later body m > k at a
+ *       DIFFERENT address expression. Equal SCEVs mean thread i of body m
+ *       touches exactly what thread i of body k wrote, so the barrier is
+ *       redundant; anything else is a potential cross-thread dependence.
+ *
+ * Accesses to thread-private memory (allocas) are skipped: no other thread can
+ * observe them. */
+static bool
+device_chain_barrier_removable(llvm::Function & Forig, size_t n, std::string & why)
+{
+    /* Decide on a CLONE, never on the real wrapper.
+     *
+     * The analysis needs canonicalized IR: as inlined, each body rebuilds its
+     * captured pointers through local allocas, so the address of `y[i]` in one
+     * body and of `y[i]` in the next are unrelated values that no analysis can
+     * equate, and every chain would be refused. SROA promotes those allocas so
+     * both resolve to the same deduplicated base load; tag_noalias_domains then
+     * tells alias analysis that two DISTINCT captured bases (`x` and `y`) do not
+     * overlap -- without which every pair would be MayAlias and, again, every
+     * chain refused. Loop-simplify and rotation give ScalarEvolution the loop
+     * shape it needs to see the induction variable.
+     *
+     * All of that is what optimize_module() does later anyway, but doing it to
+     * the real wrapper here would invalidate the caller's bracket pointers and
+     * tag the noalias domains twice. A predicate should not have side effects,
+     * so it gets its own copy and throws it away. */
+    llvm::ValueToValueMapTy vmap;
+    llvm::Function * clone = llvm::CloneFunction(&Forig, vmap);
+    if (clone == nullptr)
+    {
+        why = "could not clone the wrapper for analysis";
+        return false;
+    }
+    /* Erase the clone on every exit path, including the early returns below. */
+    struct clone_guard_t
+    {
+        llvm::Function * f;
+        ~clone_guard_t() { if (f) f->eraseFromParent(); }
+    } guard { clone };
+    llvm::Function & F = *clone;
+
+    {
+        llvm::PassBuilder             PB;
+        llvm::LoopAnalysisManager     LAM;
+        llvm::FunctionAnalysisManager FAM;
+        llvm::CGSCCAnalysisManager    CGAM;
+        llvm::ModuleAnalysisManager   MAM;
+        PB.registerModuleAnalyses(MAM);
+        PB.registerCGSCCAnalyses(CGAM);
+        PB.registerFunctionAnalyses(FAM);
+        PB.registerLoopAnalyses(LAM);
+        PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+        llvm::FunctionPassManager FPM1;
+        FPM1.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+        FPM1.addPass(llvm::InstCombinePass());
+        FPM1.addPass(llvm::SimplifyCFGPass());
+        FPM1.run(F, FAM);
+
+        tag_noalias_domains(F);
+        FAM.invalidate(F, llvm::PreservedAnalyses::none());
+
+        llvm::FunctionPassManager FPM2;
+        FPM2.addPass(llvm::LoopSimplifyPass());
+        llvm::LoopPassManager LPM;
+        LPM.addPass(llvm::LoopRotatePass());
+        FPM2.addPass(llvm::createFunctionToLoopPassAdaptor(std::move(LPM)));
+        FPM2.run(F, FAM);
+    }
+
+    /* The passes above may have replaced the instructions holding the brackets,
+     * so re-find them in the clone. Their count cannot change: the calls have
+     * side effects and nothing above deletes them. */
+    std::vector<llvm::CallInst *> live_inits, live_deinits;
+    collect_device_kernel_brackets(F, live_inits, live_deinits);
+    if (live_inits.size() != n)
+    {
+        why = "canonicalization changed the number of kernel brackets";
+        return false;
+    }
+
+    /* Reverse post-order is the execution order of a wrapper built as a straight
+     * sequence of inlined calls, and unlike the block list it does not depend on
+     * where the inliner happened to append blocks. */
+    llvm::ReversePostOrderTraversal<llvm::Function *> rpo(&F);
+
+    /* instruction -> body index; -1 before the first init (the wrapper prologue) */
+    llvm::DenseMap<const llvm::Instruction *, int> body_of;
+    llvm::DenseSet<const llvm::CallInst *> init_set(live_inits.begin(), live_inits.end());
+    int cur = -1;
+    for (llvm::BasicBlock * BB : rpo)
+        for (llvm::Instruction & I : *BB)
+        {
+            if (auto * CI = llvm::dyn_cast<llvm::CallInst>(&I))
+                if (init_set.count(CI))
+                    ++cur;
+            body_of[&I] = cur;
+        }
+
+    /* (a)+(b): scan for constructs that alone make the fusion unsound, and
+     * collect the accesses the pairwise test needs. */
+    std::vector<std::vector<device_access_t>> acc(n);
+    for (llvm::BasicBlock & BB : F)
+        for (llvm::Instruction & I : BB)
+        {
+            auto it = body_of.find(&I);
+            const int b = (it == body_of.end()) ? -1 : it->second;
+            if (b < 0 || (size_t) b >= n)
+                continue ;   /* wrapper prologue/epilogue, not a kernel body */
+
+            if (llvm::isa<llvm::AtomicRMWInst>(&I) || llvm::isa<llvm::AtomicCmpXchgInst>(&I))
+            {
+                why = "a body performs an atomic read-modify-write";
+                return false;
+            }
+            if (auto * CI = llvm::dyn_cast<llvm::CallInst>(&I))
+                if (llvm::Function * cf = CI->getCalledFunction())
+                    if (is_cross_thread_runtime_call(cf->getName()))
+                    {
+                        why = ("a body calls '" + cf->getName() + "', which combines "
+                               "values across threads").str();
+                        return false;
+                    }
+
+            llvm::Value * ptr = nullptr;
+            bool is_write = false;
+            if (auto * LI = llvm::dyn_cast<llvm::LoadInst>(&I))
+                ptr = LI->getPointerOperand();
+            else if (auto * SI = llvm::dyn_cast<llvm::StoreInst>(&I))
+            {
+                ptr = SI->getPointerOperand();
+                is_write = true;
+            }
+            else
+                continue ;
+
+            const llvm::Value * obj = llvm::getUnderlyingObject(ptr);
+            if (llvm::isa<llvm::AllocaInst>(obj))
+                continue ;                       /* thread-private */
+            if (ptr->getType()->getPointerAddressSpace() == 3)
+            {
+                why = "a body uses block-shared memory (addrspace 3)";
+                return false;
+            }
+
+            acc[(size_t) b].push_back({ &I, ptr, is_write });
+        }
+
+    /* (c): pairwise, over ALL ordered pairs of bodies -- collapsing the brackets
+     * removes every barrier in the chain, not only the adjacent ones. */
+    llvm::PassBuilder PB;
+    llvm::LoopAnalysisManager     LAM;
+    llvm::FunctionAnalysisManager FAM;
+    llvm::CGSCCAnalysisManager    CGAM;
+    llvm::ModuleAnalysisManager   MAM;
+    PB.registerModuleAnalyses(MAM);
+    PB.registerCGSCCAnalyses(CGAM);
+    PB.registerFunctionAnalyses(FAM);
+    PB.registerLoopAnalyses(LAM);
+    PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+    llvm::ScalarEvolution & SE = FAM.getResult<llvm::ScalarEvolutionAnalysis>(F);
+    llvm::AAResults       & AA = FAM.getResult<llvm::AAManager>(F);
+
+    /* The comparison is quadratic in the accesses of a pair of bodies. A long
+     * chain of large kernels would make the check itself the cost of the pass,
+     * so give up (conservatively: refuse) rather than spend that time. */
+    size_t budget = 200000;
+
+    for (size_t k = 0 ; k < n ; ++k)
+        for (const device_access_t & w : acc[k])
+        {
+            if (!w.is_write)
+                continue ;
+            for (size_t m = k + 1 ; m < n ; ++m)
+                for (const device_access_t & r : acc[m])
+                {
+                    if (budget-- == 0)
+                    {
+                        why = "the chain is too large to prove safe";
+                        return false;
+                    }
+                    if (AA.alias(llvm::MemoryLocation::getBeforeOrAfter(w.ptr),
+                                 llvm::MemoryLocation::getBeforeOrAfter(r.ptr))
+                        == llvm::AliasResult::NoAlias)
+                        continue ;               /* disjoint buffers: independent */
+
+                    /* May alias. Safe only if it is the SAME element: then the
+                     * thread reading it is the thread that wrote it. */
+                    if (SE.getSCEV(w.ptr) != SE.getSCEV(r.ptr))
+                    {
+                        /* Name the two instructions: "fusion did not happen" is
+                         * otherwise very hard to act on. */
+                        std::string buf;
+                        llvm::raw_string_ostream os(buf);
+                        os << "body " << k << " writes and body " << m
+                           << " accesses the same memory at different indices "
+                              "(a cross-thread dependence): '"
+                           << *w.inst << "' vs '" << *r.inst << "'";
+                        why = os.str();
+                        return false;
+                    }
+                }
+        }
+
+    return true;
+}
+
+/* Collapse the per-kernel OpenMP-device runtime brackets in a fused device kernel.
+ * Inlining N device target-region kernels into one wrapper leaves N
+ * `__kmpc_target_init`/`__kmpc_target_deinit` pairs, but a single launch must have
+ * exactly ONE. For SPMD kernels (target_init returns -1 => every thread runs the
+ * body) with an identical launch configuration, keep the FIRST init and the LAST
+ * deinit and drop the inner ones: each removed init's result is replaced by -1 so
+ * its "== -1 => body" branch falls through into the body, and each removed deinit
+ * is erased. Returns false if the kernels are not the expected SPMD shape, their
+ * launch configurations differ, or removing the device-wide barriers between them
+ * would not preserve the program's meaning (see device_chain_barrier_removable);
+ * the caller must then NOT fuse them. Assumes the inlined bodies appear in launch
+ * order (block layout order), which holds since the wrapper calls them in order
+ * and we inline in place. `why` receives the reason when it returns false. */
+static bool
+collapse_device_kernel_brackets(llvm::Function & F, std::string & why)
+{
+    std::vector<llvm::CallInst *> inits, deinits;
+    collect_device_kernel_brackets(F, inits, deinits);
 
     /* need N matched pairs (N == number of fused kernels >= 2) */
     if (inits.size() < 2 || inits.size() != deinits.size())
+    {
+        why = "the inlined bodies do not have matched target_init/deinit pairs";
         return false;
+    }
 
     /* All kernels must share the launch configuration: the first field of
      * KernelEnvironmentTy (ConfigurationEnvironmentTy), which holds only integers
@@ -518,10 +808,16 @@ collapse_device_kernel_brackets(llvm::Function & F)
     };
     llvm::Constant * cfg0 = config_of(inits[0]);
     if (cfg0 == nullptr)
+    {
+        why = "a kernel environment is not a readable constant";
         return false;
+    }
     for (size_t i = 1 ; i < inits.size() ; ++i)
         if (!constant_value_equal(config_of(inits[i]), cfg0))
+        {
+            why = "the kernels have differing launch configurations";
             return false;
+        }
 
     /* Each init must be the SPMD pattern: its result feeds `icmp eq <res>, -1`. */
     auto is_spmd_init = [] (llvm::CallInst * init) -> bool
@@ -536,7 +832,27 @@ collapse_device_kernel_brackets(llvm::Function & F)
     };
     for (llvm::CallInst * init : inits)
         if (!is_spmd_init(init))
+        {
+            why = "a kernel is not in SPMD form";
             return false;
+        }
+
+    /* The launch boundary between the bodies is a device-wide barrier. Removing
+     * it is the whole point of fusing, and also the only way this pass can change
+     * a program's result, so it is proved -- not assumed -- before anything is
+     * erased.
+     *
+     * CGIR_PROG_FUSE_UNSAFE_DEVICE skips the proof. It exists to measure what the
+     * proof costs -- how much fusion a conservative answer gives up -- and it
+     * produces WRONG RESULTS on any chain the proof would have refused, silently.
+     * Never set it for anything but that measurement, and check the program's
+     * output when you do. */
+    if (env_flag("CGIR_PROG_FUSE_UNSAFE_DEVICE"))
+        fprintf(stderr, "prog-fuse: CGIR_PROG_FUSE_UNSAFE_DEVICE is set -- fusing %zu "
+                        "device kernels WITHOUT proving the barrier removable; "
+                        "results may be wrong\n", inits.size());
+    else if (!device_chain_barrier_removable(F, inits.size(), why))
+        return false;
 
     /* keep inits[0] and deinits[last]; drop the inner brackets */
     llvm::Type * i32 = llvm::Type::getInt32Ty(F.getContext());
@@ -729,7 +1045,7 @@ dump_module(const std::string & dir, const char * name, llvm::Module & M)
  * SECTION 2 - the prog-fuse pass: merge a chain of programs into one.
  * ------------------------------------------------------------------------- */
 
-void
+bool
 CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     command_prog_t ** progs,
     size_t n,
@@ -738,7 +1054,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     # if !CGIR_SUPPORT_LLVM
     (void) progs; (void) n; (void) dst;
     fprintf(stderr, "prog-fuse: LLVM support not enabled (rebuild with -DUSE_LLVM=ON)\n");
-    abort();
+    return false;
     # else
     assert(n >= 2);
 
@@ -765,14 +1081,14 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         if (progs[i]->source.type != COMMAND_PROG_SOURCE_TYPE_LLVMIR)
         {
             fprintf(stderr, "prog-fuse: program %zu is not LLVM IR\n", i);
-            abort();
+            return false;
         }
         mods[i] = parse_llvmir(
             static_cast<const char *>(progs[i]->source.content.llvmir.raw),
             progs[i]->source.content.llvmir.size,
             *ctx
         );
-        if (!mods[i]) { fprintf(stderr, "prog-fuse: failed to parse program %zu\n", i); abort(); }
+        if (!mods[i]) { fprintf(stderr, "prog-fuse: failed to parse program %zu\n", i); return false; }
 
         /* dump the original input IR (before prefixing/linking) */
         if (dump)
@@ -868,7 +1184,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             if (!entry || entry->isDeclaration())
             {
                 fprintf(stderr, "prog-fuse: no entry found in task-spawn program %zu\n", i);
-                abort();
+                return false;
             }
 
             llvm::FunctionType * fty = entry->getFunctionType();
@@ -882,7 +1198,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
                 {
                     fprintf(stderr, "prog-fuse: nanos6 outline program %zu entry '%s' is not "
                                     "void(void*,void*,void*)\n", i, entry->getName().str().c_str());
-                    abort();
+                    return false;
                 }
                 is_outline = true;
                 arity      = 0;
@@ -902,7 +1218,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
                 {
                     fprintf(stderr, "prog-fuse: cannot re-fuse packed fused program %zu "
                                     "(no params table)\n", i);
-                    abort();
+                    return false;
                 }
                 is_packed_leaf = true;
                 arity          = (unsigned) progs[i]->source.content.llvmir.param_count;
@@ -932,7 +1248,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             if (!entry || entry->isDeclaration())
             {
                 fprintf(stderr, "prog-fuse: entry symbol '%s' not found in program %zu\n", sym, i);
-                abort();
+                return false;
             }
             is_wrapper = false;
             arity      = entry->getFunctionType()->getNumParams();
@@ -960,7 +1276,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         if (entry == nullptr)
         {
             entry = find_kernel(M);
-            if (!entry) { fprintf(stderr, "prog-fuse: no kernel found in program %zu\n", i); abort(); }
+            if (!entry) { fprintf(stderr, "prog-fuse: no kernel found in program %zu\n", i); return false; }
             is_wrapper = false;
             arity      = entry->getFunctionType()->getNumParams();
         }
@@ -971,7 +1287,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         {
             fprintf(stderr, "prog-fuse: program %zu has no variadic args populated "
                             "(fusible progs must use the variadic launcher)\n", i);
-            abort();
+            return false;
         }
         inputs[i].slots.resize(arity);
         for (unsigned k = 0 ; k < arity ; ++k)
@@ -1034,7 +1350,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             {
                 fprintf(stderr, "prog-fuse: cannot mix packed and non-packed task "
                                 "bodies in one fused chain (program %zu)\n", i);
-                abort();
+                return false;
             }
 
     /* nanos6 outline fusion is likewise homogeneous: the fused entry has the
@@ -1048,7 +1364,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             {
                 fprintf(stderr, "prog-fuse: cannot mix nanos6 outline and non-outline "
                                 "task bodies in one fused chain (program %zu)\n", i);
-                abort();
+                return false;
             }
 
     /* Device (GPU) fusion: the chain's PROGs carry a device codegen target
@@ -1064,7 +1380,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             {
                 fprintf(stderr, "prog-fuse: cannot mix device and host programs in one "
                                 "fused chain (program %zu)\n", i);
-                abort();
+                return false;
             }
 
     std::vector<void *>                    unique_slots;
@@ -1185,7 +1501,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         if (linker.linkInModule(std::move(mods[i])))
         {
             fprintf(stderr, "prog-fuse: linking program %zu failed\n", i);
-            abort();
+            return false;
         }
     }
 
@@ -1208,7 +1524,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         if (!F)
         {
             fprintf(stderr, "prog-fuse: symbol '%s' missing after link\n", inputs[i].fused_name.c_str());
-            abort();
+            return false;
         }
 
         /* fold the constituent into __fused_wrapper */
@@ -1366,7 +1682,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             if (!llvm::InlineFunction(*ci, ifi).isSuccess())
             {
                 fprintf(stderr, "prog-fuse: failed to inline a device kernel\n");
-                abort();
+                return false;
             }
         }
 
@@ -1416,11 +1732,15 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
 
         /* collapse the N target_init/deinit brackets into one (SPMD + same config;
          * aborts if that precondition does not hold). */
-        if (!collapse_device_kernel_brackets(*wrapper))
+        std::string why;
+        if (!collapse_device_kernel_brackets(*wrapper, why))
         {
-            fprintf(stderr, "prog-fuse: device kernels are not fusible "
-                            "(non-SPMD or differing launch configuration)\n");
-            abort();
+            /* Not an error: the chain simply stays as N separate launches. Say
+             * why, because "fusion did not happen" is otherwise invisible in the
+             * results and indistinguishable from "fusion did not pay". */
+            fprintf(stderr, "prog-fuse: device chain of %zu kernels left unfused: %s\n",
+                    n, why.c_str());
+            return false;
         }
     }
     else if (any_outline)
@@ -1475,7 +1795,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             {
                 fprintf(stderr, "prog-fuse: failed to inline a nanos6 outline: %s\n",
                         ir.getFailureReason());
-                abort();
+                return false;
             }
         }
 
@@ -1685,7 +2005,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         if (!ir.isSuccess())
         {
             fprintf(stderr, "prog-fuse: failed to inline a kernel: %s\n", ir.getFailureReason());
-            abort();
+            return false;
         }
     }
 
@@ -1744,7 +2064,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         if (!tgt)
         {
             fprintf(stderr, "prog-fuse: cannot find target '%s': %s\n", TT.str().c_str(), err.c_str());
-            abort();
+            return false;
         }
         llvm::TargetOptions opts;
         tm.reset(tgt->createTargetMachine(
@@ -1761,7 +2081,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     if (llvm::verifyModule(*mod_u, &llvm::errs()))
     {
         fprintf(stderr, "prog-fuse: merged module verification failed\n");
-        abort();
+        return false;
     }
 
     /* dump the merged module (wrapper + constituents) before optimization */
@@ -2040,6 +2360,8 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             progs[i]->source.content.llvmir._externs_owned = false;
         }
     }
+
+    return true;
 
     # endif /* CGIR_SUPPORT_LLVM */
 }

@@ -18,6 +18,7 @@ set(TEST_SOURCES
 if (USE_LLVM)
     list(APPEND TEST_SOURCES
         prog-fuse.cc
+        prog-fuse-device-legality.cc
         jit-entry-shape.cc
     )
 endif()

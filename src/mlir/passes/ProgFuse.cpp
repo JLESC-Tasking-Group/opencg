@@ -161,7 +161,12 @@ struct ProgFusePass
             for (::cgir::command_graph_node_t * cn : chain_nodes)
                 progs.push_back(&cn->command->prog);
 
-            ::cgir::command_graph_prog_fuse_llvmir(progs.data(), progs.size(), &un->command->prog);
+            /* Refusing a chain is a normal outcome (see the header). The nodes
+             * must then stay separate: contracting them anyway would drop every
+             * member but the head, i.e. silently skip work. */
+            if (!::cgir::command_graph_prog_fuse_llvmir(progs.data(), progs.size(),
+                                                        &un->command->prog))
+                continue;
 
             /* contract the chain into u: u's token takes over the chain tail's
              * successors, and the rest of the chain is erased (back to front) */
