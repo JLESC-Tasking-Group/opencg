@@ -537,6 +537,24 @@ is_cross_thread_runtime_call(llvm::StringRef name)
         || name.contains("reduction");   /* __kmpc_reduction_get_fixed_buffer, ...      */
 }
 
+/* True for the device runtime entry points a kernel body may call without
+ * hiding memory effects from the analysis: they query the thread's own position
+ * or the launch geometry and touch no user data. Everything else that is only a
+ * declaration is treated as opaque and refuses the chain, so this list is the
+ * one place a false entry could let an unsound fusion through -- keep it to
+ * calls that are provably thread-local queries. */
+static bool
+is_benign_device_runtime_call(llvm::StringRef name)
+{
+    return name.starts_with("llvm.nvvm.read.ptx.sreg.")   /* tid/ctaid/ntid/nctaid */
+        || name == "__kmpc_get_hardware_thread_id_in_block"
+        || name == "__kmpc_get_hardware_num_threads_in_block"
+        || name == "__kmpc_get_warp_size"
+        || name == "__kmpc_is_spmd_exec_mode"
+        || name == "__kmpc_target_init"
+        || name == "__kmpc_target_deinit";
+}
+
 /* One memory access of a fused kernel body, as seen from the merged wrapper. */
 struct device_access_t
 {
@@ -672,14 +690,58 @@ device_chain_barrier_removable(llvm::Function & Forig, size_t n, std::string & w
                 why = "a body performs an atomic read-modify-write";
                 return false;
             }
+            /* A call whose memory effects we cannot see makes everything below
+             * meaningless: the accesses it performs are simply absent from `acc`,
+             * and the pairwise test then proves nothing while looking like it
+             * proved something.
+             *
+             * This is not hypothetical. A `teams distribute parallel for` reaches
+             * its loop through `__kmpc_parallel_XX(..., ptr @outlined, ...)` -- the
+             * body is a function-POINTER argument to a runtime declaration, never a
+             * direct call -- so the inlining fixpoint above cannot pull it into the
+             * wrapper. The wrapper then holds no load or store at all, and an
+             * earlier version of this function happily approved fusing an SpMV
+             * gather with the kernel that produced its input. Refusing here is what
+             * makes "the gate said yes" mean something. */
             if (auto * CI = llvm::dyn_cast<llvm::CallInst>(&I))
-                if (llvm::Function * cf = CI->getCalledFunction())
-                    if (is_cross_thread_runtime_call(cf->getName()))
+            {
+                llvm::Function * cf = CI->getCalledFunction();
+                if (cf == nullptr)
+                {
+                    why = "a body makes an indirect call";
+                    return false;
+                }
+                if (is_cross_thread_runtime_call(cf->getName()))
+                {
+                    why = ("a body calls '" + cf->getName() + "', which combines "
+                           "values across threads").str();
+                    return false;
+                }
+                /* Any callee that can touch memory hides accesses from `acc`,
+                 * whether or not it has a body here: a definition that survived
+                 * the inlining fixpoint above is just as opaque to a scan of this
+                 * function's instructions as a declaration is. Tolerated only if
+                 * it cannot touch memory, or if it is a known thread-local query
+                 * of the device runtime. */
+                if (!CI->doesNotAccessMemory()
+                    && !is_benign_device_runtime_call(cf->getName()))
+                {
+                    why = ("a body calls '" + cf->getName() + "', whose memory "
+                           "effects are not visible here").str();
+                    return false;
+                }
+                /* A function pointer handed to a callee escapes analysis for the
+                 * same reason: the callee may run it, and we cannot see what it
+                 * does. This is exactly the __kmpc_parallel_XX shape. */
+                for (const llvm::Use & u : CI->args())
+                    if (llvm::isa<llvm::Function>(u->stripPointerCasts()))
                     {
-                        why = ("a body calls '" + cf->getName() + "', which combines "
-                               "values across threads").str();
+                        why = ("a body passes a function pointer to '"
+                               + cf->getName() + "', so its body is not visible "
+                               "here (the parallel region was not inlined)").str();
                         return false;
                     }
+            }
 
             llvm::Value * ptr = nullptr;
             bool is_write = false;
@@ -703,6 +765,19 @@ device_chain_barrier_removable(llvm::Function & Forig, size_t n, std::string & w
             }
 
             acc[(size_t) b].push_back({ &I, ptr, is_write });
+        }
+
+    /* A body that touches no global memory at all did nothing observable, which
+     * is far more likely to mean the analysis is looking in the wrong place than
+     * that the kernel is a no-op. Refuse rather than approve by default: an
+     * approval that examined nothing is indistinguishable from a real proof, and
+     * that is precisely how the SpMV gather got fused. */
+    for (size_t k = 0 ; k < n ; ++k)
+        if (acc[k].empty())
+        {
+            why = "body " + std::to_string(k) + " has no visible memory access, so "
+                  "there is nothing to prove it safe with";
+            return false;
         }
 
     /* (c): pairwise, over ALL ordered pairs of bodies -- collapsing the brackets
@@ -762,6 +837,17 @@ device_chain_barrier_removable(llvm::Function & Forig, size_t n, std::string & w
                 }
         }
 
+    /* Say what was actually examined. An approval and a vacuous approval look the
+     * same from the outside, and telling them apart after the fact cost a whole
+     * evaluation campaign. */
+    if (env_flag("CGIR_PROG_FUSE_VERBOSE"))
+    {
+        size_t total = 0;
+        for (const auto & a : acc)
+            total += a.size();
+        fprintf(stderr, "prog-fuse: device chain of %zu bodies proved safe over %zu "
+                        "visible memory accesses\n", n, total);
+    }
     return true;
 }
 
@@ -840,18 +926,8 @@ collapse_device_kernel_brackets(llvm::Function & F, std::string & why)
     /* The launch boundary between the bodies is a device-wide barrier. Removing
      * it is the whole point of fusing, and also the only way this pass can change
      * a program's result, so it is proved -- not assumed -- before anything is
-     * erased.
-     *
-     * CGIR_PROG_FUSE_UNSAFE_DEVICE skips the proof. It exists to measure what the
-     * proof costs -- how much fusion a conservative answer gives up -- and it
-     * produces WRONG RESULTS on any chain the proof would have refused, silently.
-     * Never set it for anything but that measurement, and check the program's
-     * output when you do. */
-    if (env_flag("CGIR_PROG_FUSE_UNSAFE_DEVICE"))
-        fprintf(stderr, "prog-fuse: CGIR_PROG_FUSE_UNSAFE_DEVICE is set -- fusing %zu "
-                        "device kernels WITHOUT proving the barrier removable; "
-                        "results may be wrong\n", inits.size());
-    else if (!device_chain_barrier_removable(F, inits.size(), why))
+     * erased. */
+    if (!device_chain_barrier_removable(F, inits.size(), why))
         return false;
 
     /* keep inits[0] and deinits[last]; drop the inner brackets */
@@ -869,6 +945,11 @@ collapse_device_kernel_brackets(llvm::Function & F, std::string & why)
 /* Write `M` as textual IR to <dir>/<name> (defined below; forward-declared so the
  * optimize pipeline can dump the pre-LoopFuse wrapper for debugging). */
 static void dump_module(const std::string & dir, const char * name, llvm::Module & M);
+
+/* Turn a generic-mode device module into SPMD form (defined in SECTION 3, where
+ * PTX codegen also uses it; forward-declared so the fuse pass can run it FIRST --
+ * see the call site for why the ordering matters). */
+static void spmdize_device_module(llvm::Module & M, llvm::TargetMachine * tm);
 
 /* Run an O3 module pipeline (inlining + loop-fuse + vectorization) on the
  * merged module, so the inlined kernels' loops can vectorize/fuse. `dump_dir` is
@@ -1633,6 +1714,31 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
 
     if (device)
     {
+        /* SPMD-ize BEFORE fusing, not after.
+         *
+         * A recorded `omp target teams distribute parallel for` is a generic-mode
+         * kernel: its loop lives in an outlined function reached through
+         * `__kmpc_parallel_XX(..., ptr @outlined, ...)`, i.e. as a function
+         * POINTER handed to a runtime declaration. Nothing downstream can follow
+         * that edge -- the inlining fixpoint below only walks direct calls -- so
+         * on generic-mode input the fused wrapper ends up containing no load or
+         * store whatsoever. Two things then quietly fail: LoopFuse has no adjacent
+         * loops to fuse (the whole point of the pass), and the legality gate in
+         * collapse_device_kernel_brackets has no memory accesses to reason about.
+         *
+         * OpenMPOpt's SPMD-ization removes the indirection. It already ran on this
+         * IR -- but in the `jit` pass, long after the fusion decision was made.
+         * Running it here puts the loops inside the wrapper, where both the gate
+         * and LoopFuse can see them.
+         *
+         * If it does not fire, the gate refuses the chain (a body with no visible
+         * access cannot be proved safe), so the failure mode is "not fused",
+         * never "fused wrongly". */
+        {
+            scoped_phase_t _p("fuse-spmdize");
+            spmdize_device_module(*mod_u, nullptr);
+        }
+
         /* Device fusion (Level 1, program-level): build a single `ptx_kernel` over
          * the deduplicated kernel parameters, call each region kernel with its
          * subset, inline them, then collapse the per-kernel target_init/deinit

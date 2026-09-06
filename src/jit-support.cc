@@ -128,7 +128,7 @@ struct jit_profiler_t
     static const std::vector<const char *> & csv_phases()
     {
         static const std::vector<const char *> P = {
-            "jit-total", "jit-parse", "fuse-total",
+            "jit-total", "jit-parse", "fuse-total", "fuse-spmdize",
             "host-optimize", "host-codegen", "host-link", "host-orc-create",
             "dev-emit-total", "dev-spmdize", "dev-link-read", "dev-link-parse",
             "dev-link-linkin", "dev-o3", "dev-ptx-emit",

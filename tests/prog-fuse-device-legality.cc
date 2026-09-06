@@ -25,8 +25,15 @@
  *  a deterministic test.
  *
  *  Each case below builds a two-node device chain that prog-fuse MUST refuse,
- *  and checks that both nodes survive the pass. A refusal leaves the chain as
- *  two separate launches: slower, but correct.
+ *  and checks BOTH that the nodes survive AND that the pass refused them for the
+ *  expected reason. Checking the node count alone is not enough: a chain is also
+ *  left unfused when the IR does not parse, when NVPTX is unavailable, or when
+ *  the kernels are not in the shape the pass recognizes. An earlier version of
+ *  this test asserted only the count, passed, and gave false confidence while
+ *  the gate it was meant to guard was in fact approving everything it saw.
+ *
+ *  The reason is read from the pass's own stderr diagnostic, which is the only
+ *  channel it has. This is why that diagnostic must stay stable.
  *
  *  Not asserted here: that a legal (element-wise) DEVICE chain still fuses.
  *  Reaching the fusion itself needs an NVPTX-capable LLVM (the pass builds a
@@ -35,10 +42,13 @@
  *  in prog-fuse.cc, which exercises the same merge/dedup/loop-fusion path.
  */
 
+# include <unistd.h>
+
 # include <stdint.h>
 # include <stdlib.h>
 # include <stdio.h>
 # include <string.h>
+# include <string>
 
 # if NDEBUG
 #  define assert(X) X
@@ -146,12 +156,96 @@ static const char dsum_ir[] =
     "  ret void\n"
     "}\n";
 
+/* dopaque: the generic-mode shape. The kernel does nothing itself; it hands the
+ * loop, as a function POINTER, to a runtime declaration that will run it. This is
+ * exactly how clang emits `omp target teams distribute parallel for` before
+ * SPMD-ization, and it is what defeated the first version of the gate: the fused
+ * wrapper then contains no load or store at all, so a pairwise dependence test
+ * over its accesses examines nothing and approves everything. The pass must
+ * notice that it cannot see the memory effects and refuse. */
+static const char dopaque_ir[] =
+    DEVICE_PREAMBLE
+    KERNEL_ENV("kenv_opaque")
+    "declare void @__kmpc_parallel_51(i8*, i32, i32, i32, i32, i8*, i8*, i8**, i64)\n"
+    "define internal void @outlined_body(double %s, double* %y, i64 %n) {\n"
+    "entry:\n"
+    "  br label %loop\n"
+    "loop:\n"
+    "  %i = phi i64 [ 0, %entry ], [ %i.next, %loop ]\n"
+    "  %ptr = getelementptr inbounds double, double* %y, i64 %i\n"
+    "  %val = load double, double* %ptr\n"
+    "  %res = fmul double %s, %val\n"
+    "  store double %res, double* %ptr\n"
+    "  %i.next = add nsw i64 %i, 1\n"
+    "  %cond = icmp slt i64 %i.next, %n\n"
+    "  br i1 %cond, label %loop, label %exit\n"
+    "exit:\n"
+    "  ret void\n"
+    "}\n"
+    "define void @dopaque(double %s, double* %y, i64 %n) {\n"
+    "entry:\n"
+    "  %tid = call i32 @__kmpc_target_init(i8* bitcast (%struct.KernelEnv* @kenv_opaque to i8*))\n"
+    "  %spmd = icmp eq i32 %tid, -1\n"
+    "  br i1 %spmd, label %par, label %done\n"
+    "par:\n"
+    "  call void @__kmpc_parallel_51(i8* null, i32 %tid, i32 1, i32 -1, i32 -1,\n"
+    "                                i8* bitcast (void (double, double*, i64)* @outlined_body to i8*),\n"
+    "                                i8* null, i8** null, i64 0)\n"
+    "  call void @__kmpc_target_deinit()\n"
+    "  br label %done\n"
+    "done:\n"
+    "  ret void\n"
+    "}\n";
+
+/* Redirect stderr to a temporary file for the duration of a scope, so the test
+ * can read the pass's diagnostic. The pass has no other way to report WHY it
+ * refused a chain, and the reason is the thing under test. */
+struct captured_stderr {
+    int saved;
+    FILE *tmp;
+
+    captured_stderr() : saved(dup(fileno(stderr))), tmp(tmpfile())
+    {
+        fflush(stderr);
+        if (tmp)
+            dup2(fileno(tmp), fileno(stderr));
+    }
+
+    std::string release()
+    {
+        fflush(stderr);
+        dup2(saved, fileno(stderr));
+        close(saved);
+        saved = -1;
+        std::string out;
+        if (tmp) {
+            rewind(tmp);
+            char buf[4096];
+            size_t k;
+            while ((k = fread(buf, 1, sizeof(buf), tmp)) > 0)
+                out.append(buf, k);
+            fclose(tmp);
+            tmp = nullptr;
+        }
+        /* echo it, so a failing run still shows what the pass said */
+        fputs(out.c_str(), stderr);
+        return out;
+    }
+
+    ~captured_stderr()
+    {
+        if (saved >= 0) { dup2(saved, fileno(stderr)); close(saved); }
+        if (tmp) fclose(tmp);
+    }
+};
+
 /* Build `entry -> u -> v -> exit` with two device PROG commands, run prog-fuse,
- * and return the number of surviving command nodes. */
+ * and return the number of surviving command nodes. `diag` receives whatever the
+ * pass wrote to stderr. */
 static size_t
 run_device_chain(const char * ir_u, size_t ir_u_size, void ** args_u, size_t n_args_u,
                  const char * ir_v, size_t ir_v_size, void ** args_v, size_t n_args_v,
-                 const char * dotfile)
+                 const char * dotfile, std::string & diag)
 {
     command_graph_t * cg = command_graph_new();
     assert(cg);
@@ -193,7 +287,11 @@ run_device_chain(const char * ir_u, size_t ir_u_size, void ** args_u, size_t n_a
     u->precedes(v);
     v->precedes(exit);
 
-    cg->optimize(COMMAND_GRAPH_PASS_PROG_FUSE);
+    {
+        captured_stderr cap;
+        cg->optimize(COMMAND_GRAPH_PASS_PROG_FUSE);
+        diag = cap.release();
+    }
     cg->dump(dotfile);
 
     size_t nodes = 0;
@@ -222,39 +320,76 @@ main(void)
     void * shift_args[3] = { &yp, &zp, &nn };      /* dshift(y, z, n)  */
     void * sum_args[3]   = { &yp, &accp, &nn };    /* dsum(y, acc, n)  */
 
+    /* A case is only satisfied when the chain survived AND the pass said it
+     * refused it for `expect`. Without the second half the test passes when the
+     * chain is left unfused for an unrelated reason -- a missing NVPTX target,
+     * unparsable IR, an unrecognized kernel shape -- and so cannot tell a working
+     * gate from an absent one. That is not a hypothetical failure mode: it is how
+     * this test previously reported success while the gate approved an SpMV
+     * gather fused with the kernel that produced its input. */
+    auto check = [&] (const char * what, size_t nodes, const std::string & diag,
+                      const char * expect)
+    {
+        if (nodes != 2)
+        {
+            fprintf(stderr, "FAIL: %s was fused into %zu node(s); it must stay 2\n",
+                    what, nodes);
+            ++failures;
+            return;
+        }
+        if (diag.find("left unfused") == std::string::npos)
+        {
+            fprintf(stderr, "FAIL: %s stayed 2 nodes but the pass never reported "
+                            "refusing it -- it was not even considered for fusion, "
+                            "so this case proves nothing\n", what);
+            ++failures;
+            return;
+        }
+        if (diag.find(expect) == std::string::npos)
+        {
+            fprintf(stderr, "FAIL: %s was refused, but not for the expected reason "
+                            "(wanted a diagnostic containing '%s')\n", what, expect);
+            ++failures;
+            return;
+        }
+        fprintf(stdout, "PASS: %s left unfused (%s)\n", what, expect);
+    };
+
     /* Case 1: a neighbour read. dshift's thread i reads y[i+1], which dscale's
      * thread i+1 wrote -- a cross-thread dependence that only the launch
      * boundary orders. */
     {
+        std::string diag;
         size_t nodes = run_device_chain(
             dscale_ir, sizeof(dscale_ir), scale_args, 3,
             dshift_ir, sizeof(dshift_ir), shift_args, 3,
-            "cg-prog-fuse-device-neighbour.dot");
-        if (nodes != 2)
-        {
-            fprintf(stderr, "FAIL: a cross-thread (neighbour) device chain was fused "
-                            "into %zu node(s); it must stay 2\n", nodes);
-            ++failures;
-        }
-        else
-            fprintf(stdout, "PASS: neighbour-read device chain left unfused\n");
+            "cg-prog-fuse-device-neighbour.dot", diag);
+        check("a neighbour-read device chain", nodes, diag, "different indices");
     }
 
     /* Case 2: a reduction. Its result is only complete at kernel exit, so a
      * later kernel in the same launch may read a partial sum. */
     {
+        std::string diag;
         size_t nodes = run_device_chain(
             dsum_ir,   sizeof(dsum_ir),   sum_args,   3,
             dscale_ir, sizeof(dscale_ir), scale_args, 3,
-            "cg-prog-fuse-device-reduction.dot");
-        if (nodes != 2)
-        {
-            fprintf(stderr, "FAIL: a device chain containing a reduction was fused "
-                            "into %zu node(s); it must stay 2\n", nodes);
-            ++failures;
-        }
-        else
-            fprintf(stdout, "PASS: reduction device chain left unfused\n");
+            "cg-prog-fuse-device-reduction.dot", diag);
+        check("a reduction device chain", nodes, diag, "across threads");
+    }
+
+    /* Case 3: an opaque call. A kernel that hands a function pointer to a runtime
+     * declaration hides its memory effects -- this is the shape a generic-mode
+     * `teams distribute parallel for` has, and approving it is what let the real
+     * corruption through. */
+    {
+        std::string diag;
+        size_t nodes = run_device_chain(
+            dopaque_ir, sizeof(dopaque_ir), scale_args, 3,
+            dscale_ir,  sizeof(dscale_ir),  scale_args, 3,
+            "cg-prog-fuse-device-opaque.dot", diag);
+        check("a device chain with a hidden parallel region", nodes, diag,
+              "not visible here");
     }
 
     if (failures)
