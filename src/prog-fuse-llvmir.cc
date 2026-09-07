@@ -479,6 +479,19 @@ constant_value_equal(llvm::Constant * a, llvm::Constant * b)
     return true;
 }
 
+/* The OpenMP device runtime entry points that bracket a kernel body. They must
+ * survive as CALLS all the way to collapse_device_kernel_brackets: they are how
+ * the fused bodies are delimited and what the collapse rewrites. Named once so
+ * the inliner's exclusion and the collector's search cannot drift apart. */
+static constexpr const char * DEVICE_KERNEL_INIT   = "__kmpc_target_init";
+static constexpr const char * DEVICE_KERNEL_DEINIT = "__kmpc_target_deinit";
+
+static bool
+is_device_kernel_bracket(llvm::StringRef name)
+{
+    return name == DEVICE_KERNEL_INIT || name == DEVICE_KERNEL_DEINIT;
+}
+
 /* Collect the per-kernel target_init / target_deinit calls of `F`, in block
  * order. Split out because the brackets must be re-found after the canonicalizing
  * passes below, which may replace the instructions holding them. */
@@ -494,8 +507,8 @@ collect_device_kernel_brackets(llvm::Function & F,
             if (auto * CI = llvm::dyn_cast<llvm::CallInst>(&I))
                 if (llvm::Function * cf = CI->getCalledFunction())
                 {
-                    if (cf->getName() == "__kmpc_target_init")   inits.push_back(CI);
-                    else if (cf->getName() == "__kmpc_target_deinit") deinits.push_back(CI);
+                    if (cf->getName() == DEVICE_KERNEL_INIT)        inits.push_back(CI);
+                    else if (cf->getName() == DEVICE_KERNEL_DEINIT) deinits.push_back(CI);
                 }
 }
 
@@ -554,8 +567,7 @@ is_benign_device_runtime_call(llvm::StringRef name)
         || name == "__kmpc_get_warp_size"
         || name == "__kmpc_is_spmd_exec_mode"
         || name == "__kmpc_global_thread_num"             /* returns the thread's id */
-        || name == "__kmpc_target_init"
-        || name == "__kmpc_target_deinit";
+        || is_device_kernel_bracket(name);
 }
 
 /* One memory access of a fused kernel body, as seen from the merged wrapper. */
@@ -1944,8 +1956,8 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
          * entry was inlined above; the __kmpc_target_init/deinit brackets and the
          * compute loops live in those (noinline/optnone) callees, so they must be
          * pulled in here for collapse_device_kernel_brackets + loop-fusion to see
-         * them. In SPMD mode the parallel region is a direct call, so every level is
-         * inlinable; we stop at declarations (the __kmpc_* runtime) and intrinsics.
+         * them. Since the device runtime was linked just above, this also pulls in
+         * the parallel-region dispatch and so the user loops themselves.
          * Iterate to a fixpoint, restarting the scan after each inline (which
          * invalidates iterators). */
         for (bool changed = true ; changed ; )
@@ -1961,6 +1973,19 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
                     llvm::Function * callee = ci->getCalledFunction();
                     if (callee == nullptr || callee == wrapper ||
                         callee->isDeclaration() || callee->isIntrinsic())
+                        continue;
+                    /* Never inline the kernel brackets. They delimit the fused
+                     * bodies and are the structure collapse_device_kernel_brackets
+                     * rewrites -- and that its legality proof is expressed in --
+                     * so inlining them erases the thing we are about to reason
+                     * about, leaving nothing to match and refusing every chain.
+                     *
+                     * They only became inlinable when the device runtime was
+                     * linked above: until then they were declarations and the test
+                     * on the previous line skipped them. The single pair that
+                     * survives the collapse is inlined later by the jit pass, as
+                     * it always was. */
+                    if (is_device_kernel_bracket(callee->getName()))
                         continue;
                     llvm::InlineFunctionInfo ifi;
                     if (llvm::InlineFunction(*ci, ifi).isSuccess())
