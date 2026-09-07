@@ -1012,12 +1012,31 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
          * inside the kernel. That barrier only completes if every block is
          * resident: a block the hardware has not scheduled never arrives, and the
          * ones that have spin forever. Establish it here, where refusing is free,
-         * rather than discovering it as a hang at replay. */
+         * rather than discovering it as a hang at replay.
+         *
+         * The bound has to hold for the program this pass is about to BUILD, not
+         * for the ones it is given. Fusion inlines every constituent into one
+         * kernel, so the result asks for at least as many registers as the
+         * greediest of them and generally more, and occupancy falls as registers
+         * rise -- the fused kernel therefore fits *fewer* blocks per SM than any
+         * measurement taken beforehand suggests. Sizing the check on the
+         * constituents' occupancy (`max_coresident_blocks`, measured by the
+         * runtime on the un-fused kernels) is thus an over-estimate, and one that
+         * fails late and hard: the launch is rejected by the driver
+         * (CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE) once the graph is already
+         * fused and there is nothing left to fall back to.
+         *
+         * So the check uses the only occupancy that holds whatever fusion does to
+         * the register count: one block per multiprocessor, which any launchable
+         * kernel achieves by definition. `max_coresident_blocks` is
+         * multiprocessors x blocks-per-SM, so the multiprocessor count divides
+         * back out of the two figures the runtime reports. */
         const uint64_t blocks = (uint64_t) progs[0]->grid.x
                               * (uint64_t) progs[0]->grid.y
                               * (uint64_t) progs[0]->grid.z;
-        const unsigned fit = progs[0]->max_coresident_blocks;
-        if (fit == 0)
+        const unsigned coresident = progs[0]->max_coresident_blocks;
+        const unsigned per_sm     = progs[0]->blocks_per_sm;
+        if (coresident == 0 || per_sm == 0)
         {
             fprintf(stderr, "prog-fuse: device chain of %zu kernels left unfused: the "
                             "runtime did not report how many blocks fit on the device, "
@@ -1026,12 +1045,14 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
                     n, prog_describe(progs[0]).c_str());
             return false;
         }
-        if (blocks > (uint64_t) fit)
+        const unsigned nsm = coresident / per_sm;   /* multiprocessors */
+        if (nsm == 0 || blocks > (uint64_t) nsm)
         {
             fprintf(stderr, "prog-fuse: device chain of %zu kernels left unfused: its "
-                            "grid of %llu blocks exceeds the %u that fit on the device "
-                            "at once, so a grid-wide barrier would hang [%s]\n",
-                    n, (unsigned long long) blocks, fit,
+                            "grid of %llu blocks exceeds the %u multiprocessors, and a "
+                            "fused kernel is only guaranteed one resident block each, "
+                            "so a grid-wide barrier could hang [%s]\n",
+                    n, (unsigned long long) blocks, nsm,
                     prog_describe(progs[0]).c_str());
             return false;
         }

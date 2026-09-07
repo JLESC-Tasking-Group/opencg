@@ -84,11 +84,17 @@ static const char dscale_ir[] = DEVICE_KERNEL("dscale", "kenv_scale");
 static const char dshift_ir[] = DEVICE_KERNEL("dshift", "kenv_shift");
 
 /* Build `entry -> u -> v -> exit` with two device PROG commands sharing a grid
- * of `grid_x` blocks and a residency budget of `coresident` blocks, run
- * prog-fuse, and report how many command nodes survive. `fused_needs_grid`
- * receives the surviving program's requires_coresident_grid flag. */
+ * of `grid_x` blocks, a residency budget of `coresident` blocks and an occupancy
+ * of `per_sm` blocks per multiprocessor, run prog-fuse, and report how many
+ * command nodes survive. `fused_needs_grid` receives the surviving program's
+ * requires_coresident_grid flag.
+ *
+ * The two residency figures are what the runtime measures on the UN-fused
+ * kernels; the pass may only rely on what still holds once they are fused into
+ * one (see the third case below). */
 static size_t
-run_device_chain(unsigned grid_x, unsigned coresident, bool & fused_needs_grid)
+run_device_chain(unsigned grid_x, unsigned coresident, unsigned per_sm,
+                 bool & fused_needs_grid)
 {
     static double   s_val = 2.0;
     static double   ybuf[4] = { 1.0, 2.0, 3.0, 4.0 };
@@ -122,6 +128,7 @@ run_device_chain(unsigned grid_x, unsigned coresident, bool & fused_needs_grid)
         cmd->prog.grid.x  = grid_x; cmd->prog.grid.y  = 1; cmd->prog.grid.z  = 1;
         cmd->prog.block.x = 32;     cmd->prog.block.y = 1; cmd->prog.block.z = 1;
         cmd->prog.max_coresident_blocks = coresident;
+        cmd->prog.blocks_per_sm         = per_sm;
 
         command_graph_node_t * node =
             command_graph_node_new(cg, gpu_device, COMMAND_GRAPH_NODE_TYPE_COMMAND);
@@ -160,10 +167,11 @@ main(void)
     /* A grid that fits: fusing is safe, so the two programs become one launch,
      * and that launch must be flagged as needing every block resident. */
     {
-        size_t nodes = run_device_chain(/* grid */ 64, /* coresident */ 128, needs_grid);
+        size_t nodes = run_device_chain(/* grid */ 64, /* coresident */ 128,
+                                        /* per_sm */ 2, needs_grid);
         if (nodes != 1)
         {
-            fprintf(stderr, "FAIL: a device chain whose grid fits (64 of 128 blocks) "
+            fprintf(stderr, "FAIL: a device chain whose grid fits (64 of 64 SMs) "
                             "produced %zu node(s); it should fuse into 1\n", nodes);
             ++failures;
         }
@@ -182,11 +190,12 @@ main(void)
     /* A grid that does not fit: the barrier could not complete, so the chain must
      * stay two launches. */
     {
-        size_t nodes = run_device_chain(/* grid */ 4096, /* coresident */ 128, needs_grid);
+        size_t nodes = run_device_chain(/* grid */ 4096, /* coresident */ 128,
+                                        /* per_sm */ 2, needs_grid);
         if (nodes != 2)
         {
-            fprintf(stderr, "FAIL: a device chain whose grid does NOT fit (4096 of 128 "
-                            "blocks) produced %zu node(s); it must stay 2, or its "
+            fprintf(stderr, "FAIL: a device chain whose grid does NOT fit (4096 of 64 "
+                            "SMs) produced %zu node(s); it must stay 2, or its "
                             "grid-wide barrier hangs the device\n", nodes);
             ++failures;
         }
@@ -197,7 +206,8 @@ main(void)
 
     /* No residency figure: nothing is known, so nothing may be assumed. */
     {
-        size_t nodes = run_device_chain(/* grid */ 64, /* coresident */ 0, needs_grid);
+        size_t nodes = run_device_chain(/* grid */ 64, /* coresident */ 0,
+                                        /* per_sm */ 0, needs_grid);
         if (nodes != 2)
         {
             fprintf(stderr, "FAIL: a device chain with no residency figure produced %zu "
@@ -206,6 +216,31 @@ main(void)
         }
         else
             fprintf(stdout, "PASS: a device chain with no residency figure left "
+                            "unfused\n");
+    }
+
+    /* The case that motivated the bound: a grid that fits the occupancy measured
+     * on the UN-fused kernels (100 of 128 co-resident blocks) but not the one the
+     * fused kernel is guaranteed (100 of 64 multiprocessors). Fusion inlines both
+     * bodies, so the result needs more registers than either and holds fewer
+     * blocks per SM than was measured -- the driver then rejects the cooperative
+     * launch, after the graph has been fused and with nothing to fall back to.
+     * Only a bound that survives fusion may be trusted, and one block per
+     * multiprocessor is the only one that does. */
+    {
+        size_t nodes = run_device_chain(/* grid */ 100, /* coresident */ 128,
+                                        /* per_sm */ 2, needs_grid);
+        if (nodes != 2)
+        {
+            fprintf(stderr, "FAIL: a device chain that fits only the pre-fusion "
+                            "occupancy estimate (100 blocks: within 128 co-resident, "
+                            "but over 64 multiprocessors) produced %zu node(s); it must "
+                            "stay 2, or the cooperative launch is rejected at replay\n",
+                    nodes);
+            ++failures;
+        }
+        else
+            fprintf(stdout, "PASS: a device chain that fits only before fusion left "
                             "unfused\n");
     }
 
