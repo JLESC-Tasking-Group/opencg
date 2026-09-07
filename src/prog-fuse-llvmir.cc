@@ -492,6 +492,68 @@ is_device_kernel_bracket(llvm::StringRef name)
     return name == DEVICE_KERNEL_INIT || name == DEVICE_KERNEL_DEINIT;
 }
 
+/* Rewrite a direct call whose signature does not match its callee's into a
+ * well-typed one, so the inliner will accept it. Returns the (possibly new) call,
+ * or nullptr when the mismatch is not a pure type mismatch and must be left alone.
+ *
+ * This exists for one shape, and it is not a corner case: it is how every OpenMP
+ * device parallel region is invoked. The runtime's invokeMicrotask() dispatches on
+ * the argument count through a uniform cast --
+ *
+ *     ((void (*)(int32_t *, int32_t *, void *, void *, ...))fn)(&gtid, &btid, args[0], ...)
+ *
+ * -- so once it is inlined the call to the outlined body is direct, but typed with
+ * `ptr` in every slot, while the body itself declares the real types
+ * (`void(ptr, ptr, i64, i64, i64, i64, ptr, ptr, ptr)` for a collapsed loop nest).
+ * LLVM refuses to inline through that mismatch, and the compute loop stays out of
+ * the fused wrapper -- which is the whole reason the wrapper is being built.
+ *
+ * Only the TYPES are repaired. Which function is called, with which values, in
+ * which order, was decided by the runtime; this reproduces the C cast that
+ * invokeMicrotask already performed (a pointer-sized slot reinterpreted as the
+ * parameter it stands for) and nothing else. Anything that is not a
+ * value-preserving coercion -- a differing arity, a return type, a float or
+ * aggregate parameter -- returns nullptr rather than guessing. */
+static llvm::CallInst *
+retype_direct_call_to_callee(llvm::CallInst * ci, llvm::Function * callee)
+{
+    llvm::FunctionType * want = callee->getFunctionType();
+    if (want == ci->getFunctionType())
+        return ci;                        /* already well typed */
+
+    if (want->isVarArg() || ci->arg_size() != want->getNumParams()
+        || want->getReturnType() != ci->getType())
+        return nullptr;
+
+    llvm::IRBuilder<> b(ci);
+    std::vector<llvm::Value *> args;
+    args.reserve(ci->arg_size());
+    for (unsigned k = 0 ; k < ci->arg_size() ; ++k)
+    {
+        llvm::Value * a  = ci->getArgOperand(k);
+        llvm::Type  * at = a->getType();
+        llvm::Type  * pt = want->getParamType(k);
+
+        if (at == pt)
+            args.push_back(a);
+        else if (at->isPointerTy() && pt->isIntegerTy())
+            args.push_back(b.CreatePtrToInt(a, pt));
+        else if (at->isIntegerTy() && pt->isPointerTy())
+            args.push_back(b.CreateIntToPtr(a, pt));
+        else if (at->isPointerTy() && pt->isPointerTy())
+            args.push_back(b.CreatePointerBitCastOrAddrSpaceCast(a, pt));
+        else
+            return nullptr;               /* not a coercion we can justify */
+    }
+
+    llvm::CallInst * fixed = b.CreateCall(callee, args);
+    fixed->setCallingConv(callee->getCallingConv());
+    fixed->setDebugLoc(ci->getDebugLoc());
+    ci->replaceAllUsesWith(fixed);
+    ci->eraseFromParent();
+    return fixed;
+}
+
 /* Collect the per-kernel target_init / target_deinit calls of `F`, in block
  * order. Split out because the brackets must be re-found after the canonicalizing
  * passes below, which may replace the instructions holding them. */
@@ -1987,9 +2049,24 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
                      * it always was. */
                     if (is_device_kernel_bracket(callee->getName()))
                         continue;
+                    /* The runtime invokes an outlined parallel region through a
+                     * uniformly-typed function pointer, so the direct call that
+                     * inlining it leaves behind does not match the callee's
+                     * signature and cannot itself be inlined. Repair the types
+                     * first (see retype_direct_call_to_callee). */
+                    llvm::CallInst * target = retype_direct_call_to_callee(ci, callee);
+                    if (target == nullptr)
+                        continue;   /* not a repairable mismatch; leave it alone */
+                    const bool retyped = (target != ci);
+
                     llvm::InlineFunctionInfo ifi;
-                    if (llvm::InlineFunction(*ci, ifi).isSuccess())
+                    const bool inlined = llvm::InlineFunction(*target, ifi).isSuccess();
+                    if (retyped || inlined)
                     {
+                        /* Retyping erased the old call, so the iterators are
+                         * invalid either way. A retype that did not lead to an
+                         * inline is not a loop: the call is well typed on the next
+                         * pass, so it is attempted once more and then left. */
                         changed = true;
                         break;   /* iterators invalidated -- rescan from the top */
                     }
@@ -2007,6 +2084,13 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             if (F && F->use_empty())
                 F->eraseFromParent();
         }
+
+        /* Dump the wrapper as the legality gate will see it -- BEFORE the collapse,
+         * so a refused chain leaves evidence too. `merged.ll` below is only written
+         * once the collapse has succeeded, which is exactly the case that needs no
+         * explaining. */
+        if (dump)
+            dump_module(dump_dir, "precollapse.ll", *mod_u);
 
         /* collapse the N target_init/deinit brackets into one (SPMD + same config;
          * aborts if that precondition does not hold). */
