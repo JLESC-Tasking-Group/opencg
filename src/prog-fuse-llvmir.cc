@@ -567,7 +567,12 @@ collect_device_kernel_brackets(llvm::Function & F,
     for (llvm::BasicBlock & BB : F)
         for (llvm::Instruction & I : BB)
             if (auto * CI = llvm::dyn_cast<llvm::CallInst>(&I))
-                if (llvm::Function * cf = CI->getCalledFunction())
+                /* The called operand rather than getCalledFunction(), for the same
+                 * reason as the inliner and the legality gate: a bracket call whose
+                 * signature did not match would otherwise go unseen, and the chain
+                 * would be refused for "unmatched pairs" with no way to tell why. */
+                if (auto * cf = llvm::dyn_cast<llvm::Function>(
+                        CI->getCalledOperand()->stripPointerCasts()))
                 {
                     if (cf->getName() == DEVICE_KERNEL_INIT)        inits.push_back(CI);
                     else if (cf->getName() == DEVICE_KERNEL_DEINIT) deinits.push_back(CI);
@@ -810,7 +815,12 @@ device_chain_barrier_removable(llvm::Function & Forig, size_t n, std::string & w
              * makes "the gate said yes" mean something. */
             if (auto * CI = llvm::dyn_cast<llvm::CallInst>(&I))
             {
-                llvm::Function * cf = CI->getCalledFunction();
+                /* Same lookup the inliner uses: the called operand, not
+                 * getCalledFunction(), which hides a callee whose signature does
+                 * not match the call. Both must agree on what a call is, or one
+                 * of them reasons about a program the other does not see. */
+                llvm::Function * cf = llvm::dyn_cast<llvm::Function>(
+                    CI->getCalledOperand()->stripPointerCasts());
                 if (cf == nullptr)
                 {
                     why = "a body makes an indirect call";
@@ -2032,7 +2042,19 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
                     auto * ci = llvm::dyn_cast<llvm::CallInst>(&I);
                     if (ci == nullptr)
                         continue;
-                    llvm::Function * callee = ci->getCalledFunction();
+                    /* Deliberately NOT getCalledFunction(): it returns null when
+                     * the call's signature differs from the callee's
+                     * (llvm/IR/InstrTypes.h), and that is exactly the shape the
+                     * OpenMP runtime leaves behind. invokeMicrotask() invokes an
+                     * outlined region through a uniformly typed function pointer,
+                     * so the direct call it produces passes `ptr` in every slot
+                     * while the region declares the real parameter types. Asking
+                     * for the called operand sees the callee anyway, and the
+                     * mismatch is repaired below -- where getCalledFunction()
+                     * would simply hide the call and leave the compute loop
+                     * outside the wrapper. */
+                    llvm::Function * callee = llvm::dyn_cast<llvm::Function>(
+                        ci->getCalledOperand()->stripPointerCasts());
                     if (callee == nullptr || callee == wrapper ||
                         callee->isDeclaration() || callee->isIntrinsic())
                         continue;
