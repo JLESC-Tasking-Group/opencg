@@ -92,6 +92,13 @@ LLVM IR to a host function or device PTX):
   externs, prototype and target) reuse the already-compiled host function pointer
   or emitted device PTX instead of recompiling. A hit is byte-identical to
   recompiling, so it never changes generated code.
+- `CGIR_JIT_CACHE_MODE` restricts what the on-disk cache may do: `rw` (default),
+  `w` write-only, `r` read-only. The one-letter modes are for measurement. Timing
+  a first run means timing a run that compiles everything, but a run that also
+  *populates* the cache reads back what it has just written, so its later work
+  reuses its own earlier output and the "cold" figure is quietly warm. `w` fills
+  the cache without ever consulting it, so a following `rw` or `r` run measures
+  the cached case against a cache it did not influence.
 - `CGIR_JIT_CACHE_DIR` enables the **persistent on-disk cache** at the given
   directory (opt-in; disabled unless set). It stores compiled host objects
   (`<hash>.o`) and device PTX (`<hash>.ptx`) so a later run skips

@@ -439,13 +439,26 @@ jit_cache_key(const command_prog_t * prog)
  *   CGIR_JIT_CACHE_DIR=DIR  enable the on-disk cache at DIR (opt-in; off by
  *                           default so a stale build is never silently reused
  *                           while the toolchain is under development)
+ *   CGIR_JIT_CACHE_MODE=M   what the on-disk cache may do: "rw" (default),
+ *                           "w" write-only, "r" read-only.
+ *
+ * The one-letter modes exist for measurement. Timing a first run means timing a
+ * run that compiles everything, but a run that also POPULATES the cache reads
+ * back what it has just written -- so the artifacts it produces early are reused
+ * by the work it does later, and the "cold" figure is quietly warm. "w"
+ * separates the two: the run fills the cache and never consults it, so its cost
+ * is a genuine first run, and a following "rw" (or "r") run measures the cached
+ * case against a cache it did not influence. "r" is the complement, for
+ * measuring against a frozen cache without mutating it.
+ *
  * Guarded by a mutex for a future parallel jit pass. */
 struct jit_cache_t
 {
     struct host_entry_t { int proto; void * fn; };
 
     bool                                       enabled;
-    bool                                       disk_enabled = false;
+    bool                                       disk_read  = false;
+    bool                                       disk_write = false;
     std::string                                dir;
     std::mutex                                 mtx;
     std::unordered_map<uint64_t, host_entry_t> host;        // in-process fn ptr
@@ -462,7 +475,17 @@ struct jit_cache_t
             !llvm::sys::fs::create_directories(cd))
         {
             dir = cd;
-            disk_enabled = true;
+            disk_read = disk_write = true;
+
+            const char * m = getenv("CGIR_JIT_CACHE_MODE");
+            if (m && m[0] && !(m[0] == 'r' && m[1] == 'w' && m[2] == '\0'))
+            {
+                if (m[0] == 'w' && m[1] == '\0')      disk_read  = false;
+                else if (m[0] == 'r' && m[1] == '\0') disk_write = false;
+                else
+                    fprintf(stderr, "cgir: CGIR_JIT_CACHE_MODE='%s' is not one of "
+                                    "rw, w, r; using rw\n", m);
+            }
         }
     }
 
@@ -517,12 +540,12 @@ struct jit_cache_t
     // ---- host: on-disk relocatable object (.o) ----
     bool host_get_obj(uint64_t k, std::string & obj)
     {
-        if (!enabled || !disk_enabled) return false;
+        if (!enabled || !disk_read) return false;
         return read_file(path_for(k, "o"), obj);
     }
     void host_put_obj(uint64_t k, const std::string & obj)
     {
-        if (!enabled || !disk_enabled) return ;
+        if (!enabled || !disk_write) return ;
         write_file_atomic(path_for(k, "o"), obj);
     }
 
@@ -535,7 +558,7 @@ struct jit_cache_t
             auto it = device_ptx.find(k);
             if (it != device_ptx.end()) { out = it->second; return 2; }
         }
-        if (disk_enabled && read_file(path_for(k, "ptx"), out))
+        if (disk_read && read_file(path_for(k, "ptx"), out))
         {
             std::lock_guard<std::mutex> lk(mtx);
             device_ptx[k] = out;
@@ -547,7 +570,7 @@ struct jit_cache_t
     {
         if (!enabled) return ;
         { std::lock_guard<std::mutex> lk(mtx); device_ptx[k] = ptx; }
-        if (disk_enabled) write_file_atomic(path_for(k, "ptx"), ptx);
+        if (disk_write) write_file_atomic(path_for(k, "ptx"), ptx);
     }
 };
 
