@@ -155,10 +155,11 @@ test_sequence_chain(void)
     b->precedes(c);
     c->precedes(exit);
 
-    cg->dump("cg-pre-sequence-chain.dot");
+    /* No dump() here on purpose. dump() walks the graph, and this test used to
+     * pass only because those walks bumped the parent's walk ids past the ones
+     * a fresh sub-graph would issue -- masking the aliasing that
+     * [subgraph-walk] below pins down. */
     cg->optimize(COMMAND_GRAPH_PASS_SEQUENCE);
-    cg->dump("cg-post-sequence-chain.dot");
-
     cg->coherence_checks();
 
     command_graph_node_t * batch = NULL;
@@ -266,6 +267,65 @@ test_sequence_device_split(void)
     return 0;
 }
 
+/*
+ *  A batch's sub-graph reuses the parent's nodes, so walking the sub-graph must
+ *  visit all of them however many times the parent was walked before -- and
+ *  must leave the parent walkable afterwards. Walk ids are what marks a node
+ *  visited; if a sub-graph could issue an id one of its shared nodes already
+ *  carries from a parent walk, that node reads as "already visited" and the
+ *  traversal stops early, silently and with no error.
+ */
+static int
+test_sequence_subgraph_walk(void)
+{
+    command_graph_node_t * entry;
+    command_graph_node_t * exit;
+    command_graph_t * cg = make_graph(&entry, &exit);
+
+    command_graph_node_t * a = make_task_node(cg);
+    command_graph_node_t * b = make_task_node(cg);
+    command_graph_node_t * c = make_task_node(cg);
+
+    entry->precedes(a);
+    a->precedes(b);
+    b->precedes(c);
+    c->precedes(exit);
+
+    cg->optimize(COMMAND_GRAPH_PASS_SEQUENCE);
+
+    command_graph_node_t * batch = NULL;
+    if (count_batches(cg, &batch) != 1)
+    {
+        fprintf(stderr, "FAIL [subgraph-walk]: expected exactly 1 top-level BATCH\n");
+        return 1;
+    }
+    command_graph_t * sub = batch->command->batch.cg;
+    assert(sub);
+
+    /* Alternate parent and sub-graph walks. Every one must see its whole graph:
+     * a stale id left by either must never be mistaken for this walk's mark. */
+    for (int round = 0 ; round < 4 ; ++round)
+    {
+        size_t outer = count_nodes(cg);
+        if (outer != 1)
+        {
+            fprintf(stderr, "FAIL [subgraph-walk]: round %d: parent walk reached "
+                    "%zu top-level node(s), expected 1\n", round, outer);
+            return 1;
+        }
+        size_t inner = count_command_nodes(sub);
+        if (inner != 3)
+        {
+            fprintf(stderr, "FAIL [subgraph-walk]: round %d: sub-graph walk reached "
+                    "%zu command(s), expected 3\n", round, inner);
+            return 1;
+        }
+    }
+
+    fprintf(stdout, "PASS [subgraph-walk]: parent and sub-graph walks stay complete\n");
+    return 0;
+}
+
 int
 main(void)
 {
@@ -273,5 +333,6 @@ main(void)
     rc |= test_sequence_chain();
     rc |= test_sequence_not_a_chain();
     rc |= test_sequence_device_split();
+    rc |= test_sequence_subgraph_walk();
     return rc;
 }

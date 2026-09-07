@@ -44,6 +44,7 @@
 # include <cgir/namespace.hpp>
 
 # include <algorithm>
+# include <atomic>
 # include <functional>
 # include <list>
 # include <queue>
@@ -76,8 +77,24 @@ void command_graph_optimize(command_graph_t * cg, command_graph_pass_t pass);
 /* Integer type to use for indexing command graph nodes */
 typedef size_t command_graph_node_index_t;
 
-/* Integer type to use for walk ids */
-typedef int8_t command_graph_walk_id_t;
+/* Integer type to use for walk ids.
+ *
+ * A walk marks a node visited by stamping it with the id of the walk in
+ * progress. The id must therefore be unique among all walks a node can ever
+ * take part in -- and a node takes part in the walks of every graph that can
+ * reach it, not just of the one that allocated it: the `sequence` and `batch`
+ * passes build sub-graphs that REUSE the parent's nodes. A per-graph counter
+ * would restart at zero in each fresh sub-graph and re-issue ids that its
+ * shared nodes still carry from the parent's last walk, which reads as
+ * "already visited" and silently truncates the traversal.
+ *
+ * So the counter is process-wide (command_graph_walk_id_next), and 64 bits
+ * wide so it cannot wrap back onto a live id. 0 is never issued and is the
+ * value a fresh node starts at. */
+typedef uint64_t command_graph_walk_id_t;
+
+/* Issues the stamp for one walk. Incremented once per walk, not per node. */
+extern std::atomic<command_graph_walk_id_t> command_graph_walk_id_next;
 
 enum command_graph_walk_search_t
 {
@@ -309,9 +326,6 @@ struct command_graph_t
     command_graph_node_t * entry;
     command_graph_node_t * exit;
 
-    /* dfs id */
-    command_graph_walk_id_t walk_id;
-
     /* true iff this graph is a linear chain (A -> B -> ... -> Z) of PROG
      * commands whose launch mode is TASK_SPAWN (i.e. a sequence of OpenMP
      * tasks). Set by the batch pass on a batch's sub-graph; lets the runtime
@@ -362,7 +376,6 @@ struct command_graph_t
             assert(this->exit);
             this->entry->precedes(this->exit);
         }
-        this->walk_id = 0;
         this->is_serial = false;
     }
 
@@ -721,7 +734,10 @@ struct command_graph_t
         command_graph_node_t * node,
         std::function<void(command_graph_node_t * node)> f
     ) {
-        node->walk_id = ++this->walk_id;
+        /* one fresh id per walk, from the process-wide counter: `node` may be
+         * shared with another graph, so an id private to this one could alias
+         * a stamp that graph already left on it (see command_graph_walk_id_t) */
+        node->walk_id = ++command_graph_walk_id_next;
         node->walk<search, order>(f);
     }
 

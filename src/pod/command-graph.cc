@@ -46,6 +46,13 @@
 
 CGIR_NAMESPACE_USE;
 
+/* Process-wide, so that a walk id is unique across every graph that can reach
+ * a given node -- a sub-graph built by `sequence` or `batch` shares its nodes
+ * with its parent. Bumped once per walk, so the atomic is never contended by
+ * the traversal itself. See command_graph_walk_id_t. */
+std::atomic<CGIR_NAMESPACE::command_graph_walk_id_t>
+CGIR_NAMESPACE::command_graph_walk_id_next{0};
+
 ///////////
 //  DUMP //
 ///////////
