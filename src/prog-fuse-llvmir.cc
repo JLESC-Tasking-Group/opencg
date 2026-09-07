@@ -80,7 +80,10 @@
 # include <llvm/Analysis/ScalarEvolution.h>
 # include <llvm/Analysis/ValueTracking.h>
 # include <llvm/IR/Function.h>
+# include <llvm/IR/GlobalVariable.h>
 # include <llvm/IR/IRBuilder.h>
+# include <llvm/IR/Intrinsics.h>
+# include <llvm/IR/IntrinsicsNVPTX.h>
 # include <llvm/IR/CallingConv.h>
 # include <llvm/IR/Instructions.h>
 # include <llvm/IR/IntrinsicInst.h>
@@ -479,79 +482,153 @@ constant_value_equal(llvm::Constant * a, llvm::Constant * b)
     return true;
 }
 
-/* The OpenMP device runtime entry points that bracket a kernel body. They must
- * survive as CALLS all the way to collapse_device_kernel_brackets: they are how
- * the fused bodies are delimited and what the collapse rewrites. Named once so
- * the inliner's exclusion and the collector's search cannot drift apart. */
-static constexpr const char * DEVICE_KERNEL_INIT   = "__kmpc_target_init";
-static constexpr const char * DEVICE_KERNEL_DEINIT = "__kmpc_target_deinit";
+/* ---------------------------------------------------------------------------
+ * Grid-wide barrier for fused device kernels.
+ *
+ * Two device programs run as two kernel launches, and the boundary between them
+ * is a device-wide barrier: every thread of the first finishes before any thread
+ * of the second starts. Fusing them into one launch removes it -- nothing in a
+ * single launch orders one block against another -- so the fused kernel has to
+ * put it back, or a program whose second half reads what the first half wrote
+ * (through any thread but its own) silently computes the wrong answer.
+ *
+ * The barrier below is the standard counter-and-generation handshake: one thread
+ * per block arrives, the last arrival releases everyone, and the rest spin on a
+ * generation counter. It is bracketed by block barriers so the whole block is
+ * ordered, not just its leader.
+ *
+ * PRECONDITION: every block of the grid must be resident simultaneously. A block
+ * that has not been scheduled cannot arrive, and the ones that have will spin
+ * forever. This is not checkable from inside the kernel, so it is established
+ * before fusing -- see command_prog_t::max_coresident_blocks and the check in
+ * command_graph_prog_fuse_llvmir -- and the launch must preserve it (in CUDA, a
+ * cooperative launch).
+ * ------------------------------------------------------------------------- */
 
-static bool
-is_device_kernel_bracket(llvm::StringRef name)
+/* The barrier's shared state, created once per fused module: an arrival counter
+ * that returns to zero at each barrier, and a generation counter that only ever
+ * increases. Zero-initialized, which is the correct starting state, so a replay
+ * needs no reset. */
+struct grid_barrier_state_t
 {
-    return name == DEVICE_KERNEL_INIT || name == DEVICE_KERNEL_DEINIT;
+    llvm::GlobalVariable * count;
+    llvm::GlobalVariable * generation;
+};
+
+static grid_barrier_state_t
+get_or_create_grid_barrier_state(llvm::Module & M)
+{
+    /* addrspace(1) is NVPTX global memory: visible to every block, which is the
+     * whole point. */
+    constexpr unsigned GLOBAL_AS = 1;
+    llvm::Type * i32 = llvm::Type::getInt32Ty(M.getContext());
+
+    auto get = [&] (const char * name) -> llvm::GlobalVariable *
+    {
+        if (llvm::GlobalVariable * G = M.getGlobalVariable(name, /*AllowInternal*/ true))
+            return G;
+        auto * G = new llvm::GlobalVariable(
+            M, i32, /* isConstant */ false, llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantInt::get(i32, 0), name, /* InsertBefore */ nullptr,
+            llvm::GlobalValue::NotThreadLocal, GLOBAL_AS);
+        G->setAlignment(llvm::Align(4));
+        return G;
+    };
+    return { get("__cgir_grid_barrier_count"), get("__cgir_grid_barrier_gen") };
 }
 
-/* Rewrite a direct call whose signature does not match its callee's into a
- * well-typed one, so the inliner will accept it. Returns the (possibly new) call,
- * or nullptr when the mismatch is not a pure type mismatch and must be left alone.
+/* Emit a grid-wide barrier at `b`'s insertion point and leave the builder in the
+ * block execution continues in (which is returned).
  *
- * This exists for one shape, and it is not a corner case: it is how every OpenMP
- * device parallel region is invoked. The runtime's invokeMicrotask() dispatches on
- * the argument count through a uniform cast --
- *
- *     ((void (*)(int32_t *, int32_t *, void *, void *, ...))fn)(&gtid, &btid, args[0], ...)
- *
- * -- so once it is inlined the call to the outlined body is direct, but typed with
- * `ptr` in every slot, while the body itself declares the real types
- * (`void(ptr, ptr, i64, i64, i64, i64, ptr, ptr, ptr)` for a collapsed loop nest).
- * LLVM refuses to inline through that mismatch, and the compute loop stays out of
- * the fused wrapper -- which is the whole reason the wrapper is being built.
- *
- * Only the TYPES are repaired. Which function is called, with which values, in
- * which order, was decided by the runtime; this reproduces the C cast that
- * invokeMicrotask already performed (a pointer-sized slot reinterpreted as the
- * parameter it stands for) and nothing else. Anything that is not a
- * value-preserving coercion -- a differing arity, a return type, a float or
- * aggregate parameter -- returns nullptr rather than guessing. */
-static llvm::CallInst *
-retype_direct_call_to_callee(llvm::CallInst * ci, llvm::Function * callee)
+ * PRECONDITION: the current block has no terminator yet -- this is called while
+ * the fused wrapper is still being built, and it appends the barrier's control
+ * flow rather than splitting an existing block. */
+static llvm::BasicBlock *
+emit_grid_barrier(llvm::IRBuilder<> & b, llvm::Module & M)
 {
-    llvm::FunctionType * want = callee->getFunctionType();
-    if (want == ci->getFunctionType())
-        return ci;                        /* already well typed */
+    llvm::LLVMContext & ctx = M.getContext();
+    llvm::Type * i32 = llvm::Type::getInt32Ty(ctx);
+    llvm::Function * F = b.GetInsertBlock()->getParent();
+    grid_barrier_state_t st = get_or_create_grid_barrier_state(M);
 
-    if (want->isVarArg() || ci->arg_size() != want->getNumParams()
-        || want->getReturnType() != ci->getType())
-        return nullptr;
+    auto k0 = [&] { return llvm::ConstantInt::get(i32, 0); };
+    auto k1 = [&] { return llvm::ConstantInt::get(i32, 1); };
 
-    llvm::IRBuilder<> b(ci);
-    std::vector<llvm::Value *> args;
-    args.reserve(ci->arg_size());
-    for (unsigned k = 0 ; k < ci->arg_size() ; ++k)
+    /* Read a nullary NVPTX special register (tid, nctaid, ...). */
+    auto sreg = [&] (llvm::Intrinsic::ID id) -> llvm::Value *
     {
-        llvm::Value * a  = ci->getArgOperand(k);
-        llvm::Type  * at = a->getType();
-        llvm::Type  * pt = want->getParamType(k);
+        return b.CreateCall(llvm::Intrinsic::getOrInsertDeclaration(&M, id), {});
+    };
+    /* __syncthreads(): barrier 0, all threads of the block, aligned. */
+    auto block_barrier = [&] ()
+    {
+        b.CreateCall(llvm::Intrinsic::getOrInsertDeclaration(
+                         &M, llvm::Intrinsic::nvvm_barrier_cta_sync_aligned_all),
+                     { k0() });
+    };
 
-        if (at == pt)
-            args.push_back(a);
-        else if (at->isPointerTy() && pt->isIntegerTy())
-            args.push_back(b.CreatePtrToInt(a, pt));
-        else if (at->isIntegerTy() && pt->isPointerTy())
-            args.push_back(b.CreateIntToPtr(a, pt));
-        else if (at->isPointerTy() && pt->isPointerTy())
-            args.push_back(b.CreatePointerBitCastOrAddrSpaceCast(a, pt));
-        else
-            return nullptr;               /* not a coercion we can justify */
-    }
+    /* 1. Order the block, so its leader speaks for threads that have all
+     *    finished the preceding body. */
+    block_barrier();
 
-    llvm::CallInst * fixed = b.CreateCall(callee, args);
-    fixed->setCallingConv(callee->getCallingConv());
-    fixed->setDebugLoc(ci->getDebugLoc());
-    ci->replaceAllUsesWith(fixed);
-    ci->eraseFromParent();
-    return fixed;
+    /* 2. One thread per block takes part in the grid handshake. */
+    llvm::Value * is_leader = b.CreateAnd(
+        b.CreateAnd(
+            b.CreateICmpEQ(sreg(llvm::Intrinsic::nvvm_read_ptx_sreg_tid_x), k0()),
+            b.CreateICmpEQ(sreg(llvm::Intrinsic::nvvm_read_ptx_sreg_tid_y), k0())),
+        b.CreateICmpEQ(sreg(llvm::Intrinsic::nvvm_read_ptx_sreg_tid_z), k0()));
+
+    llvm::BasicBlock * leader  = llvm::BasicBlock::Create(ctx, "cgir.gb.leader",  F);
+    llvm::BasicBlock * release = llvm::BasicBlock::Create(ctx, "cgir.gb.release", F);
+    llvm::BasicBlock * wait    = llvm::BasicBlock::Create(ctx, "cgir.gb.wait",    F);
+    llvm::BasicBlock * done    = llvm::BasicBlock::Create(ctx, "cgir.gb.done",    F);
+    llvm::BasicBlock * cont    = llvm::BasicBlock::Create(ctx, "cgir.gb.cont",    F);
+    b.CreateCondBr(is_leader, leader, done);
+
+    /* 3. Leader: note the generation, then arrive. */
+    b.SetInsertPoint(leader);
+    llvm::Value * gen0 = b.CreateAtomicRMW(
+        llvm::AtomicRMWInst::Add, st.generation, k0(),
+        llvm::MaybeAlign(4), llvm::AtomicOrdering::Acquire);
+
+    llvm::Value * nblocks = b.CreateMul(
+        b.CreateMul(sreg(llvm::Intrinsic::nvvm_read_ptx_sreg_nctaid_x),
+                    sreg(llvm::Intrinsic::nvvm_read_ptx_sreg_nctaid_y)),
+        sreg(llvm::Intrinsic::nvvm_read_ptx_sreg_nctaid_z));
+
+    llvm::Value * arrived = b.CreateAtomicRMW(
+        llvm::AtomicRMWInst::Add, st.count, k1(),
+        llvm::MaybeAlign(4), llvm::AtomicOrdering::AcquireRelease);
+    b.CreateCondBr(b.CreateICmpEQ(arrived, b.CreateSub(nblocks, k1())),
+                   release, wait);
+
+    /* 3a. Last to arrive: reset the counter, then publish the new generation.
+     *     In that order, or a block entering the NEXT barrier could see a count
+     *     that still includes this one. */
+    b.SetInsertPoint(release);
+    b.CreateAtomicRMW(llvm::AtomicRMWInst::Xchg, st.count, k0(),
+                      llvm::MaybeAlign(4), llvm::AtomicOrdering::Release);
+    b.CreateAtomicRMW(llvm::AtomicRMWInst::Add, st.generation, k1(),
+                      llvm::MaybeAlign(4), llvm::AtomicOrdering::AcquireRelease);
+    b.CreateBr(done);
+
+    /* 3b. Everyone else spins until the generation moves. The read is an atomic
+     *     add of zero rather than a load, so it cannot be hoisted out of the
+     *     loop. */
+    b.SetInsertPoint(wait);
+    llvm::Value * gen = b.CreateAtomicRMW(
+        llvm::AtomicRMWInst::Add, st.generation, k0(),
+        llvm::MaybeAlign(4), llvm::AtomicOrdering::Acquire);
+    b.CreateCondBr(b.CreateICmpEQ(gen, gen0), wait, done);
+
+    /* 4. Re-join the block: the threads that were not the leader waited here,
+     *    and none of them may enter the next body before it has been released. */
+    b.SetInsertPoint(done);
+    block_barrier();
+    b.CreateBr(cont);
+
+    b.SetInsertPoint(cont);
+    return cont;
 }
 
 /* Collect the per-kernel target_init / target_deinit calls of `F`, in block
@@ -567,420 +644,11 @@ collect_device_kernel_brackets(llvm::Function & F,
     for (llvm::BasicBlock & BB : F)
         for (llvm::Instruction & I : BB)
             if (auto * CI = llvm::dyn_cast<llvm::CallInst>(&I))
-                /* The called operand rather than getCalledFunction(), for the same
-                 * reason as the inliner and the legality gate: a bracket call whose
-                 * signature did not match would otherwise go unseen, and the chain
-                 * would be refused for "unmatched pairs" with no way to tell why. */
-                if (auto * cf = llvm::dyn_cast<llvm::Function>(
-                        CI->getCalledOperand()->stripPointerCasts()))
+                if (llvm::Function * cf = CI->getCalledFunction())
                 {
-                    if (cf->getName() == DEVICE_KERNEL_INIT)        inits.push_back(CI);
-                    else if (cf->getName() == DEVICE_KERNEL_DEINIT) deinits.push_back(CI);
+                    if (cf->getName() == "__kmpc_target_init")   inits.push_back(CI);
+                    else if (cf->getName() == "__kmpc_target_deinit") deinits.push_back(CI);
                 }
-}
-
-/* ---------------------------------------------------------------------------
- * Device-chain fusion legality.
- *
- * Two `omp target` regions execute as two kernel launches, and the launch
- * boundary is a DEVICE-WIDE barrier: every thread of kernel k finishes before
- * any thread of kernel k+1 starts. Collapsing the brackets (below) fuses them
- * into a single launch, which removes that barrier -- nothing in a single SPMD
- * launch synchronizes across thread blocks.
- *
- * That is only meaning-preserving if no thread of a later kernel reads a
- * location written by a DIFFERENT thread of an earlier one. Two families of
- * program violate it:
- *
- *   - a cross-thread write: a reduction (`reduction(+:s)` lowers to a
- *     `__kmpc_*reduce*` call whose result is only settled at kernel exit) or an
- *     atomic. Every Krylov solver has one: `dot(p, Ap)` reduces, and the next
- *     kernel divides by it.
- *   - a cross-thread read: a gather/stencil, where thread i of kernel k+1 reads
- *     an element thread j != i of kernel k wrote.
- *
- * LLVM cannot decide this for us. Its loop-fusion legality analysis reasons
- * within one function about one loop nest; it has no notion of the launch
- * boundary we removed before it ever ran. So the check lives here.
- *
- * The test below is conservative: it refuses whenever it cannot prove safety.
- * ------------------------------------------------------------------------- */
-
-/* True if `name` is a call that combines values across threads, i.e. one whose
- * result is only complete at kernel exit. Deliberately a broad substring match:
- * refusing a fusion costs performance, allowing an unsound one costs correctness,
- * so a false positive here is the cheap error. */
-static bool
-is_cross_thread_runtime_call(llvm::StringRef name)
-{
-    return name.contains("reduce")       /* __kmpc_nvptx_parallel_reduce_nowait_v2, ... */
-        || name.contains("reduction");   /* __kmpc_reduction_get_fixed_buffer, ...      */
-}
-
-/* True for the device runtime entry points a kernel body may call without
- * hiding memory effects from the analysis: they query the thread's own position
- * or the launch geometry and touch no user data. Everything else that is only a
- * declaration is treated as opaque and refuses the chain, so this list is the
- * one place a false entry could let an unsound fusion through -- keep it to
- * calls that are provably thread-local queries. */
-static bool
-is_benign_device_runtime_call(llvm::StringRef name)
-{
-    return name.starts_with("llvm.nvvm.read.ptx.sreg.")   /* tid/ctaid/ntid/nctaid */
-        || name.starts_with("llvm.nvvm.barrier")          /* block synchronization */
-        || name.starts_with("__kmpc_barrier")
-        || name == "__kmpc_get_hardware_thread_id_in_block"
-        || name == "__kmpc_get_hardware_num_threads_in_block"
-        || name == "__kmpc_get_warp_size"
-        || name == "__kmpc_is_spmd_exec_mode"
-        || name == "__kmpc_global_thread_num"             /* returns the thread's id */
-        || is_device_kernel_bracket(name);
-}
-
-/* One memory access of a fused kernel body, as seen from the merged wrapper. */
-struct device_access_t
-{
-    llvm::Instruction * inst;
-    llvm::Value       * ptr;
-    bool                is_write;
-};
-
-/* Partition the wrapper's instructions into the N inlined kernel bodies and
- * decide whether the device-wide barriers between them can be removed.
- *
- * `n` is the number of fused kernels. Body k is every instruction from the k-th
- * `__kmpc_target_init` up to (excluding) the (k+1)-th, in reverse-post-order,
- * which is the order the wrapper calls them in.
- *
- * Refuses -- and writes the reason to `why` -- when:
- *   (a) a body performs a cross-thread write (reduction call, atomicrmw,
- *       cmpxchg), whose value is only settled by the launch boundary;
- *   (b) a body touches block-shared memory (addrspace 3), whose lifetime is the
- *       launch and would otherwise leak from one body into the next;
- *   (c) a location written by body k may be accessed by a later body m > k at a
- *       DIFFERENT address expression. Equal SCEVs mean thread i of body m
- *       touches exactly what thread i of body k wrote, so the barrier is
- *       redundant; anything else is a potential cross-thread dependence.
- *
- * Accesses to thread-private memory (allocas) are skipped: no other thread can
- * observe them. */
-static bool
-device_chain_barrier_removable(llvm::Function & Forig, size_t n, std::string & why)
-{
-    /* Decide on a CLONE, never on the real wrapper.
-     *
-     * The analysis needs canonicalized IR: as inlined, each body rebuilds its
-     * captured pointers through local allocas, so the address of `y[i]` in one
-     * body and of `y[i]` in the next are unrelated values that no analysis can
-     * equate, and every chain would be refused. SROA promotes those allocas so
-     * both resolve to the same deduplicated base load; tag_noalias_domains then
-     * tells alias analysis that two DISTINCT captured bases (`x` and `y`) do not
-     * overlap -- without which every pair would be MayAlias and, again, every
-     * chain refused. Loop-simplify and rotation give ScalarEvolution the loop
-     * shape it needs to see the induction variable.
-     *
-     * All of that is what optimize_module() does later anyway, but doing it to
-     * the real wrapper here would invalidate the caller's bracket pointers and
-     * tag the noalias domains twice. A predicate should not have side effects,
-     * so it gets its own copy and throws it away. */
-    llvm::ValueToValueMapTy vmap;
-    llvm::Function * clone = llvm::CloneFunction(&Forig, vmap);
-    if (clone == nullptr)
-    {
-        why = "could not clone the wrapper for analysis";
-        return false;
-    }
-    /* Erase the clone on every exit path, including the early returns below. */
-    struct clone_guard_t
-    {
-        llvm::Function * f;
-        ~clone_guard_t() { if (f) f->eraseFromParent(); }
-    } guard { clone };
-    llvm::Function & F = *clone;
-
-    {
-        llvm::PassBuilder             PB;
-        llvm::LoopAnalysisManager     LAM;
-        llvm::FunctionAnalysisManager FAM;
-        llvm::CGSCCAnalysisManager    CGAM;
-        llvm::ModuleAnalysisManager   MAM;
-        PB.registerModuleAnalyses(MAM);
-        PB.registerCGSCCAnalyses(CGAM);
-        PB.registerFunctionAnalyses(FAM);
-        PB.registerLoopAnalyses(LAM);
-        PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
-
-        llvm::FunctionPassManager FPM1;
-        FPM1.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
-        FPM1.addPass(llvm::InstCombinePass());
-        FPM1.addPass(llvm::SimplifyCFGPass());
-        FPM1.run(F, FAM);
-
-        tag_noalias_domains(F);
-        FAM.invalidate(F, llvm::PreservedAnalyses::none());
-
-        llvm::FunctionPassManager FPM2;
-        FPM2.addPass(llvm::LoopSimplifyPass());
-        llvm::LoopPassManager LPM;
-        LPM.addPass(llvm::LoopRotatePass());
-        FPM2.addPass(llvm::createFunctionToLoopPassAdaptor(std::move(LPM)));
-        FPM2.run(F, FAM);
-    }
-
-    /* The passes above may have replaced the instructions holding the brackets,
-     * so re-find them in the clone. Their count cannot change: the calls have
-     * side effects and nothing above deletes them. */
-    std::vector<llvm::CallInst *> live_inits, live_deinits;
-    collect_device_kernel_brackets(F, live_inits, live_deinits);
-    if (live_inits.size() != n)
-    {
-        why = "canonicalization changed the number of kernel brackets";
-        return false;
-    }
-
-    /* Reverse post-order is the execution order of a wrapper built as a straight
-     * sequence of inlined calls, and unlike the block list it does not depend on
-     * where the inliner happened to append blocks. */
-    llvm::ReversePostOrderTraversal<llvm::Function *> rpo(&F);
-
-    /* instruction -> body index; -1 before the first init (the wrapper prologue) */
-    llvm::DenseMap<const llvm::Instruction *, int> body_of;
-    llvm::DenseSet<const llvm::CallInst *> init_set(live_inits.begin(), live_inits.end());
-    int cur = -1;
-    for (llvm::BasicBlock * BB : rpo)
-        for (llvm::Instruction & I : *BB)
-        {
-            if (auto * CI = llvm::dyn_cast<llvm::CallInst>(&I))
-                if (init_set.count(CI))
-                    ++cur;
-            body_of[&I] = cur;
-        }
-
-    /* What counts as USER data: memory reachable from one of the wrapper's
-     * pointer parameters, i.e. a buffer the recorded programs captured. That is
-     * the only memory a dependence between two program bodies can flow through.
-     *
-     * The distinction matters because the device runtime is inlined into these
-     * bodies (that is what makes their loops visible at all), and it manipulates
-     * its own team state with atomics and shared memory. Judging those as if they
-     * were user accesses would refuse every device chain; ignoring them is sound
-     * because no program body can observe them. */
-    llvm::DenseSet<const llvm::Value *> user_bases;
-    for (llvm::Argument & A : F.args())
-        if (A.getType()->isPointerTy())
-            user_bases.insert(&A);
-
-    auto is_user_memory = [&] (const llvm::Value * ptr) -> bool
-    {
-        return user_bases.count(llvm::getUnderlyingObject(ptr)) != 0;
-    };
-
-    /* (a)+(b): scan for constructs that alone make the fusion unsound, and
-     * collect the accesses the pairwise test needs. */
-    std::vector<std::vector<device_access_t>> acc(n);
-    for (llvm::BasicBlock & BB : F)
-        for (llvm::Instruction & I : BB)
-        {
-            auto it = body_of.find(&I);
-            const int b = (it == body_of.end()) ? -1 : it->second;
-            if (b < 0 || (size_t) b >= n)
-                continue ;   /* wrapper prologue/epilogue, not a kernel body */
-
-            /* An atomic on user data is a cross-thread write: its value is only
-             * settled once every thread has contributed, which is exactly what the
-             * barrier we are about to remove guarantees. On runtime state it is
-             * just the inlined device runtime doing its own bookkeeping. */
-            const llvm::Value * atomic_ptr = nullptr;
-            if (auto * RMW = llvm::dyn_cast<llvm::AtomicRMWInst>(&I))
-                atomic_ptr = RMW->getPointerOperand();
-            else if (auto * CX = llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&I))
-                atomic_ptr = CX->getPointerOperand();
-            if (atomic_ptr != nullptr && is_user_memory(atomic_ptr))
-            {
-                why = "a body performs an atomic read-modify-write on captured data";
-                return false;
-            }
-            /* A call whose memory effects we cannot see makes everything below
-             * meaningless: the accesses it performs are simply absent from `acc`,
-             * and the pairwise test then proves nothing while looking like it
-             * proved something.
-             *
-             * This is not hypothetical. A `teams distribute parallel for` reaches
-             * its loop through `__kmpc_parallel_XX(..., ptr @outlined, ...)` -- the
-             * body is a function-POINTER argument to a runtime declaration, never a
-             * direct call -- so the inlining fixpoint above cannot pull it into the
-             * wrapper. The wrapper then holds no load or store at all, and an
-             * earlier version of this function happily approved fusing an SpMV
-             * gather with the kernel that produced its input. Refusing here is what
-             * makes "the gate said yes" mean something. */
-            if (auto * CI = llvm::dyn_cast<llvm::CallInst>(&I))
-            {
-                /* Same lookup the inliner uses: the called operand, not
-                 * getCalledFunction(), which hides a callee whose signature does
-                 * not match the call. Both must agree on what a call is, or one
-                 * of them reasons about a program the other does not see. */
-                llvm::Function * cf = llvm::dyn_cast<llvm::Function>(
-                    CI->getCalledOperand()->stripPointerCasts());
-                if (cf == nullptr)
-                {
-                    why = "a body makes an indirect call";
-                    return false;
-                }
-                if (is_cross_thread_runtime_call(cf->getName()))
-                {
-                    why = ("a body calls '" + cf->getName() + "', which combines "
-                           "values across threads").str();
-                    return false;
-                }
-                /* A callee that can reach user data hides accesses from `acc`,
-                 * whether or not it has a body here: a definition that survived
-                 * the inlining fixpoint above is as opaque to a scan of this
-                 * function's instructions as a declaration is.
-                 *
-                 * "Can reach user data" is decided by its arguments: a call that
-                 * is handed none of the captured buffers cannot touch them. That
-                 * is what lets the inlined device runtime -- which calls into its
-                 * own state and synchronization helpers constantly -- through,
-                 * while still refusing anything that was given a user pointer and
-                 * whose body we cannot see. */
-                if (!CI->doesNotAccessMemory()
-                    && !is_benign_device_runtime_call(cf->getName()))
-                {
-                    for (const llvm::Use & u : CI->args())
-                        if (u->getType()->isPointerTy() && is_user_memory(u.get()))
-                        {
-                            why = ("a body calls '" + cf->getName() + "' on captured "
-                                   "data, and its memory effects are not visible "
-                                   "here").str();
-                            return false;
-                        }
-                }
-                /* A function pointer handed to a callee escapes analysis whatever
-                 * its other arguments look like: the callee may run it, and we
-                 * cannot see what it does. This is exactly the __kmpc_parallel_XX
-                 * shape -- the reason the device runtime has to be linked before
-                 * this analysis runs, so the region is inlined rather than passed. */
-                for (const llvm::Use & u : CI->args())
-                    if (llvm::isa<llvm::Function>(u->stripPointerCasts()))
-                    {
-                        why = ("a body passes a function pointer to '"
-                               + cf->getName() + "', so its body is not visible "
-                               "here (the parallel region was not inlined)").str();
-                        return false;
-                    }
-            }
-
-            llvm::Value * ptr = nullptr;
-            bool is_write = false;
-            if (auto * LI = llvm::dyn_cast<llvm::LoadInst>(&I))
-                ptr = LI->getPointerOperand();
-            else if (auto * SI = llvm::dyn_cast<llvm::StoreInst>(&I))
-            {
-                ptr = SI->getPointerOperand();
-                is_write = true;
-            }
-            else
-                continue ;
-
-            /* Only captured buffers can carry a dependence between two program
-             * bodies. Everything else -- thread-private allocas, the inlined
-             * runtime's team state, its shared-memory scratch -- is invisible to
-             * the programs and cannot order them. */
-            if (!is_user_memory(ptr))
-                continue ;
-            if (ptr->getType()->getPointerAddressSpace() == 3)
-            {
-                /* A captured buffer reached through shared memory: its contents do
-                 * not survive the launch we are about to merge away. */
-                why = "a body reaches captured data through block-shared memory";
-                return false;
-            }
-
-            acc[(size_t) b].push_back({ &I, ptr, is_write });
-        }
-
-    /* A body that touches no global memory at all did nothing observable, which
-     * is far more likely to mean the analysis is looking in the wrong place than
-     * that the kernel is a no-op. Refuse rather than approve by default: an
-     * approval that examined nothing is indistinguishable from a real proof, and
-     * that is precisely how the SpMV gather got fused. */
-    for (size_t k = 0 ; k < n ; ++k)
-        if (acc[k].empty())
-        {
-            why = "body " + std::to_string(k) + " has no visible memory access, so "
-                  "there is nothing to prove it safe with";
-            return false;
-        }
-
-    /* (c): pairwise, over ALL ordered pairs of bodies -- collapsing the brackets
-     * removes every barrier in the chain, not only the adjacent ones. */
-    llvm::PassBuilder PB;
-    llvm::LoopAnalysisManager     LAM;
-    llvm::FunctionAnalysisManager FAM;
-    llvm::CGSCCAnalysisManager    CGAM;
-    llvm::ModuleAnalysisManager   MAM;
-    PB.registerModuleAnalyses(MAM);
-    PB.registerCGSCCAnalyses(CGAM);
-    PB.registerFunctionAnalyses(FAM);
-    PB.registerLoopAnalyses(LAM);
-    PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
-
-    llvm::ScalarEvolution & SE = FAM.getResult<llvm::ScalarEvolutionAnalysis>(F);
-    llvm::AAResults       & AA = FAM.getResult<llvm::AAManager>(F);
-
-    /* The comparison is quadratic in the accesses of a pair of bodies. A long
-     * chain of large kernels would make the check itself the cost of the pass,
-     * so give up (conservatively: refuse) rather than spend that time. */
-    size_t budget = 200000;
-
-    for (size_t k = 0 ; k < n ; ++k)
-        for (const device_access_t & w : acc[k])
-        {
-            if (!w.is_write)
-                continue ;
-            for (size_t m = k + 1 ; m < n ; ++m)
-                for (const device_access_t & r : acc[m])
-                {
-                    if (budget-- == 0)
-                    {
-                        why = "the chain is too large to prove safe";
-                        return false;
-                    }
-                    if (AA.alias(llvm::MemoryLocation::getBeforeOrAfter(w.ptr),
-                                 llvm::MemoryLocation::getBeforeOrAfter(r.ptr))
-                        == llvm::AliasResult::NoAlias)
-                        continue ;               /* disjoint buffers: independent */
-
-                    /* May alias. Safe only if it is the SAME element: then the
-                     * thread reading it is the thread that wrote it. */
-                    if (SE.getSCEV(w.ptr) != SE.getSCEV(r.ptr))
-                    {
-                        /* Name the two instructions: "fusion did not happen" is
-                         * otherwise very hard to act on. */
-                        std::string buf;
-                        llvm::raw_string_ostream os(buf);
-                        os << "body " << k << " writes and body " << m
-                           << " accesses the same memory at different indices "
-                              "(a cross-thread dependence): '"
-                           << *w.inst << "' vs '" << *r.inst << "'";
-                        why = os.str();
-                        return false;
-                    }
-                }
-        }
-
-    /* Say what was actually examined. An approval and a vacuous approval look the
-     * same from the outside, and telling them apart after the fact cost a whole
-     * evaluation campaign. */
-    if (env_flag("CGIR_PROG_FUSE_VERBOSE"))
-    {
-        size_t total = 0;
-        for (const auto & a : acc)
-            total += a.size();
-        fprintf(stderr, "prog-fuse: device chain of %zu bodies proved safe over %zu "
-                        "visible memory accesses\n", n, total);
-    }
-    return true;
 }
 
 /* Collapse the per-kernel OpenMP-device runtime brackets in a fused device kernel.
@@ -990,12 +658,15 @@ device_chain_barrier_removable(llvm::Function & Forig, size_t n, std::string & w
  * body) with an identical launch configuration, keep the FIRST init and the LAST
  * deinit and drop the inner ones: each removed init's result is replaced by -1 so
  * its "== -1 => body" branch falls through into the body, and each removed deinit
- * is erased. Returns false if the kernels are not the expected SPMD shape, their
- * launch configurations differ, or removing the device-wide barriers between them
- * would not preserve the program's meaning (see device_chain_barrier_removable);
- * the caller must then NOT fuse them. Assumes the inlined bodies appear in launch
- * order (block layout order), which holds since the wrapper calls them in order
- * and we inline in place. `why` receives the reason when it returns false. */
+ * is erased. Returns false if the kernels are not the expected SPMD shape or their
+ * launch configurations differ; the caller must then NOT fuse them. Assumes the
+ * inlined bodies appear in launch order (block layout order), which holds since
+ * the wrapper calls them in order and we inline in place. `why` receives the
+ * reason when it returns false.
+ *
+ * The ordering the removed launch boundaries used to provide is restored by the
+ * grid-wide barrier the wrapper emits between consecutive bodies -- see
+ * emit_grid_barrier(); this routine only removes the brackets. */
 static bool
 collapse_device_kernel_brackets(llvm::Function & F, std::string & why)
 {
@@ -1055,13 +726,6 @@ collapse_device_kernel_brackets(llvm::Function & F, std::string & why)
             return false;
         }
 
-    /* The launch boundary between the bodies is a device-wide barrier. Removing
-     * it is the whole point of fusing, and also the only way this pass can change
-     * a program's result, so it is proved -- not assumed -- before anything is
-     * erased. */
-    if (!device_chain_barrier_removable(F, inits.size(), why))
-        return false;
-
     /* keep inits[0] and deinits[last]; drop the inner brackets */
     llvm::Type * i32 = llvm::Type::getInt32Ty(F.getContext());
     for (size_t i = 1 ; i < inits.size() ; ++i)
@@ -1077,18 +741,6 @@ collapse_device_kernel_brackets(llvm::Function & F, std::string & why)
 /* Write `M` as textual IR to <dir>/<name> (defined below; forward-declared so the
  * optimize pipeline can dump the pre-LoopFuse wrapper for debugging). */
 static void dump_module(const std::string & dir, const char * name, llvm::Module & M);
-
-/* Turn a generic-mode device module into SPMD form, and read back the target
- * features to build a TargetMachine with (both defined in SECTION 3, where PTX
- * codegen also uses them; forward-declared so the fuse pass can SPMD-ize its
- * inputs FIRST -- see the call site for why the ordering matters). */
-static void spmdize_device_module(llvm::Module & M, llvm::TargetMachine * tm);
-static std::string device_features_of(const llvm::Module & M);
-
-/* Link a device bitcode library into `M`, materializing only what is referenced
- * (defined in SECTION 3; forward-declared so the fuse pass can resolve the
- * parallel-region runtime before it inlines -- see the call site). */
-static bool link_device_bitcode(llvm::Module & M, const char * bc_path, std::string & err);
 
 /* Run an O3 module pipeline (inlining + loop-fuse + vectorization) on the
  * merged module, so the inlined kernels' loops can vectorize/fuse. `dump_dir` is
@@ -1316,73 +968,6 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             char name[32];
             snprintf(name, sizeof(name), "input-%zu.ll", i);
             dump_module(dump_dir, name, *mods[i]);
-        }
-
-        /* SPMD-ize a device input HERE, before it is renamed, internalized and
-         * linked into the merged module.
-         *
-         * A recorded `omp target teams distribute parallel for` is a generic-mode
-         * kernel: its loop lives in an outlined function reached through
-         * `__kmpc_parallel_XX(..., ptr @outlined, ...)` -- the body is a function
-         * POINTER handed to a runtime declaration, never a direct call. Nothing
-         * downstream can follow that edge (the inlining fixpoint later only walks
-         * direct calls), so the fused wrapper would contain no load or store at
-         * all. Two things then fail silently: LoopFuse has no adjacent loops to
-         * fuse, which is the whole point of this pass; and the legality gate in
-         * collapse_device_kernel_brackets has no memory accesses to reason about,
-         * so it approves chains it has not examined.
-         *
-         * OpenMPOpt's SPMD-ization removes the indirection. It already runs on
-         * this IR -- but in the `jit` pass, long after the fusion decision. It has
-         * to happen before.
-         *
-         * It has to happen HERE specifically, and not once on the merged module:
-         * by then each constituent has been given internal linkage, stripped of
-         * its `ptx_kernel` calling convention and left unreferenced until the
-         * wrapper is built (see step 5b). OpenMPOpt would no longer recognize them
-         * as device kernels, and would delete them as dead code. At this point
-         * each module is still the standalone snapshot it expects -- one external
-         * `ptx_kernel` entry plus its helpers -- which is exactly the shape
-         * emit_device_ptx feeds it.
-         *
-         * Best-effort: if the target is unavailable the module is left in generic
-         * mode, and the legality gate then refuses the chain (a body with no
-         * visible memory access cannot be proved safe). The failure mode is
-         * "not fused", never "fused wrongly". */
-        const char * itriple = progs[i]->source.content.llvmir.triple;
-        if (itriple != nullptr)
-        {
-            scoped_phase_t _p("fuse-spmdize");
-
-            llvm::Triple TT(itriple);
-            std::string terr;
-            if (const llvm::Target * T = llvm::TargetRegistry::lookupTarget(TT, terr))
-            {
-                const char * iarch = progs[i]->source.content.llvmir.arch;
-                llvm::TargetOptions topts;
-                std::unique_ptr<llvm::TargetMachine> itm(T->createTargetMachine(
-                    TT, iarch ? iarch : "", device_features_of(*mods[i]), topts,
-                    std::nullopt, std::nullopt, llvm::CodeGenOptLevel::Aggressive));
-                if (itm)
-                {
-                    mods[i]->setTargetTriple(TT);
-                    mods[i]->setDataLayout(itm->createDataLayout());
-                    spmdize_device_module(*mods[i], itm.get());
-
-                    /* Both shapes are worth having when a fusion misbehaves: the
-                     * recording as it arrived, and what the pass actually works on. */
-                    if (dump)
-                    {
-                        char name[40];
-                        snprintf(name, sizeof(name), "input-%zu-spmd.ll", i);
-                        dump_module(dump_dir, name, *mods[i]);
-                    }
-                }
-            }
-            else
-                fprintf(stderr, "prog-fuse: no target for '%s' (%s); program %zu stays "
-                                "in generic mode and will not be fused\n",
-                        TT.str().c_str(), terr.c_str(), i);
         }
     }
 
@@ -1662,6 +1247,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     const char * dev_arch   = progs[0]->source.content.llvmir.arch;
     const bool   device     = (dev_triple != nullptr);
     if (device)
+    {
         for (size_t i = 0 ; i < n ; ++i)
             if (progs[i]->source.content.llvmir.triple == nullptr)
             {
@@ -1669,6 +1255,34 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
                                 "fused chain (program %zu)\n", i);
                 return false;
             }
+
+        /* A fused device program is one launch, so the ordering its constituents
+         * used to get from the launch boundary must come from a grid-wide barrier
+         * inside the kernel. That barrier only completes if every block is
+         * resident: a block the hardware has not scheduled never arrives, and the
+         * ones that have spin forever. Establish it here, where refusing is free,
+         * rather than discovering it as a hang at replay. */
+        const uint64_t blocks = (uint64_t) progs[0]->grid.x
+                              * (uint64_t) progs[0]->grid.y
+                              * (uint64_t) progs[0]->grid.z;
+        const unsigned fit = progs[0]->max_coresident_blocks;
+        if (fit == 0)
+        {
+            fprintf(stderr, "prog-fuse: device chain of %zu kernels left unfused: the "
+                            "runtime did not report how many blocks fit on the device, "
+                            "so the grid-wide barrier a fused kernel needs cannot be "
+                            "shown to complete\n", n);
+            return false;
+        }
+        if (blocks > (uint64_t) fit)
+        {
+            fprintf(stderr, "prog-fuse: device chain of %zu kernels left unfused: its "
+                            "grid of %llu blocks exceeds the %u that fit on the device "
+                            "at once, so a grid-wide barrier would hang\n",
+                    n, (unsigned long long) blocks, fit);
+            return false;
+        }
+    }
 
     std::vector<void *>                    unique_slots;
     std::vector<size_t>                    unique_slot_size; /* byte size per unique slot */
@@ -1952,19 +1566,14 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         kernel_calls.reserve(n);
         for (size_t i = 0 ; i < n ; ++i)
         {
+            /* Restore the ordering the launch boundary used to give. Emitting it
+             * here -- between the calls, before they are inlined -- means it does
+             * not depend on anything about the bodies' shape: whatever they turn
+             * into, the barrier stays between them. */
+            if (i > 0)
+                emit_grid_barrier(builder, *mod_u);
+
             llvm::Function * fn = mod_u->getFunction(inputs[i].fused_name);
-            if (fn == nullptr)
-            {
-                /* The constituent was present at step 5b and is gone now, so
-                 * something between the two removed it -- a module pass that saw
-                 * an internal function with no callers, most likely. Refuse
-                 * rather than dereference null: the wrapper is half-built, but
-                 * `dst` has not been touched yet, so the caller simply keeps the
-                 * chain unfused. */
-                fprintf(stderr, "prog-fuse: constituent '%s' vanished before the "
-                                "wrapper could call it\n", inputs[i].fused_name.c_str());
-                return false;
-            }
             std::vector<llvm::Value *> call_args;
             call_args.reserve(inputs[i].arity);
             for (unsigned j = 0 ; j < inputs[i].arity ; ++j)
@@ -1985,51 +1594,13 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             }
         }
 
-        /* Link the device runtime BEFORE the inlining fixpoint below.
-         *
-         * A kernel's compute loop does not live in the kernel: an `omp target
-         * teams distribute parallel for` reaches it through
-         * `__kmpc_parallel_XX(..., ptr @outlined, ...)`, handing the body to the
-         * runtime as a function POINTER. Nothing can follow that edge while the
-         * runtime is only a declaration, so without this the wrapper ends up
-         * containing no user loop at all -- and then neither the legality gate
-         * (which would have nothing to reason about) nor LoopFuse (which would
-         * have nothing to fuse) can do its job.
-         *
-         * Linking resolves it, and the resolution is the runtime's own: the
-         * DeviceRTL marks __kmpc_parallel_XX, __kmpc_parallel_spmd and
-         * invokeMicrotask `always_inline`, so the fixpoint below pulls the real
-         * dispatch in -- with its thread-count guard, its team-state updates and
-         * its barriers. Reproducing that by hand was the alternative, and getting
-         * any of it wrong is a silent miscompile.
-         *
-         * Only the referenced functions are materialized (lazy bitcode +
-         * LinkOnlyNeeded), and the `jit` pass links the same libraries again later,
-         * which is then largely a no-op.
-         *
-         * Best-effort: a chain whose runtime cannot be linked keeps its parallel
-         * regions opaque, and the gate refuses it. Not fused, never fused wrongly. */
-        {
-            const char * const * dlibs = progs[0]->source.content.llvmir.device_libs;
-            const size_t         nlibs = progs[0]->source.content.llvmir.device_libs_count;
-            for (size_t l = 0 ; l < nlibs ; ++l)
-            {
-                if (dlibs[l] == nullptr || dlibs[l][0] == 0)
-                    continue ;
-                std::string lerr;
-                if (!link_device_bitcode(*mod_u, dlibs[l], lerr))
-                    fprintf(stderr, "prog-fuse: %s; parallel regions stay opaque and "
-                                    "the chain will not be fused\n", lerr.c_str());
-            }
-        }
-
         /* Transitively force-inline the kernels' whole helper chain into the
          * wrapper (ptx_kernel entry -> *_debug__ -> *_omp_outlined -> ...). Only the
          * entry was inlined above; the __kmpc_target_init/deinit brackets and the
          * compute loops live in those (noinline/optnone) callees, so they must be
          * pulled in here for collapse_device_kernel_brackets + loop-fusion to see
-         * them. Since the device runtime was linked just above, this also pulls in
-         * the parallel-region dispatch and so the user loops themselves.
+         * them. In SPMD mode the parallel region is a direct call, so every level is
+         * inlinable; we stop at declarations (the __kmpc_* runtime) and intrinsics.
          * Iterate to a fixpoint, restarting the scan after each inline (which
          * invalidates iterators). */
         for (bool changed = true ; changed ; )
@@ -2042,53 +1613,13 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
                     auto * ci = llvm::dyn_cast<llvm::CallInst>(&I);
                     if (ci == nullptr)
                         continue;
-                    /* Deliberately NOT getCalledFunction(): it returns null when
-                     * the call's signature differs from the callee's
-                     * (llvm/IR/InstrTypes.h), and that is exactly the shape the
-                     * OpenMP runtime leaves behind. invokeMicrotask() invokes an
-                     * outlined region through a uniformly typed function pointer,
-                     * so the direct call it produces passes `ptr` in every slot
-                     * while the region declares the real parameter types. Asking
-                     * for the called operand sees the callee anyway, and the
-                     * mismatch is repaired below -- where getCalledFunction()
-                     * would simply hide the call and leave the compute loop
-                     * outside the wrapper. */
-                    llvm::Function * callee = llvm::dyn_cast<llvm::Function>(
-                        ci->getCalledOperand()->stripPointerCasts());
+                    llvm::Function * callee = ci->getCalledFunction();
                     if (callee == nullptr || callee == wrapper ||
                         callee->isDeclaration() || callee->isIntrinsic())
                         continue;
-                    /* Never inline the kernel brackets. They delimit the fused
-                     * bodies and are the structure collapse_device_kernel_brackets
-                     * rewrites -- and that its legality proof is expressed in --
-                     * so inlining them erases the thing we are about to reason
-                     * about, leaving nothing to match and refusing every chain.
-                     *
-                     * They only became inlinable when the device runtime was
-                     * linked above: until then they were declarations and the test
-                     * on the previous line skipped them. The single pair that
-                     * survives the collapse is inlined later by the jit pass, as
-                     * it always was. */
-                    if (is_device_kernel_bracket(callee->getName()))
-                        continue;
-                    /* The runtime invokes an outlined parallel region through a
-                     * uniformly-typed function pointer, so the direct call that
-                     * inlining it leaves behind does not match the callee's
-                     * signature and cannot itself be inlined. Repair the types
-                     * first (see retype_direct_call_to_callee). */
-                    llvm::CallInst * target = retype_direct_call_to_callee(ci, callee);
-                    if (target == nullptr)
-                        continue;   /* not a repairable mismatch; leave it alone */
-                    const bool retyped = (target != ci);
-
                     llvm::InlineFunctionInfo ifi;
-                    const bool inlined = llvm::InlineFunction(*target, ifi).isSuccess();
-                    if (retyped || inlined)
+                    if (llvm::InlineFunction(*ci, ifi).isSuccess())
                     {
-                        /* Retyping erased the old call, so the iterators are
-                         * invalid either way. A retype that did not lead to an
-                         * inline is not a loop: the call is well typed on the next
-                         * pass, so it is attempted once more and then left. */
                         changed = true;
                         break;   /* iterators invalidated -- rescan from the top */
                     }
@@ -2106,13 +1637,6 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             if (F && F->use_empty())
                 F->eraseFromParent();
         }
-
-        /* Dump the wrapper as the legality gate will see it -- BEFORE the collapse,
-         * so a refused chain leaves evidence too. `merged.ll` below is only written
-         * once the collapse has succeeded, which is exactly the case that needs no
-         * explaining. */
-        if (dump)
-            dump_module(dump_dir, "precollapse.ll", *mod_u);
 
         /* collapse the N target_init/deinit brackets into one (SPMD + same config;
          * aborts if that precondition does not hold). */
@@ -2696,6 +2220,13 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     }
     dst->blocks_per_sm = fused_blocks_per_sm;
     dst->dyn_shmem     = fused_dyn_shmem;
+    /* Carry the residency budget forward, and tell the runtime that this kernel
+     * now contains a grid-wide barrier: it must be launched so that every block
+     * runs at once (a cooperative launch, in CUDA), or the barrier never
+     * completes. The precondition was checked above; this is how the launcher
+     * learns it has to honour it. */
+    dst->max_coresident_blocks    = progs[0]->max_coresident_blocks;
+    dst->requires_coresident_grid = device;
 
     /* ------------------------------------------------------------------ *
      * 12. Release the consumed inputs' owned heap buffers.                 *

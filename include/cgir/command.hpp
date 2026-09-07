@@ -261,6 +261,26 @@ struct command_prog_t
      * suffices -- shared-memory capacity bounds residency, at the cost of the L1
      * it shares its budget with on most devices. */
     unsigned int dyn_shmem;
+
+    /* How many blocks of THIS program the device can run at the same time, i.e.
+     * (blocks resident per SM) x (number of SMs). Filled in by the runtime, which
+     * is the only party that knows the device; 0 means "not known".
+     *
+     * It is a precondition for fusing device programs. A fused program is a
+     * single launch, so the ordering its constituents used to get from the launch
+     * boundary has to come from a barrier inside the kernel instead -- and a
+     * grid-wide barrier only completes if every block is running, because a block
+     * that has not been scheduled never arrives at it. cgir therefore fuses
+     * device programs only when `grid` fits within this, and leaves them alone
+     * when it does not or when nobody said. */
+    unsigned int max_coresident_blocks;
+
+    /* Set by prog-fuse on a program it produced from several device programs: the
+     * kernel contains a grid-wide barrier, so every block must be resident for it
+     * to make progress. A CUDA driver must launch it cooperatively
+     * (cuLaunchCooperativeKernel), which is what makes that guarantee; launching
+     * it like an ordinary kernel risks a hang. */
+    bool requires_coresident_grid;
 };
 
 /* read/write files */
@@ -377,6 +397,11 @@ struct command_t
             prog.block.x = prog.block.y = prog.block.z = 0;
             prog.blocks_per_sm = 0;
             prog.dyn_shmem     = 0;
+            /* 0 = the runtime has not told us how many blocks fit at once, which
+             * makes device fusion unsafe; false = this program has no grid-wide
+             * barrier and needs no special launch. Both are the safe defaults. */
+            prog.max_coresident_blocks   = 0;
+            prog.requires_coresident_grid = false;
         }
     }
 };

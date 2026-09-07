@@ -35,12 +35,6 @@ make
 You may set the following environment variables
 - `CGIR_OPTIMIZER` as `mlir` or `pod` to switch the optimizer representation.
 - `CGIR_JIT_DUMP` to dump the LLVM IR before and after JIT passes.
-- `CGIR_PROG_FUSE_VERBOSE` set to any non-empty value other than `0` to report,
-  for each device chain the `prog-fuse` pass fuses, how many memory accesses the
-  legality analysis actually examined. A chain is only fused if removing the
-  device-wide barrier between its kernels provably preserves the program's
-  meaning; this says the proof looked at something, which an approval alone does
-  not.
 - `CGIR_PROG_FUSE_DUMP` to dump the LLVM IR of each prog-fusion for debugging:
   the input programs (`input-<i>.ll`), the merged module before optimization
   (`merged.ll`) and the fused/optimized result (`fused.ll`). Set it to any
