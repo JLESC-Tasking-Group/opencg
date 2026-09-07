@@ -917,6 +917,57 @@ dump_module(const std::string & dir, const char * name, llvm::Module & M)
  * SECTION 2 - the prog-fuse pass: merge a chain of programs into one.
  * ------------------------------------------------------------------------- */
 
+/* Diagnostics for a refused fusion. Guarded like everything else that needs the
+ * LLVM-only includes (<string> among them); without LLVM the pass refuses before
+ * it can reach them. */
+# if CGIR_SUPPORT_LLVM
+
+/* Names for the two enums a refusal needs to report. Local to the diagnostics:
+ * a wrong name here misreports, it does not misbehave. */
+static const char *
+launch_mode_name(command_prog_launch_mode_t m)
+{
+    switch (m)
+    {
+        case CGIR_COMMAND_PROG_LAUNCH_MODE_DIRECT:     return "DIRECT";
+        case CGIR_COMMAND_PROG_LAUNCH_MODE_TASK_SPAWN: return "TASK_SPAWN";
+    }
+    return "?";
+}
+
+static const char *
+prototype_name(command_prog_function_prototype_t p)
+{
+    switch (p)
+    {
+        case CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_FIXED:    return "FIXED";
+        case CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC: return "VARIADIC";
+        case CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_KMP:      return "KMP";
+        case CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED:   return "PACKED";
+        case CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_NANOS6:   return "NANOS6";
+    }
+    return "?";
+}
+
+/* What a program is, for a refusal message. Whether a chain that cannot be fused
+ * is a device kernel missing its launch geometry, or a host task body that was
+ * classified as a device program, is not something the reason alone can tell
+ * apart -- and they call for opposite fixes. */
+static std::string
+prog_describe(const command_prog_t * p)
+{
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "launch=%s prototype=%s grid=%ux%ux%u block=%ux%ux%u symbol='%s'",
+             launch_mode_name(p->launch_mode), prototype_name(p->prototype),
+             p->grid.x, p->grid.y, p->grid.z,
+             p->block.x, p->block.y, p->block.z,
+             p->source.content.llvmir.symbol ? p->source.content.llvmir.symbol : "");
+    return std::string(buf);
+}
+
+# endif /* CGIR_SUPPORT_LLVM */
+
 bool
 CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     command_prog_t ** progs,
@@ -931,6 +982,60 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     assert(n >= 2);
 
     scoped_phase_t _fuse_total("fuse-total");
+
+    /* Device (GPU) fusion: the chain's PROGs carry a device codegen target
+     * (triple/arch). Homogeneous by construction (a device kernel only chains with
+     * others on the same device via equal launch params). The fused entry is a
+     * single `ptx_kernel` (see below) compiled to PTX by the jit pass.
+     *
+     * Decided here, before a single module is parsed. Every condition below reads
+     * a plain field of `progs[]`, so refusing costs nothing at this point --
+     * whereas refusing after the parse throws away the parse, and a chain that
+     * cannot be fused is not rare enough for that to be free: on the applications
+     * we measure, every device chain is declined, and parsing them first cost
+     * 6--290 ms per run. */
+    const char * dev_triple = progs[0]->source.content.llvmir.triple;
+    const char * dev_arch   = progs[0]->source.content.llvmir.arch;
+    const bool   device     = (dev_triple != nullptr);
+    if (device)
+    {
+        for (size_t i = 0 ; i < n ; ++i)
+            if (progs[i]->source.content.llvmir.triple == nullptr)
+            {
+                fprintf(stderr, "prog-fuse: cannot mix device and host programs in one "
+                                "fused chain (program %zu)\n", i);
+                return false;
+            }
+
+        /* A fused device program is one launch, so the ordering its constituents
+         * used to get from the launch boundary must come from a grid-wide barrier
+         * inside the kernel. That barrier only completes if every block is
+         * resident: a block the hardware has not scheduled never arrives, and the
+         * ones that have spin forever. Establish it here, where refusing is free,
+         * rather than discovering it as a hang at replay. */
+        const uint64_t blocks = (uint64_t) progs[0]->grid.x
+                              * (uint64_t) progs[0]->grid.y
+                              * (uint64_t) progs[0]->grid.z;
+        const unsigned fit = progs[0]->max_coresident_blocks;
+        if (fit == 0)
+        {
+            fprintf(stderr, "prog-fuse: device chain of %zu kernels left unfused: the "
+                            "runtime did not report how many blocks fit on the device, "
+                            "so the grid-wide barrier a fused kernel needs cannot be "
+                            "shown to complete [%s]\n",
+                    n, prog_describe(progs[0]).c_str());
+            return false;
+        }
+        if (blocks > (uint64_t) fit)
+        {
+            fprintf(stderr, "prog-fuse: device chain of %zu kernels left unfused: its "
+                            "grid of %llu blocks exceeds the %u that fit on the device "
+                            "at once, so a grid-wide barrier would hang [%s]\n",
+                    n, (unsigned long long) blocks, fit,
+                    prog_describe(progs[0]).c_str());
+            return false;
+        }
+    }
 
     /* ------------------------------------------------------------------ *
      * 0. One-time LLVM global initialisation                             *
@@ -1238,51 +1343,6 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
                                 "task bodies in one fused chain (program %zu)\n", i);
                 return false;
             }
-
-    /* Device (GPU) fusion: the chain's PROGs carry a device codegen target
-     * (triple/arch). Homogeneous by construction (a device kernel only chains with
-     * others on the same device via equal launch params). The fused entry is a
-     * single `ptx_kernel` (see below) compiled to PTX by the jit pass. */
-    const char * dev_triple = progs[0]->source.content.llvmir.triple;
-    const char * dev_arch   = progs[0]->source.content.llvmir.arch;
-    const bool   device     = (dev_triple != nullptr);
-    if (device)
-    {
-        for (size_t i = 0 ; i < n ; ++i)
-            if (progs[i]->source.content.llvmir.triple == nullptr)
-            {
-                fprintf(stderr, "prog-fuse: cannot mix device and host programs in one "
-                                "fused chain (program %zu)\n", i);
-                return false;
-            }
-
-        /* A fused device program is one launch, so the ordering its constituents
-         * used to get from the launch boundary must come from a grid-wide barrier
-         * inside the kernel. That barrier only completes if every block is
-         * resident: a block the hardware has not scheduled never arrives, and the
-         * ones that have spin forever. Establish it here, where refusing is free,
-         * rather than discovering it as a hang at replay. */
-        const uint64_t blocks = (uint64_t) progs[0]->grid.x
-                              * (uint64_t) progs[0]->grid.y
-                              * (uint64_t) progs[0]->grid.z;
-        const unsigned fit = progs[0]->max_coresident_blocks;
-        if (fit == 0)
-        {
-            fprintf(stderr, "prog-fuse: device chain of %zu kernels left unfused: the "
-                            "runtime did not report how many blocks fit on the device, "
-                            "so the grid-wide barrier a fused kernel needs cannot be "
-                            "shown to complete\n", n);
-            return false;
-        }
-        if (blocks > (uint64_t) fit)
-        {
-            fprintf(stderr, "prog-fuse: device chain of %zu kernels left unfused: its "
-                            "grid of %llu blocks exceeds the %u that fit on the device "
-                            "at once, so a grid-wide barrier would hang\n",
-                    n, (unsigned long long) blocks, fit);
-            return false;
-        }
-    }
 
     std::vector<void *>                    unique_slots;
     std::vector<size_t>                    unique_slot_size; /* byte size per unique slot */
