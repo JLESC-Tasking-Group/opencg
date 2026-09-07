@@ -48,6 +48,7 @@
 # include <stdlib.h>
 # include <stdio.h>
 # include <string.h>
+# include <initializer_list>
 # include <string>
 
 # if NDEBUG
@@ -76,7 +77,7 @@
 static const char dscale_ir[] =
     DEVICE_PREAMBLE
     KERNEL_ENV("kenv_scale")
-    "define void @dscale(double %s, double* %y, i64 %n) {\n"
+    "define ptx_kernel void @dscale(double %s, double* %y, i64 %n) {\n"
     "entry:\n"
     "  %tid = call i32 @__kmpc_target_init(i8* bitcast (%struct.KernelEnv* @kenv_scale to i8*))\n"
     "  %spmd = icmp eq i32 %tid, -1\n"
@@ -103,7 +104,7 @@ static const char dscale_ir[] =
 static const char dshift_ir[] =
     DEVICE_PREAMBLE
     KERNEL_ENV("kenv_shift")
-    "define void @dshift(double* %y, double* %z, i64 %n) {\n"
+    "define ptx_kernel void @dshift(double* %y, double* %z, i64 %n) {\n"
     "entry:\n"
     "  %tid = call i32 @__kmpc_target_init(i8* bitcast (%struct.KernelEnv* @kenv_shift to i8*))\n"
     "  %spmd = icmp eq i32 %tid, -1\n"
@@ -132,7 +133,7 @@ static const char dsum_ir[] =
     DEVICE_PREAMBLE
     KERNEL_ENV("kenv_sum")
     "declare i32 @__kmpc_nvptx_parallel_reduce_nowait_v2(i8*, i32, i8*, i8*)\n"
-    "define void @dsum(double* %y, double* %acc, i64 %n) {\n"
+    "define ptx_kernel void @dsum(double* %y, double* %acc, i64 %n) {\n"
     "entry:\n"
     "  %tid = call i32 @__kmpc_target_init(i8* bitcast (%struct.KernelEnv* @kenv_sum to i8*))\n"
     "  %spmd = icmp eq i32 %tid, -1\n"
@@ -182,7 +183,7 @@ static const char dopaque_ir[] =
     "exit:\n"
     "  ret void\n"
     "}\n"
-    "define void @dopaque(double %s, double* %y, i64 %n) {\n"
+    "define ptx_kernel void @dopaque(double %s, double* %y, i64 %n) {\n"
     "entry:\n"
     "  %tid = call i32 @__kmpc_target_init(i8* bitcast (%struct.KernelEnv* @kenv_opaque to i8*))\n"
     "  %spmd = icmp eq i32 %tid, -1\n"
@@ -355,6 +356,19 @@ main(void)
         fprintf(stdout, "PASS: %s left unfused (%s)\n", what, expect);
     };
 
+    /* Same, when more than one diagnostic legitimately satisfies the case. */
+    auto check_any = [&] (const char * what, size_t nodes, const std::string & diag,
+                          std::initializer_list<const char *> expect)
+    {
+        for (const char * e : expect)
+            if (diag.find(e) != std::string::npos)
+            {
+                check(what, nodes, diag, e);
+                return;
+            }
+        check(what, nodes, diag, *expect.begin());   /* reports the mismatch */
+    };
+
     /* Case 1: a neighbour read. dshift's thread i reads y[i+1], which dscale's
      * thread i+1 wrote -- a cross-thread dependence that only the launch
      * boundary orders. */
@@ -388,8 +402,14 @@ main(void)
             dopaque_ir, sizeof(dopaque_ir), scale_args, 3,
             dscale_ir,  sizeof(dscale_ir),  scale_args, 3,
             "cg-prog-fuse-device-opaque.dot", diag);
-        check("a device chain with a hidden parallel region", nodes, diag,
-              "not visible here");
+        /* Two diagnostics satisfy this case, and both are the gate saying it
+         * cannot see: the call that hides the region ("not visible here"), or the
+         * consequence when that call is the only thing in the body ("no visible
+         * memory access"). Which one fires depends on what the device passes make
+         * of this synthetic kernel; the property under test is that a hidden
+         * region is never APPROVED. */
+        check_any("a device chain with a hidden parallel region", nodes, diag,
+                  { "not visible here", "no visible memory access" });
     }
 
     if (failures)

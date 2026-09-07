@@ -547,10 +547,13 @@ static bool
 is_benign_device_runtime_call(llvm::StringRef name)
 {
     return name.starts_with("llvm.nvvm.read.ptx.sreg.")   /* tid/ctaid/ntid/nctaid */
+        || name.starts_with("llvm.nvvm.barrier")          /* block synchronization */
+        || name.starts_with("__kmpc_barrier")
         || name == "__kmpc_get_hardware_thread_id_in_block"
         || name == "__kmpc_get_hardware_num_threads_in_block"
         || name == "__kmpc_get_warp_size"
         || name == "__kmpc_is_spmd_exec_mode"
+        || name == "__kmpc_global_thread_num"             /* returns the thread's id */
         || name == "__kmpc_target_init"
         || name == "__kmpc_target_deinit";
 }
@@ -674,6 +677,25 @@ device_chain_barrier_removable(llvm::Function & Forig, size_t n, std::string & w
             body_of[&I] = cur;
         }
 
+    /* What counts as USER data: memory reachable from one of the wrapper's
+     * pointer parameters, i.e. a buffer the recorded programs captured. That is
+     * the only memory a dependence between two program bodies can flow through.
+     *
+     * The distinction matters because the device runtime is inlined into these
+     * bodies (that is what makes their loops visible at all), and it manipulates
+     * its own team state with atomics and shared memory. Judging those as if they
+     * were user accesses would refuse every device chain; ignoring them is sound
+     * because no program body can observe them. */
+    llvm::DenseSet<const llvm::Value *> user_bases;
+    for (llvm::Argument & A : F.args())
+        if (A.getType()->isPointerTy())
+            user_bases.insert(&A);
+
+    auto is_user_memory = [&] (const llvm::Value * ptr) -> bool
+    {
+        return user_bases.count(llvm::getUnderlyingObject(ptr)) != 0;
+    };
+
     /* (a)+(b): scan for constructs that alone make the fusion unsound, and
      * collect the accesses the pairwise test needs. */
     std::vector<std::vector<device_access_t>> acc(n);
@@ -685,9 +707,18 @@ device_chain_barrier_removable(llvm::Function & Forig, size_t n, std::string & w
             if (b < 0 || (size_t) b >= n)
                 continue ;   /* wrapper prologue/epilogue, not a kernel body */
 
-            if (llvm::isa<llvm::AtomicRMWInst>(&I) || llvm::isa<llvm::AtomicCmpXchgInst>(&I))
+            /* An atomic on user data is a cross-thread write: its value is only
+             * settled once every thread has contributed, which is exactly what the
+             * barrier we are about to remove guarantees. On runtime state it is
+             * just the inlined device runtime doing its own bookkeeping. */
+            const llvm::Value * atomic_ptr = nullptr;
+            if (auto * RMW = llvm::dyn_cast<llvm::AtomicRMWInst>(&I))
+                atomic_ptr = RMW->getPointerOperand();
+            else if (auto * CX = llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&I))
+                atomic_ptr = CX->getPointerOperand();
+            if (atomic_ptr != nullptr && is_user_memory(atomic_ptr))
             {
-                why = "a body performs an atomic read-modify-write";
+                why = "a body performs an atomic read-modify-write on captured data";
                 return false;
             }
             /* A call whose memory effects we cannot see makes everything below
@@ -717,22 +748,34 @@ device_chain_barrier_removable(llvm::Function & Forig, size_t n, std::string & w
                            "values across threads").str();
                     return false;
                 }
-                /* Any callee that can touch memory hides accesses from `acc`,
+                /* A callee that can reach user data hides accesses from `acc`,
                  * whether or not it has a body here: a definition that survived
-                 * the inlining fixpoint above is just as opaque to a scan of this
-                 * function's instructions as a declaration is. Tolerated only if
-                 * it cannot touch memory, or if it is a known thread-local query
-                 * of the device runtime. */
+                 * the inlining fixpoint above is as opaque to a scan of this
+                 * function's instructions as a declaration is.
+                 *
+                 * "Can reach user data" is decided by its arguments: a call that
+                 * is handed none of the captured buffers cannot touch them. That
+                 * is what lets the inlined device runtime -- which calls into its
+                 * own state and synchronization helpers constantly -- through,
+                 * while still refusing anything that was given a user pointer and
+                 * whose body we cannot see. */
                 if (!CI->doesNotAccessMemory()
                     && !is_benign_device_runtime_call(cf->getName()))
                 {
-                    why = ("a body calls '" + cf->getName() + "', whose memory "
-                           "effects are not visible here").str();
-                    return false;
+                    for (const llvm::Use & u : CI->args())
+                        if (u->getType()->isPointerTy() && is_user_memory(u.get()))
+                        {
+                            why = ("a body calls '" + cf->getName() + "' on captured "
+                                   "data, and its memory effects are not visible "
+                                   "here").str();
+                            return false;
+                        }
                 }
-                /* A function pointer handed to a callee escapes analysis for the
-                 * same reason: the callee may run it, and we cannot see what it
-                 * does. This is exactly the __kmpc_parallel_XX shape. */
+                /* A function pointer handed to a callee escapes analysis whatever
+                 * its other arguments look like: the callee may run it, and we
+                 * cannot see what it does. This is exactly the __kmpc_parallel_XX
+                 * shape -- the reason the device runtime has to be linked before
+                 * this analysis runs, so the region is inlined rather than passed. */
                 for (const llvm::Use & u : CI->args())
                     if (llvm::isa<llvm::Function>(u->stripPointerCasts()))
                     {
@@ -755,12 +798,17 @@ device_chain_barrier_removable(llvm::Function & Forig, size_t n, std::string & w
             else
                 continue ;
 
-            const llvm::Value * obj = llvm::getUnderlyingObject(ptr);
-            if (llvm::isa<llvm::AllocaInst>(obj))
-                continue ;                       /* thread-private */
+            /* Only captured buffers can carry a dependence between two program
+             * bodies. Everything else -- thread-private allocas, the inlined
+             * runtime's team state, its shared-memory scratch -- is invisible to
+             * the programs and cannot order them. */
+            if (!is_user_memory(ptr))
+                continue ;
             if (ptr->getType()->getPointerAddressSpace() == 3)
             {
-                why = "a body uses block-shared memory (addrspace 3)";
+                /* A captured buffer reached through shared memory: its contents do
+                 * not survive the launch we are about to merge away. */
+                why = "a body reaches captured data through block-shared memory";
                 return false;
             }
 
@@ -952,6 +1000,11 @@ static void dump_module(const std::string & dir, const char * name, llvm::Module
  * inputs FIRST -- see the call site for why the ordering matters). */
 static void spmdize_device_module(llvm::Module & M, llvm::TargetMachine * tm);
 static std::string device_features_of(const llvm::Module & M);
+
+/* Link a device bitcode library into `M`, materializing only what is referenced
+ * (defined in SECTION 3; forward-declared so the fuse pass can resolve the
+ * parallel-region runtime before it inlines -- see the call site). */
+static bool link_device_bitcode(llvm::Module & M, const char * bc_path, std::string & err);
 
 /* Run an O3 module pipeline (inlining + loop-fuse + vectorization) on the
  * merged module, so the inlined kernels' loops can vectorize/fuse. `dump_dir` is
@@ -1845,6 +1898,44 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             {
                 fprintf(stderr, "prog-fuse: failed to inline a device kernel\n");
                 return false;
+            }
+        }
+
+        /* Link the device runtime BEFORE the inlining fixpoint below.
+         *
+         * A kernel's compute loop does not live in the kernel: an `omp target
+         * teams distribute parallel for` reaches it through
+         * `__kmpc_parallel_XX(..., ptr @outlined, ...)`, handing the body to the
+         * runtime as a function POINTER. Nothing can follow that edge while the
+         * runtime is only a declaration, so without this the wrapper ends up
+         * containing no user loop at all -- and then neither the legality gate
+         * (which would have nothing to reason about) nor LoopFuse (which would
+         * have nothing to fuse) can do its job.
+         *
+         * Linking resolves it, and the resolution is the runtime's own: the
+         * DeviceRTL marks __kmpc_parallel_XX, __kmpc_parallel_spmd and
+         * invokeMicrotask `always_inline`, so the fixpoint below pulls the real
+         * dispatch in -- with its thread-count guard, its team-state updates and
+         * its barriers. Reproducing that by hand was the alternative, and getting
+         * any of it wrong is a silent miscompile.
+         *
+         * Only the referenced functions are materialized (lazy bitcode +
+         * LinkOnlyNeeded), and the `jit` pass links the same libraries again later,
+         * which is then largely a no-op.
+         *
+         * Best-effort: a chain whose runtime cannot be linked keeps its parallel
+         * regions opaque, and the gate refuses it. Not fused, never fused wrongly. */
+        {
+            const char * const * dlibs = progs[0]->source.content.llvmir.device_libs;
+            const size_t         nlibs = progs[0]->source.content.llvmir.device_libs_count;
+            for (size_t l = 0 ; l < nlibs ; ++l)
+            {
+                if (dlibs[l] == nullptr || dlibs[l][0] == 0)
+                    continue ;
+                std::string lerr;
+                if (!link_device_bitcode(*mod_u, dlibs[l], lerr))
+                    fprintf(stderr, "prog-fuse: %s; parallel regions stay opaque and "
+                                    "the chain will not be fused\n", lerr.c_str());
             }
         }
 
