@@ -2,7 +2,7 @@
 
 # CGIR - Open Command Graphs
 
-CGIR is a library that defines **commands graph** (**CG**) - a **Vendor-agnostic** and **Multi-devices** Intermediate Representation (IR) for programming [**Command Processor**](https://rocm.docs.amd.com/projects/rocprofiler-compute/en/latest/conceptual/command-processor.html
+CGIR is a library that defines **commands graph** (**CG**) - a **Vendor-agnostic**, **Multi-devices** and **General** Intermediate Representation (IR) for programming [**Command Processor**](https://rocm.docs.amd.com/projects/rocprofiler-compute/en/latest/conceptual/command-processor.html
 ) available on modern GPUs. CGIR provides **Optimization passes** of its IR.
 
 In a command graph
