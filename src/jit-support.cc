@@ -310,6 +310,22 @@ device_lto_pipeline(void)
     return value;
 }
 
+/* `CGIR_JIT_DEVICE_MINCTASM` -- see the use site in command_graph_jit_llvmir. On
+ * by default: the assembler's own guess is that every kernel wants full
+ * occupancy, and for a bandwidth-bound kernel that guess costs registers it
+ * would rather have spent on memory-level parallelism. `=0` restores the
+ * assembler's default. Folded into the JIT cache key: it changes the emitted
+ * code. */
+static bool
+device_declare_min_ctas_per_sm(void)
+{
+    static const bool value = [] {
+        const char * e = getenv("CGIR_JIT_DEVICE_MINCTASM");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    return value;
+}
+
 /* ---------------------------------------------------------------------------
  * Content hashing, toolchain salts and the two-level JIT result cache
  * (in-process + optional on-disk).
@@ -353,9 +369,10 @@ jit_static_salt(void)
             &CGIR_JIT_CACHE_FORMAT, sizeof(CGIR_JIT_CACHE_FORMAT));
         /* codegen-affecting knobs must be part of the key, or the on-disk cache
          * would hand back PTX built under a different assumption */
-        const char knobs[2] = {
-            (char) (device_assume_noalias_params() ? 1 : 0),
-            (char) (device_lto_pipeline()          ? 1 : 0),
+        const char knobs[3] = {
+            (char) (device_assume_noalias_params()   ? 1 : 0),
+            (char) (device_lto_pipeline()            ? 1 : 0),
+            (char) (device_declare_min_ctas_per_sm() ? 1 : 0),
         };
         return jit_fnv1a_seed(h, knobs, sizeof(knobs));
     }();
@@ -430,7 +447,7 @@ jit_cache_key(const command_prog_t * prog)
     for (size_t i = 0 ; L.externs && i < L.externs_count ; ++i)
         if (L.externs[i].name)
             h = jit_fnv1a_seed(h, L.externs[i].name, strlen(L.externs[i].name) + 1);
-    if (L.triple)   // device: fold device-lib identity + static salt
+    if (L.triple)   // device: fold device-lib identity + occupancy target + salt
     {
         for (size_t i = 0 ; L.device_libs && i < L.device_libs_count ; ++i)
             if (L.device_libs[i] && L.device_libs[i][0])
@@ -438,6 +455,15 @@ jit_cache_key(const command_prog_t * prog)
                 const uint64_t d = jit_device_lib_salt(L.device_libs[i]);
                 h = jit_fnv1a_seed(h, &d, sizeof(d));
             }
+        /* When the occupancy target is declared to the assembler (as
+         * `.minnctapersm`, see command_graph_jit_llvmir) it sizes the register
+         * budget, so it is part of the emitted PTX and not merely of how that
+         * PTX is launched: two instances of the same construct recorded at
+         * different occupancies are different artifacts and must not share an
+         * entry. Left out of the key when the declaration is off, so that
+         * disabling it also restores the coarser (and more sharing) key. */
+        if (device_declare_min_ctas_per_sm())
+            h = jit_fnv1a_seed(h, &prog->blocks_per_sm, sizeof(prog->blocks_per_sm));
         const uint64_t s = jit_static_salt();
         h = jit_fnv1a_seed(h, &s, sizeof(s));
     }
@@ -629,6 +655,12 @@ bool
 CGIR_NAMESPACE::jit::device_lto_pipeline(void)
 {
     return ::device_lto_pipeline();
+}
+
+bool
+CGIR_NAMESPACE::jit::device_declare_min_ctas_per_sm(void)
+{
+    return ::device_declare_min_ctas_per_sm();
 }
 
 bool

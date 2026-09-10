@@ -251,8 +251,22 @@ struct command_prog_t
      * work, because other blocks (of the same program or of a concurrent one)
      * simply take the freed slots.
      *
-     * A driver consumes this at first launch; it may clear or overwrite the field
-     * afterwards (it is a request, not a durable record). */
+     * Two consumers, in this order:
+     *
+     *   - the `jit` pass, at codegen time, which declares it to the device
+     *     assembler (NVPTX: `.minnctapersm`). This is the one that matters: an
+     *     assembler given no occupancy target assumes the kernel wants full
+     *     occupancy and sizes the register budget for it, which for a
+     *     bandwidth-bound kernel spends registers on warps it cannot use. Told
+     *     the real target, it emits code that is *already* limited to it, and
+     *     keeps the registers. Hence the requirement that a producer fill this
+     *     in before command_graph_t::optimize, not merely before the launch.
+     *
+     *   - the driver, at first launch, as a backstop for whatever the assembler
+     *     did anyway -- and for programs whose code the JIT never saw.
+     *
+     * A driver may clear or overwrite the field once consumed (it is a request,
+     * not a durable record). */
     unsigned int blocks_per_sm;
 
     /* Dynamic (per-block) shared memory to reserve at launch, in bytes. 0 = none.

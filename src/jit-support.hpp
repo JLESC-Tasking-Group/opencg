@@ -80,6 +80,12 @@ bool device_assume_noalias_params(void);
  * folded into the cache key, since it changes the code. */
 bool device_lto_pipeline(void);
 
+/* `CGIR_JIT_DEVICE_MINCTASM`: declare the program's recorded occupancy to the
+ * PTX assembler as `.minnctapersm`, so it stops assuming the kernel wants full
+ * occupancy and sizes the register budget accordingly. Default on; `=0` opts
+ * out. Read once; folded into the cache key, since it changes the code. */
+bool device_declare_min_ctas_per_sm(void);
+
 /* ---------------------------------------------------------------------------
  * Opt-in profiling. Off (and near-free) unless enabled via env, read once at
  * first use:

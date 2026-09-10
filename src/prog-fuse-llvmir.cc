@@ -74,6 +74,7 @@
 # include <llvm/ADT/DenseMap.h>
 # include <llvm/ADT/DenseSet.h>
 # include <llvm/ADT/PostOrderIterator.h>
+# include <llvm/ADT/StringExtras.h>    /* utostr, for the .minnctapersm attribute */
 # include <llvm/Analysis/AliasAnalysis.h>
 # include <llvm/Analysis/InlineCost.h>
 # include <llvm/Analysis/MemoryLocation.h>
@@ -2523,20 +2524,22 @@ optimize_device_module_prelink(llvm::Module & M, llvm::TargetMachine * tm)
  *   LTO (default) -- buildLTODefaultPipeline(O3), what clang-nvlink-wrapper runs
  *     at the device link under -foffload-lto (via LTOBackend). Passing a null
  *     ExportSummary is the regular-LTO, no-index configuration, the same one
- *     `opt -passes='lto<O3>'` uses. Two things make it the pipeline to imitate:
- *     it runs OpenMPOpt in the FullLTOPostLink phase, which is the only phase
- *     where the runtime-symbol cleanup happens and where OpenMPOpt is honest
- *     about which runtime functions actually exist; and it re-runs the inliner,
- *     unroller and vectorizers over already-simplified code, which is where the
- *     ahead-of-time kernel gets the register pressure that holds it to its
- *     intended occupancy. A single per-module O3 over a never-simplified
- *     frontend snapshot does not reach the same fixed point.
+ *     `opt -passes='lto<O3>'` uses. What it adds over a per-module pipeline is
+ *     OpenMPOpt in the FullLTOPostLink phase -- the only phase that runs the
+ *     runtime-symbol cleanup and the only one in which OpenMPOpt is honest about
+ *     which runtime functions actually exist -- plus the LTO-specific IPO
+ *     ordering.
  *
- *   legacy -- buildPerModuleDefaultPipeline(O3).
+ *   legacy -- buildPerModuleDefaultPipeline(O3), which is also what LLVM's own
+ *     offload JIT runs (offload/plugins-nextgen/common/src/JIT.cpp).
  *
- * The LTO shape roughly doubles device JIT time (measure with CGIR_JIT_TIMING=1:
- * the cost lands in the dev-spmdize and dev-o3 buckets). The two-level result
- * cache absorbs that after the first run. */
+ * On Krylov CG the two shapes emit code of indistinguishable quality: the gap
+ * against the ahead-of-time kernel was never in the IR, it was the register
+ * budget ptxas picks (see the .minnctapersm declaration in
+ * command_graph_jit_llvmir). The LTO shape is the default for fidelity, and
+ * because it is cheaper: simplifying before the link costs less in the pre-link
+ * stage than it saves in the post-link one (measure with CGIR_JIT_TIMING=1 --
+ * the two stages are the dev-spmdize and dev-o3 buckets). */
 static void
 optimize_device_module_postlink(llvm::Module & M, llvm::TargetMachine * tm)
 {
@@ -3022,6 +3025,49 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
             if (marked && dump)
                 fprintf(stderr, "jit(device): assuming %u pointer parameters of `%s` do not alias\n",
                         marked, entry->getName().str().c_str());
+        }
+
+        /* Tell the PTX assembler how densely this kernel is actually going to be
+         * co-scheduled, so it stops guessing.
+         *
+         * ptxas sizes the register budget from an occupancy target, and with only
+         * `.maxntid` to go on its target is full occupancy -- so for a 512-thread
+         * kernel on a 2048-thread SM it aims at 4 blocks and hands out exactly
+         * 65536/2048 = 32 registers per thread. That is the right trade for a
+         * latency-bound kernel and the wrong one for a bandwidth-bound kernel,
+         * which cannot use the extra warps and would rather have the registers
+         * for memory-level parallelism. The ahead-of-time toolchain never has to
+         * make the guess: it assembles relocatable (`ptxas -c`, forced by
+         * -fopenmp-relocatable-target), and a relocatable unit has no launch
+         * configuration to optimize against, so the allocator runs unconstrained.
+         * Measured on Krylov CG's SpMV, on identical PTX: 32 registers
+         * whole-program, 50 relocatable, and the 18-register difference is a 16%
+         * kernel-time difference at the same achieved occupancy.
+         *
+         * A JIT does not have to guess either, and does not have to arrive at the
+         * answer by accident: `blocks_per_sm` is the occupancy the runtime
+         * measured on this very program (see command_prog_t::blocks_per_sm), so
+         * declare it. `.minnctapersm N` raises the budget to 65536/(N*threads),
+         * which the allocator then uses or not as it sees fit -- on the same SpMV
+         * it lands on 50 with no spills, i.e. exactly the relocatable result.
+         *
+         * Declaring it is also what makes the driver-side occupancy guard a
+         * no-op rather than a repair: the kernel comes out register-limited to
+         * the recorded occupancy on its own, so nothing has to be clawed back
+         * afterwards with a shared-memory carveout or ballast.
+         *
+         * Zero means the runtime could not measure it -- leave ptxas alone. Note
+         * the value is an occupancy *floor*: too large a value tightens the
+         * budget instead of relaxing it and can force spills, so a runtime that
+         * cannot bound it against the device's threads-per-SM should pass 0 or
+         * turn this off. */
+        if (device_declare_min_ctas_per_sm() && prog->blocks_per_sm > 0 &&
+            !entry->hasFnAttribute("nvvm.minctasm"))
+        {
+            entry->addFnAttr("nvvm.minctasm", llvm::utostr(prog->blocks_per_sm));
+            if (dump)
+                fprintf(stderr, "jit(device): `%s` declared at %u blocks/SM (.minnctapersm)\n",
+                        entry->getName().str().c_str(), prog->blocks_per_sm);
         }
 
         const char * dtriple = prog->source.content.llvmir.triple;

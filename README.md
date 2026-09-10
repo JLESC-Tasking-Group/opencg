@@ -77,17 +77,35 @@ LLVM IR to a host function or device PTX):
   runtime that knows which buffers a task touches can. Off by default: it is an
   assumption about the program, not a deduction. (`prog-fuse` already makes the
   same assumption for the pointers it captures into a fused wrapper.)
+- `CGIR_JIT_DEVICE_MINCTASM` set to `0` stops the device JIT from declaring a
+  program's recorded occupancy (`command_prog_t::blocks_per_sm`) to the PTX
+  assembler as `.minnctapersm`. **On by default.** ptxas sizes the register
+  budget from an occupancy target, and given only `.maxntid` it assumes full
+  occupancy — for a 512-thread kernel on a 2048-thread SM that means aiming at 4
+  blocks and handing out exactly 65536/2048 = 32 registers per thread. A
+  bandwidth-bound kernel cannot use the extra warps and would rather have the
+  registers. The ahead-of-time toolchain sidesteps the guess by accident, since
+  it assembles relocatable (`ptxas -c`) and a relocatable unit has no launch
+  configuration to target; a JIT sidesteps it on purpose, because the runtime
+  measured the occupancy. On Krylov CG (GH200, n=196), identical PTX assembles
+  to 32 registers whole-program and 50 with either `-c` or `.minnctapersm 2`,
+  and those 18 registers are worth 16% of kernel time (1102 us vs 950 us) at the
+  same achieved occupancy. Declaring it also makes the driver-side occupancy
+  guard a no-op instead of a repair. The value is an occupancy *floor*: too
+  large a value tightens the budget rather than relaxing it and can force
+  spills, so a runtime that cannot bound it against the device's
+  threads-per-SM should record 0 or set this to `0`.
 - `CGIR_JIT_DEVICE_LTO` set to `0` makes the device JIT run a single per-module
   O3 after linking the DeviceRTL, instead of the two-phase pipeline clang uses
-  under `-foffload-lto`. **On by default**, because that flag is what the
-  ahead-of-time baseline is built with and a single pipeline does not reach the
-  same fixed point: on Krylov CG (GH200, n=196) the ahead-of-time `task_spmv`
-  comes out at 50 registers and is register-limited to 2 blocks/SM, while the
-  single-pipeline JIT settles at 32 registers, which buys occupancy the kernel
-  cannot use (it is bandwidth-bound) and costs memory-level parallelism —
-  950 us vs 1102 us for the same instruction count at the same achieved
-  occupancy. The two-phase shape roughly doubles device JIT time; the result
-  cache absorbs that after the first run.
+  under `-foffload-lto` (pre-link O3, link, post-link `lto<O3>`). **On by
+  default**, but for fidelity and compile time rather than for speed: measured
+  on Krylov CG (GH200, n=196) it is **neutral on kernel time** — it does not
+  change the register allocation, which is what that gap turned out to be about
+  (see `CGIR_JIT_DEVICE_MINCTASM`) — while being ~14% *cheaper* to JIT (0.55 s
+  vs 0.65 s for 12 programs), because simplifying before the DeviceRTL link
+  makes the post-link pipeline cheaper than the extra pre-link pass costs. It is
+  on because matching the toolchain the ahead-of-time baseline is built with is
+  the right default when no difference is measurable.
 - `CGIR_JIT_AOT_DEVICE` set to `0` makes the `jit` pass leave alone any device
   program that still carries its ahead-of-time compiled kernel, i.e. recompile
   only what `prog-fuse` synthesized. **On by default** — recompiling is safe and
