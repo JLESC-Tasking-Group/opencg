@@ -2483,36 +2483,72 @@ run_module_passes(llvm::Module & M, llvm::TargetMachine * tm, BuildFn && body)
  * link the device libraries, optimize, emit PTX.
  * ------------------------------------------------------------------------- */
 
-/* Pre-link SPMD-ization of the raw generic-mode device snapshot. Runs OpenMPOpt
- * in a NON-post-link phase, BEFORE linking the DeviceRTL: SPMD-ization needs the
- * SPMD runtime (__kmpc_get_hardware_thread_id_in_block, __kmpc_barrier_simple_spmd)
- * "available", which post-link means already defined -- but the generic snapshot
- * does not reference them yet. Non-post-link assumes they are linked later, so
- * OpenMPOpt SPMD-izes and emits the SPMD calls that the following LinkOnlyNeeded
- * then resolves. */
+/* Pre-link stage, run on the raw generic-mode snapshot BEFORE the DeviceRTL is
+ * linked in. Two shapes, selected by CGIR_JIT_DEVICE_LTO:
+ *
+ *   LTO (default) -- buildLTOPreLinkDefaultPipeline(O3), the very pipeline clang
+ *     runs on a device translation unit under -foffload-lto. OpenMPOpt is inside
+ *     it (buildModuleSimplificationPipeline), placed after the early
+ *     SROA/EarlyCSE/SimplifyCFG cleanup, so it SPMD-izes from SSA values instead
+ *     of from the frontend's allocas.
+ *
+ *   legacy -- OpenMPOpt alone, leaving all optimization to the post-link stage.
+ *
+ * Both must be a NON-post-link phase and both must precede the link, for the
+ * same reason: SPMD-ization needs the SPMD runtime
+ * (__kmpc_get_hardware_thread_id_in_block, __kmpc_barrier_simple_spmd) to be
+ * "available", and post-link that means already defined -- which the generic
+ * snapshot cannot arrange, since it does not reference them yet and a
+ * LinkOnlyNeeded link therefore would not import them. A non-post-link phase
+ * instead assumes they arrive later, which is exactly what happens: OpenMPOpt
+ * emits the SPMD calls and the following link resolves them. FullLTOPreLink is
+ * non-post-link (OpenMPOpt treats only FullLTOPostLink and the ThinLTO phases as
+ * post-link), so the LTO shape keeps that property. */
 static void
-spmdize_device_module(llvm::Module & M, llvm::TargetMachine * tm)
+optimize_device_module_prelink(llvm::Module & M, llvm::TargetMachine * tm)
 {
     prepare_device_module_for_openmp(M);
-    run_module_passes(M, tm, [] (llvm::PassBuilder &, llvm::ModulePassManager & MPM) {
-        MPM.addPass(llvm::OpenMPOptPass(llvm::ThinOrFullLTOPhase::None));
+    run_module_passes(M, tm, [] (llvm::PassBuilder & PB, llvm::ModulePassManager & MPM) {
+        if (device_lto_pipeline())
+            MPM.addPass(PB.buildLTOPreLinkDefaultPipeline(llvm::OptimizationLevel::O3));
+        else
+            MPM.addPass(llvm::OpenMPOptPass(llvm::ThinOrFullLTOPhase::None));
     });
 }
 
-/* Post-link finalize: O3 inlines the just-linked DeviceRTL, folds the (now
- * constant) kernel-environment config, DCEs the dead runtime and vectorizes.
- * Must run AFTER the DeviceRTL is linked into `M`. */
+/* Post-link finalize, run AFTER the DeviceRTL is linked into `M`: inline the
+ * just-linked runtime, fold the (now constant) kernel-environment config, DCE
+ * what is left and vectorize. Two shapes, selected by CGIR_JIT_DEVICE_LTO:
+ *
+ *   LTO (default) -- buildLTODefaultPipeline(O3), what clang-nvlink-wrapper runs
+ *     at the device link under -foffload-lto (via LTOBackend). Passing a null
+ *     ExportSummary is the regular-LTO, no-index configuration, the same one
+ *     `opt -passes='lto<O3>'` uses. Two things make it the pipeline to imitate:
+ *     it runs OpenMPOpt in the FullLTOPostLink phase, which is the only phase
+ *     where the runtime-symbol cleanup happens and where OpenMPOpt is honest
+ *     about which runtime functions actually exist; and it re-runs the inliner,
+ *     unroller and vectorizers over already-simplified code, which is where the
+ *     ahead-of-time kernel gets the register pressure that holds it to its
+ *     intended occupancy. A single per-module O3 over a never-simplified
+ *     frontend snapshot does not reach the same fixed point.
+ *
+ *   legacy -- buildPerModuleDefaultPipeline(O3).
+ *
+ * The LTO shape roughly doubles device JIT time (measure with CGIR_JIT_TIMING=1:
+ * the cost lands in the dev-spmdize and dev-o3 buckets). The two-level result
+ * cache absorbs that after the first run. */
 static void
-optimize_device_module_o3(llvm::Module & M, llvm::TargetMachine * tm)
+optimize_device_module_postlink(llvm::Module & M, llvm::TargetMachine * tm)
 {
     prepare_device_module_for_openmp(M);   // idempotent; robust to link side-effects
 
-    /* LTO-style internalization (matches the offload backend): the DeviceRTL is
-     * linked weak/hidden, so its config globals (@__omp_rtl_debug_kind = 0, ...)
-     * are not constant-foldable and its unused functions are not DCE-able.
-     * Internalizing everything but the kernel entries makes them 'internal', so
-     * O3 folds the debug/assert machinery away and globalDCE drops the dead
-     * runtime. llvm.used members are auto-preserved. */
+    /* LTO-style internalization (matches the offload backend, which derives it
+     * from the linker's symbol resolutions): the DeviceRTL is linked weak/hidden,
+     * so its config globals (@__omp_rtl_debug_kind = 0, ...) are not
+     * constant-foldable and its unused functions are not DCE-able. Internalizing
+     * everything but the kernel entries makes them 'internal', so O3 folds the
+     * debug/assert machinery away and globalDCE drops the dead runtime.
+     * llvm.used members are auto-preserved. */
     llvm::internalizeModule(M, [] (const llvm::GlobalValue & GV) -> bool {
         // keep kernel entries external (resolved by name via cuModuleGetFunction)
         if (const auto * F = llvm::dyn_cast<llvm::Function>(&GV))
@@ -2521,7 +2557,39 @@ optimize_device_module_o3(llvm::Module & M, llvm::TargetMachine * tm)
     });
 
     run_module_passes(M, tm, [] (llvm::PassBuilder & PB, llvm::ModulePassManager & MPM) {
-        MPM.addPass(PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3));
+        if (!device_lto_pipeline())
+        {
+            MPM.addPass(PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3));
+            return ;
+        }
+
+        /* The device libraries arrive BETWEEN the two stages, and libdevice's
+         * math functions are still guarded by __nvvm_reflect (FTZ and friends)
+         * while the DeviceRTL reads thread/block indices whose ranges are only
+         * known from the kernel's launch bounds. The ahead-of-time compiler
+         * never faces this: clang links both bitcode libraries at cc1 time, so
+         * the pipeline-start extension point of its pre-link pipeline -- which
+         * is where the NVPTX target installs nvvm-reflect and nvvm-intr-range --
+         * already sees them. Here the only pipeline running after the link is
+         * the LTO one, and an LTO pipeline invokes the FullLinkTimeOptimization
+         * extension points, not PipelineStart. Reproduce it by name (the NVPTX
+         * TargetMachine registers both in NVPTXPassRegistry.def, hooked up by
+         * the PassBuilder constructor) so the post-link O3 optimizes resolved
+         * code instead of carrying both sides of a branch it cannot fold.
+         *
+         * Parsed into a scratch manager and only adopted on success: a target
+         * without these passes is not an error, it just has nothing to do. The
+         * single-pipeline branch above needs none of this -- a per-module
+         * pipeline does invoke PipelineStart, so it picks them up on its own. */
+        llvm::ModulePassManager pre;
+        if (llvm::Error err = PB.parsePassPipeline(
+                pre, "nvvm-reflect,function(nvvm-intr-range)"))
+            llvm::consumeError(std::move(err));
+        else
+            MPM.addPass(std::move(pre));
+
+        MPM.addPass(PB.buildLTODefaultPipeline(llvm::OptimizationLevel::O3,
+                                               /* ExportSummary */ nullptr));
     });
 }
 
@@ -2563,7 +2631,8 @@ stamp_host_target_attrs(llvm::Module & M)
 }
 
 /* Optimize a JIT'd host task module before codegen (host analogue of
- * optimize_device_module_o3): O3 optimizes the pre-optimization frontend snapshot.
+ * optimize_device_module_postlink): O3 optimizes the pre-optimization frontend
+ * snapshot -- there is no link stage here, so the pipeline stays single-phase.
  * Also promote available_externally definitions (inline callees the closure keeps
  * only for inlining, e.g. a `declare target` SQRT) to internal, so codegen emits
  * them instead of dropping them into unresolvable externals. Externalized globals
@@ -2648,11 +2717,15 @@ emit_device_ptx(llvm::Module & M, const char * triple, const char * arch,
 
     scoped_phase_t _emit("dev-emit-total");
 
-    /* 1. Pre-link: SPMD-ize the generic-mode snapshot (must precede the link). */
+    /* 1. Pre-link: SPMD-ize (and, under CGIR_JIT_DEVICE_LTO, optimize) the
+     * generic-mode snapshot. Must precede the link -- see the function. */
     {
         scoped_phase_t _p("dev-spmdize");
-        spmdize_device_module(M, TM.get());
+        optimize_device_module_prelink(M, TM.get());
     }
+
+    if (!dump_dir.empty())
+        dump_module(dump_dir, "prelinked.ll", M);
 
     /* 2. Link the device bitcode libraries the kernel references (in order, so a
      * later library can resolve externs of an earlier one), so ptxas can JIT the
@@ -2667,7 +2740,7 @@ emit_device_ptx(llvm::Module & M, const char * triple, const char * arch,
     /* 3. Post-link: O3 to AOT quality (inline runtime, fold config, DCE, vectorize). */
     {
         scoped_phase_t _p("dev-o3");
-        optimize_device_module_o3(M, TM.get());
+        optimize_device_module_postlink(M, TM.get());
     }
 
     if (!dump_dir.empty())

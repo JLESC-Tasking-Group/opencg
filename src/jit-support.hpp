@@ -74,6 +74,12 @@ const char * env_str(const char * var, const char * dflt);
  * overlap. Read once; folded into the cache key, since it changes the code. */
 bool device_assume_noalias_params(void);
 
+/* `CGIR_JIT_DEVICE_LTO`: run the device snapshot through the two-phase pipeline
+ * clang uses under -foffload-lto (pre-link O3, link, post-link LTO O3) instead
+ * of a single post-link per-module O3. Default on; `=0` opts out. Read once;
+ * folded into the cache key, since it changes the code. */
+bool device_lto_pipeline(void);
+
 /* ---------------------------------------------------------------------------
  * Opt-in profiling. Off (and near-free) unless enabled via env, read once at
  * first use:

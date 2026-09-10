@@ -294,6 +294,22 @@ device_assume_noalias_params(void)
     return value;
 }
 
+/* `CGIR_JIT_DEVICE_LTO` -- see optimize_device_module_prelink/_postlink. On by
+ * default because the ahead-of-time toolchain it is imitating is the one the
+ * apps are built with; `=0` restores the single-pipeline shape. Opting out is
+ * spelled as an explicit "0" rather than "unset" so that the default survives a
+ * caller that scrubs the environment. Folded into the JIT cache key: it changes
+ * the emitted code, so artifacts built each way must not be interchanged. */
+static bool
+device_lto_pipeline(void)
+{
+    static const bool value = [] {
+        const char * e = getenv("CGIR_JIT_DEVICE_LTO");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    return value;
+}
+
 /* ---------------------------------------------------------------------------
  * Content hashing, toolchain salts and the two-level JIT result cache
  * (in-process + optional on-disk).
@@ -337,8 +353,11 @@ jit_static_salt(void)
             &CGIR_JIT_CACHE_FORMAT, sizeof(CGIR_JIT_CACHE_FORMAT));
         /* codegen-affecting knobs must be part of the key, or the on-disk cache
          * would hand back PTX built under a different assumption */
-        const char noalias = device_assume_noalias_params() ? 1 : 0;
-        return jit_fnv1a_seed(h, &noalias, sizeof(noalias));
+        const char knobs[2] = {
+            (char) (device_assume_noalias_params() ? 1 : 0),
+            (char) (device_lto_pipeline()          ? 1 : 0),
+        };
+        return jit_fnv1a_seed(h, knobs, sizeof(knobs));
     }();
     return s;
 }
@@ -604,6 +623,12 @@ bool
 CGIR_NAMESPACE::jit::device_assume_noalias_params(void)
 {
     return ::device_assume_noalias_params();
+}
+
+bool
+CGIR_NAMESPACE::jit::device_lto_pipeline(void)
+{
+    return ::device_lto_pipeline();
 }
 
 bool

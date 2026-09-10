@@ -77,6 +77,17 @@ LLVM IR to a host function or device PTX):
   runtime that knows which buffers a task touches can. Off by default: it is an
   assumption about the program, not a deduction. (`prog-fuse` already makes the
   same assumption for the pointers it captures into a fused wrapper.)
+- `CGIR_JIT_DEVICE_LTO` set to `0` makes the device JIT run a single per-module
+  O3 after linking the DeviceRTL, instead of the two-phase pipeline clang uses
+  under `-foffload-lto`. **On by default**, because that flag is what the
+  ahead-of-time baseline is built with and a single pipeline does not reach the
+  same fixed point: on Krylov CG (GH200, n=196) the ahead-of-time `task_spmv`
+  comes out at 50 registers and is register-limited to 2 blocks/SM, while the
+  single-pipeline JIT settles at 32 registers, which buys occupancy the kernel
+  cannot use (it is bandwidth-bound) and costs memory-level parallelism —
+  950 us vs 1102 us for the same instruction count at the same achieved
+  occupancy. The two-phase shape roughly doubles device JIT time; the result
+  cache absorbs that after the first run.
 - `CGIR_JIT_AOT_DEVICE` set to `0` makes the `jit` pass leave alone any device
   program that still carries its ahead-of-time compiled kernel, i.e. recompile
   only what `prog-fuse` synthesized. **On by default** — recompiling is safe and
